@@ -1,0 +1,99 @@
+namespace: security
+
+jobName: &jobName antonp-sr-sharedkv-answerability
+queueName: default-queue
+priority: default-priority
+
+numPods: &numPodsVal 1
+numCpusPerPod: 8
+numGpusPerPod: &gpusPerPod 4
+totalMemoryPerPod: 400Gi
+
+containerImage: us.icr.io/cil15-shared-registry/sec-rl-neo:latest
+
+sshGitCloneConfig:
+  secretName: github-ssh-key
+  configMapName: github-known-hosts
+
+retryLimit: 1
+deletionOnFailureGracePeriodDuration: 24h
+failureGracePeriodDuration: 24h
+
+environmentVariables:
+  - name: NUM_PODS
+    value: *numPodsVal
+  - name: GPUS_PER_POD
+    value: *gpusPerPod
+  - name: JOB_NAME
+    value: *jobName
+  - name: HF_TOKEN
+    value: <changeme>
+  - name: HF_DATASETS_TRUST_REMOTE_CODE
+    value: "1"
+  - name: HF_HOME
+    value: /workspace/.cache/huggingface
+  - name: TORCH_HOME
+    value: /workspace/.cache/torch
+  - name: XDG_CACHE_HOME
+    value: /workspace/.cache
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: PYTORCH_CUDA_ALLOC_CONF
+    value: "expandable_segments:True"
+  - name: GHP_PERSONAL_TOKEN
+    value: <changeme>
+  - name: REPO_BRANCH
+    value: feature/unified_model_training
+  - name: WANDB_BASE_URL
+    value: http://52.116.188.209:7689/
+  - name: WANDB_API_KEY
+    value: <changeme>
+  - name: WANDB_PROJECT
+    value: granite-switch-architectures
+  - name: WANDB_RUN_NAME
+    value: sr-sharedkv-answerability
+  - name: TRAIN_CONFIG
+    value: src/shadow_residual/config/sr-qo-mlp-r32-c32-sharedkv.yaml
+  - name: VARIANT
+    value: sr-sharedkv-answerability
+  - name: DATA_ROOT
+    value: /danieloh_cos/granite-switch/granite-intrinsics-training-data/output/unified_compare/data_v4
+  - name: EVAL_DATA
+    value: /danieloh_cos/granite-switch/granite-intrinsics-training-data/output/unified_compare/eval_data_v4/evaluation.jsonl
+  - name: OUTPUT_BASE
+    value: /danieloh_cos/granite-switch/granite-intrinsics-training-data/output/answerability_debug/v4
+
+imagePullSecrets:
+  - name: image-pull-secret-us
+
+volumes:
+  - name: danieloh-cos
+    claimName: danieloh-cos
+    mountPath: /danieloh_cos
+
+setupCommands:
+  - nvidia-smi
+  - export RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
+  - echo "Run timestamp ${RUN_TS}, variant ${VARIANT}"
+  - git clone https://${GHP_PERSONAL_TOKEN}@<YOUR_GIT_HOST>/<ORG>/shadow-residual.git   # TODO: set the shadow-residual remote
+  - cd shadow-residual
+  - git checkout ${REPO_BRANCH}
+  - python3 -m venv .venv
+  - . .venv/bin/activate
+  - pip install --upgrade pip
+  - pip install -e ".[train]"
+  - pip uninstall -y torchvision || true
+  - pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu124 "torch==2.6.0"
+  - python3 -c "import torch, transformers, peft, trl; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('transformers', transformers.__version__); print('peft', peft.__version__); print('trl', trl.__version__); print('cuda_available', torch.cuda.is_available(), 'devices', torch.cuda.device_count())"
+  - ls -la ${DATA_ROOT}/train.jsonl ${DATA_ROOT}/val.jsonl
+  - wc -l ${DATA_ROOT}/train.jsonl ${DATA_ROOT}/val.jsonl
+  - export RUN_DIR=${OUTPUT_BASE}/${VARIANT}/run_${RUN_TS}
+  - mkdir -p ${RUN_DIR}
+  - 'echo "Run dir = ${RUN_DIR}"'
+  - echo "=== Train config ===" && cat ${TRAIN_CONFIG}
+  - echo "=== Training (1 GPU, variant ${VARIANT}) ==="
+  - accelerate launch --num_machines 1 --main_process_port 0 --num_processes ${GPUS_PER_POD} --mixed_precision bf16 -m shadow_residual.training.train --config ${TRAIN_CONFIG} --debug-collator
+  - echo "=== work done; sleeping 1800s ==="
+  - sleep 1800
+
+mainProgram:

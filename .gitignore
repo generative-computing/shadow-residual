@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.uv/
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Training artifacts
+checkpoints/
+runs/
+wandb/
+*.safetensors
+predictions.jsonl
+
+# Vela local scratch (ad-hoc job YAMLs)
+scratch/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

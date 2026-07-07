@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shadow-residual"
+version = "0.1.0-dev"
+description = "Train and distribute Shadow Residual adapters for Granite models."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # Versions locked to match the granite-switch-internal environment this
+    # code was extracted from (transformers 5.5.1–5.9.x + peft 0.19.1 + trl<1.7).
+    # transformers >=5.10 renamed/strict-validated GraniteMoeHybridConfig
+    # layer_types ("attention" -> "full_attention"), which the SR config and
+    # tests depend on — do not bump the upper bound without re-running the
+    # invariant tests.
+    "transformers>=5.5.1,<5.10.0",
+    "peft==0.19.1",
+    "trl>=1.0,<1.7",           # TRL 1.7 accesses config.num_experts and crashes on Granite configs
+    "torch>=2.4",
+    "datasets>=2.14",
+    "accelerate>=0.20",
+    "pydantic>=2.0",
+    "pyyaml",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+train = ["wandb"]
+# Optional evaluation modes that need the open-source granite-switch package.
+# The default `answerability_eval --mode peft` path is fully standalone.
+eval-switch = ["granite-switch"]
+eval-vllm = ["granite-switch", "vllm"]
+dev = ["pytest"]
+
+[project.scripts]
+sr-train = "shadow_residual.training.train:main"
+sr-generate = "shadow_residual.training.generate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["shadow_residual*"]
+
+[tool.setuptools.package-data]
+shadow_residual = ["config/*.yaml", "config/**/*.yaml", "config/schema/*.json", "training/data_samples/*.jsonl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-m", "not deep"]
+markers = [
+    "gpu: requires CUDA GPU",
+    "vllm: requires vLLM installed",
+    "slow: takes > 30s",
+    "deep: expensive code-theory tests; run with: pytest -m deep",
+    "requires_model: needs a real model checkpoint",
+]

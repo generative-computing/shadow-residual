@@ -1,0 +1,492 @@
+{
+  "$defs": {
+    "AdapterConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "target_modules": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "additionalProperties": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            }
+          ],
+          "default": 32,
+          "title": "Target Modules"
+        },
+        "alpha": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Alpha"
+        },
+        "dropout": {
+          "default": 0.0,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Dropout",
+          "type": "number"
+        },
+        "bias": {
+          "$ref": "#/$defs/Bias",
+          "default": "none"
+        },
+        "task_type": {
+          "const": "CAUSAL_LM",
+          "default": "CAUSAL_LM",
+          "title": "Task Type",
+          "type": "string"
+        },
+        "invocation_tokens": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Invocation Tokens"
+        }
+      },
+      "title": "AdapterConfig",
+      "type": "object"
+    },
+    "BatchConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "per_device_train": {
+          "default": 1,
+          "exclusiveMinimum": 0,
+          "title": "Per Device Train",
+          "type": "integer"
+        },
+        "gradient_accumulation": {
+          "default": 16,
+          "exclusiveMinimum": 0,
+          "title": "Gradient Accumulation",
+          "type": "integer"
+        },
+        "per_device_eval": {
+          "default": 1,
+          "exclusiveMinimum": 0,
+          "title": "Per Device Eval",
+          "type": "integer"
+        },
+        "gradient_checkpointing": {
+          "default": true,
+          "title": "Gradient Checkpointing",
+          "type": "boolean"
+        },
+        "gradient_checkpointing_kwargs": {
+          "additionalProperties": true,
+          "title": "Gradient Checkpointing Kwargs",
+          "type": "object"
+        }
+      },
+      "title": "BatchConfig",
+      "type": "object"
+    },
+    "Bias": {
+      "enum": [
+        "none",
+        "all",
+        "lora_only"
+      ],
+      "title": "Bias",
+      "type": "string"
+    },
+    "DataConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "train_path": {
+          "title": "Train Path",
+          "type": "string"
+        },
+        "val_path": {
+          "title": "Val Path",
+          "type": "string"
+        },
+        "max_length": {
+          "default": 8192,
+          "exclusiveMinimum": 0,
+          "title": "Max Length",
+          "type": "integer"
+        },
+        "assistant_marker": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Assistant Marker"
+        }
+      },
+      "required": [
+        "train_path",
+        "val_path"
+      ],
+      "title": "DataConfig",
+      "type": "object"
+    },
+    "GenerationConfig": {
+      "additionalProperties": false,
+      "description": "Post-training generation parameters.\n\nUsed by both the standalone ``generate`` entry point and by ``train.py``\nwhen this block is present in the YAML \u2014 its **presence** opts the\ntraining run into a follow-up generation pass on ``input_path``.",
+      "properties": {
+        "input_path": {
+          "title": "Input Path",
+          "type": "string"
+        },
+        "max_new_tokens": {
+          "default": 256,
+          "exclusiveMinimum": 0,
+          "title": "Max New Tokens",
+          "type": "integer"
+        },
+        "temperature": {
+          "default": 0.0,
+          "minimum": 0.0,
+          "title": "Temperature",
+          "type": "number"
+        },
+        "top_p": {
+          "default": 1.0,
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "title": "Top P",
+          "type": "number"
+        },
+        "do_sample": {
+          "default": false,
+          "title": "Do Sample",
+          "type": "boolean"
+        },
+        "batch_size": {
+          "default": 8,
+          "exclusiveMinimum": 0,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "output_filename": {
+          "default": "predictions.jsonl",
+          "title": "Output Filename",
+          "type": "string"
+        }
+      },
+      "required": [
+        "input_path"
+      ],
+      "title": "GenerationConfig",
+      "type": "object"
+    },
+    "IntervalStrategy": {
+      "enum": [
+        "no",
+        "epoch",
+        "steps"
+      ],
+      "title": "IntervalStrategy",
+      "type": "string"
+    },
+    "ModelConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "description": "HF model ID or local path, e.g. ibm-granite/granite-4.1-3b",
+          "title": "Base",
+          "type": "string"
+        },
+        "attn_implementation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attn Implementation"
+        },
+        "shared_base_kv": {
+          "default": false,
+          "description": "SR-architecture knob: when True, the adapter stream attends to a single base-only K/V (one cache, K/V computed once from normed_base). Default False = disjoint per-stream K/V.",
+          "title": "Shared Base Kv",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "base"
+      ],
+      "title": "ModelConfig",
+      "type": "object"
+    },
+    "OptimizerConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "default": "paged_adamw_8bit",
+          "title": "Name",
+          "type": "string"
+        },
+        "learning_rate": {
+          "default": 0.0002,
+          "exclusiveMinimum": 0,
+          "title": "Learning Rate",
+          "type": "number"
+        },
+        "weight_decay": {
+          "default": 0.01,
+          "minimum": 0.0,
+          "title": "Weight Decay",
+          "type": "number"
+        },
+        "max_grad_norm": {
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "title": "Max Grad Norm",
+          "type": "number"
+        }
+      },
+      "title": "OptimizerConfig",
+      "type": "object"
+    },
+    "RuntimeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "num_train_epochs": {
+          "default": 3,
+          "exclusiveMinimum": 0,
+          "title": "Num Train Epochs",
+          "type": "integer"
+        },
+        "seed": {
+          "default": 42,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "logging_steps": {
+          "default": 1,
+          "exclusiveMinimum": 0,
+          "title": "Logging Steps",
+          "type": "integer"
+        },
+        "dataloader_num_workers": {
+          "default": 4,
+          "minimum": 0,
+          "title": "Dataloader Num Workers",
+          "type": "integer"
+        },
+        "report_to": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Report To",
+          "type": "array"
+        },
+        "fsdp": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "additionalProperties": true,
+              "type": "object"
+            }
+          ],
+          "default": false,
+          "title": "Fsdp"
+        }
+      },
+      "title": "RuntimeConfig",
+      "type": "object"
+    },
+    "SaveConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "$ref": "#/$defs/IntervalStrategy",
+          "default": "epoch"
+        },
+        "total_limit": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 3,
+          "title": "Total Limit"
+        },
+        "output_dir": {
+          "title": "Output Dir",
+          "type": "string"
+        }
+      },
+      "required": [
+        "output_dir"
+      ],
+      "title": "SaveConfig",
+      "type": "object"
+    },
+    "SchedulerConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/SchedulerType",
+          "default": "cosine"
+        },
+        "warmup_ratio": {
+          "default": 0.05,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Warmup Ratio",
+          "type": "number"
+        }
+      },
+      "title": "SchedulerConfig",
+      "type": "object"
+    },
+    "SchedulerType": {
+      "enum": [
+        "cosine",
+        "linear",
+        "constant",
+        "constant_with_warmup"
+      ],
+      "title": "SchedulerType",
+      "type": "string"
+    },
+    "TrainerConfig": {
+      "additionalProperties": false,
+      "description": "SFTTrainer-specific knobs that aren't part of the optimizer/batch story.",
+      "properties": {
+        "packing": {
+          "default": false,
+          "title": "Packing",
+          "type": "boolean"
+        }
+      },
+      "title": "TrainerConfig",
+      "type": "object"
+    },
+    "ValidationConfig": {
+      "additionalProperties": false,
+      "description": "In-loop validation behavior (formerly `eval:`).",
+      "properties": {
+        "strategy": {
+          "$ref": "#/$defs/IntervalStrategy",
+          "default": "epoch"
+        },
+        "load_best_model_at_end": {
+          "default": true,
+          "title": "Load Best Model At End",
+          "type": "boolean"
+        },
+        "metric_for_best_model": {
+          "default": "eval_loss",
+          "title": "Metric For Best Model",
+          "type": "string"
+        },
+        "greater_is_better": {
+          "default": false,
+          "title": "Greater Is Better",
+          "type": "boolean"
+        },
+        "early_stopping_patience": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 3,
+          "title": "Early Stopping Patience"
+        },
+        "stop_on_nan": {
+          "default": true,
+          "title": "Stop On Nan",
+          "type": "boolean"
+        }
+      },
+      "title": "ValidationConfig",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Root unified training config.",
+  "properties": {
+    "model": {
+      "$ref": "#/$defs/ModelConfig"
+    },
+    "data": {
+      "$ref": "#/$defs/DataConfig"
+    },
+    "adapter": {
+      "$ref": "#/$defs/AdapterConfig"
+    },
+    "optimizer": {
+      "$ref": "#/$defs/OptimizerConfig"
+    },
+    "scheduler": {
+      "$ref": "#/$defs/SchedulerConfig"
+    },
+    "batch": {
+      "$ref": "#/$defs/BatchConfig"
+    },
+    "trainer": {
+      "$ref": "#/$defs/TrainerConfig"
+    },
+    "validation": {
+      "$ref": "#/$defs/ValidationConfig"
+    },
+    "save": {
+      "$ref": "#/$defs/SaveConfig"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeConfig"
+    },
+    "generation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GenerationConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "model",
+    "data",
+    "save"
+  ],
+  "title": "TrainingConfig",
+  "type": "object"
+}

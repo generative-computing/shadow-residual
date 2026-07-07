@@ -1,0 +1,71 @@
+# Hand-authored variant of sr-qo-mlp-r32-c96.yaml that flips the SR
+# architecture to shared-base-K/V mode: K and V are computed once from
+# normed_base; the adapter stream attends to that single shared K/V
+# (one cache instead of two). Forbids LoRA on k_proj / v_proj — this
+# YAML targets only Q, O, MLP (gate/up/down), and cross_stream, which
+# is the canonical pairing.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ibm-granite/granite-4.1-3b
+  shared_base_kv: true
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream: 32
+  alpha: 64
+  dropout: 0.05
+  invocation_tokens: "<|start_of_role|>assistant<|end_of_role|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4           # 1 GPU * 1 * 32 = effective batch 32
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl
