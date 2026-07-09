@@ -24,6 +24,9 @@ from transformers import (
 
 from shadow_residual.peft_shadow_residual.factory import _build_sr_base
 from shadow_residual.shadow_residual import ShadowResidualForCausalLM
+from shadow_residual.shadow_residual.model_config import (
+    ShadowResidualConfig as GraniteSwitchConfig,
+)
 from shadow_residual.shadow_residual._stream_gated_linear import (
     _StreamGatedLinear,
 )
@@ -346,6 +349,104 @@ def test_materialize_reties_lm_head_to_embed_tokens(tiny_base_model, monkeypatch
         f"loss. lm_head ptr={lm_w.data_ptr()} embed ptr={emb_w.data_ptr()}."
     )
     assert torch.isfinite(lm_w).all(), "tied lm_head must be finite (no to_empty garbage)."
+
+
+# --- Tied vs untied embeddings (granite-4.1 tied / granite-4.2 untied) --------
+
+
+def _make_tiny_untied_config():
+    """Tiny all-attention config with UNTIED embeddings (matches granite-4.2)."""
+    cfg = _make_tiny_hybrid_config()
+    cfg.tie_word_embeddings = False
+    return cfg
+
+
+@pytest.fixture
+def tiny_untied_base_model():
+    """Upstream model with a SEPARATE, distinct lm_head.weight (granite-4.2 shape).
+
+    GraniteMoeHybridForCausalLM ties by default; force an untied model AND give
+    lm_head values that differ from embed_tokens, so a test can prove the real
+    (distinct) head survives transfer rather than being re-tied to the embedding.
+    """
+    cfg = _make_tiny_untied_config()
+    torch.manual_seed(0)
+    model = GraniteMoeHybridForCausalLM(cfg)
+    # Ensure lm_head is a genuinely independent tensor with distinct values.
+    with torch.no_grad():
+        model.lm_head.weight = torch.nn.Parameter(
+            torch.randn_like(model.get_input_embeddings().weight) * 0.05 + 7.0
+        )
+    model.eval()
+    return model
+
+
+def test_tied_config_ties_lm_head():
+    """tie_word_embeddings=True → lm_head aliases embed_tokens (granite-4.1)."""
+    cfg = _make_tiny_hybrid_config()  # tie_word_embeddings=True
+    sr_cfg = GraniteSwitchConfig(**cfg.to_dict())
+    torch.manual_seed(0)
+    m = ShadowResidualForCausalLM(sr_cfg)
+    assert m._tied_weights_keys == {"lm_head.weight": "model.embed_tokens.weight"}
+    assert m.lm_head.weight.data_ptr() == m.get_input_embeddings().weight.data_ptr(), (
+        "tied config must alias lm_head.weight to embed_tokens.weight."
+    )
+
+
+def test_untied_config_keeps_separate_lm_head():
+    """tie_word_embeddings=False → lm_head is a distinct Parameter (granite-4.2)."""
+    cfg = _make_tiny_untied_config()
+    sr_cfg = GraniteSwitchConfig(**cfg.to_dict())
+    torch.manual_seed(0)
+    m = ShadowResidualForCausalLM(sr_cfg)
+    assert m._tied_weights_keys == {}, (
+        "untied config must not declare a tie mapping (else post_init/tie_weights "
+        f"would alias lm_head). got {m._tied_weights_keys!r}."
+    )
+    assert m.lm_head.weight.data_ptr() != m.get_input_embeddings().weight.data_ptr(), (
+        "untied config must keep lm_head.weight storage separate from "
+        "embed_tokens.weight."
+    )
+
+
+def test_untied_weight_transfer_populates_lm_head(tiny_untied_base_model, monkeypatch):
+    """The real, distinct lm_head must survive the build for an untied base.
+
+    Direct guard against the granite-4.2 step-1 NaN: the factory must copy the
+    source's separately-trained lm_head.weight into SR and must NOT re-tie it to
+    the embedding afterwards (which would clobber it → garbage logits → NaN).
+    """
+    from peft import LoraConfig
+    from shadow_residual.peft_shadow_residual import factory as _factory_mod
+    from shadow_residual.peft_shadow_residual.factory import (
+        get_shadow_residual_peft_model,
+    )
+
+    _patch_auto(monkeypatch, _factory_mod, tiny_untied_base_model)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    src_lm = tiny_untied_base_model.lm_head.weight.detach().clone()
+    src_emb = tiny_untied_base_model.get_input_embeddings().weight.detach().clone()
+    # Sanity: fixture really has a distinct head.
+    assert src_lm.data_ptr() != src_emb.data_ptr()
+    assert not torch.allclose(src_lm, src_emb)
+
+    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"])
+    peft_model = get_shadow_residual_peft_model("ignored-path", lora_config, torch_dtype=None)
+
+    sr_inner = peft_model.base_model.model
+    lm_w = sr_inner.lm_head.weight
+    emb_w = sr_inner.model.embed_tokens.weight
+
+    # lm_head stayed distinct storage (not re-tied to the embedding)…
+    assert lm_w.data_ptr() != emb_w.data_ptr(), (
+        "untied base: lm_head must NOT be re-tied to embed_tokens (re-tie would "
+        "overwrite the trained head → NaN)."
+    )
+    # …and holds the SOURCE's real head values, not the embedding's.
+    assert torch.isfinite(lm_w).all(), "lm_head must be finite (real weights, not to_empty garbage)."
+    assert torch.allclose(lm_w, src_lm), "lm_head must equal the source's trained lm_head.weight."
+    assert not torch.allclose(lm_w, emb_w), "lm_head must differ from the embedding (untied)."
 
 
 def test_reinit_rope_buffers_restores_nonfinite_inv_freq():

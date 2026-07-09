@@ -46,6 +46,18 @@ def test_examples_validate(monkeypatch, name):
     assert cfg.save.output_dir == "/runs/job1/checkpoints"
 
 
+def test_g42_config_validates(monkeypatch):
+    """The Granite 4.2 variant: ${BASE_MODEL} interpolation + ChatML marker."""
+    monkeypatch.setenv("DATA_ROOT", "/data")
+    monkeypatch.setenv("RUN_DIR", "/runs/job1")
+    monkeypatch.setenv("EVAL_DATA", "/data/eval.jsonl")
+    monkeypatch.setenv("BASE_MODEL", "/models/granite-4.2-3b")
+    cfg = load_training_config(EXAMPLES / "sr-qo-mlp-r32-c32-sharedkv-g42.yaml")
+    assert cfg.model.base == "/models/granite-4.2-3b"      # ${BASE_MODEL} resolved
+    assert cfg.model.shared_base_kv is True
+    assert cfg.adapter.invocation_tokens == "<|im_start|>assistant\n"  # ChatML marker
+
+
 # --- adapter.target_modules: scalar vs dict -----------------------------------
 
 def test_target_modules_scalar():

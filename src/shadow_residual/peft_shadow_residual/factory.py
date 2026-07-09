@@ -502,25 +502,38 @@ def get_shadow_residual_peft_model(
             attn_implementation=attn_implementation,
         )
 
-    # Re-tie lm_head ↔ embed_tokens on EVERY rank, symmetrically.
-    # ``ShadowResidualForCausalLM`` inherits ``tie_word_embeddings=True`` from
-    # upstream granite-4.1, so ``lm_head.weight`` must share storage with
+    # Re-tie lm_head ↔ embed_tokens — CONFIG-DRIVEN, and only when the base
+    # ties them (``tie_word_embeddings=True``, e.g. granite-4.1).
+    #
+    # TIED base (granite-4.1): ``lm_head.weight`` must share storage with
     # ``model.embed_tokens.weight``. The meta build (and rank-0's ``to_empty`` in
     # ``_materialize_and_transfer``) leaves them as two separate tensors; without
     # re-tying, the loss-producing projection is disjoint from the trained
     # embedding → frozen/divergent loss (seen on the DDP path as a collapse to
-    # acc 0.0438 with a +vocab*hidden param count).
+    # acc 0.0438). ``ShadowResidualForCausalLM.__init__`` sets
+    # ``_tied_weights_keys`` accordingly, so ``tie_weights()`` re-aliases lm_head.
     #
-    # This MUST run on all ranks — not just inside the rank-0 materialize branch.
-    # Under FSDP only rank 0 materializes, so tying only there made rank 0
-    # structurally different from the still-meta ranks (one shared storage vs two
-    # separate params). FSDP's flatten / sync_module_states then mismatched across
-    # ranks and an ``_ALLGATHER_BASE`` collective hung until the NCCL watchdog
-    # aborted (Signal 6) — no checkpoint saved. Tying on every rank keeps the
-    # module structure identical before the FSDP wrap. ``tie_weights()`` is a
-    # no-op when ``tie_word_embeddings=False`` and is safe on meta tensors (it
-    # repoints the Parameter, touching no storage).
-    peft_model.base_model.model.tie_weights()
+    # UNTIED base (granite-4.2, ``tie_word_embeddings=False``): the checkpoint
+    # ships a SEPARATELY-TRAINED ``lm_head.weight`` that ``transfer_base_weights``
+    # already copied into SR's lm_head. Calling ``tie_weights()`` here would
+    # OVERWRITE that real head with the embedding matrix → garbage logits → NaN
+    # loss on step 1. So we skip it; the model's ``_tied_weights_keys`` is ``{}``
+    # in this case anyway (tie_weights would be a no-op), but we gate explicitly
+    # for clarity.
+    #
+    # FSDP symmetry (why this is safe on all ranks): the tie/untie decision is
+    # driven by ``sr_config.tie_word_embeddings``, which every rank sees
+    # identically, and the Parameter-sharing structure is settled in
+    # ``__init__``/``post_init`` (runs on every rank incl. meta) — NOT introduced
+    # only in the rank-0 materialize branch. So the module structure is identical
+    # across ranks before the FSDP wrap in both cases. (Tying on only rank 0
+    # previously made rank 0 differ from the still-meta ranks → FSDP flatten /
+    # sync_module_states mismatch → ``_ALLGATHER_BASE`` hang, Signal 6, no
+    # checkpoint. Keeping the decision config-driven and rank-symmetric avoids
+    # that.) This call runs on every rank in the tied case; not calling it in the
+    # untied case is likewise symmetric.
+    if getattr(sr_config, "tie_word_embeddings", True):
+        peft_model.base_model.model.tie_weights()
 
     _disable_merge_and_unload(peft_model)
     return peft_model

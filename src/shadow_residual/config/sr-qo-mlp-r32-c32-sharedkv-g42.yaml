@@ -1,0 +1,77 @@
+# Granite 4.2 variant of sr-qo-mlp-r32-c32-sharedkv.yaml.
+#
+# Identical SR setup (shared-base-K/V; LoRA on Q, O, MLP gate/up/down +
+# cross_stream) but adapted for Granite 4.2:
+#   - model.base is supplied via ${BASE_MODEL} so the SAME config serves both
+#     the 3b and 8b 4.2 checkpoints (the launcher sets the path).
+#   - invocation_tokens uses the ChatML assistant marker "<|im_start|>assistant\n"
+#     (4.2 moved from the 4.1 <|start_of_role|>...<|end_of_role|> format to
+#     ChatML). See docs/GRANITE_4.1_vs_4.2.md.
+#
+# 4.2 has tie_word_embeddings=False (a separate lm_head.weight); the SR factory
+# handles that automatically from the base config — no config knob needed here.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+  shared_base_kv: true
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream: 32
+  alpha: 64
+  dropout: 0.05
+  invocation_tokens: "<|im_start|>assistant\n"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4           # 1 GPU * 1 * 32 = effective batch 32
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

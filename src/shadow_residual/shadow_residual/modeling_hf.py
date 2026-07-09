@@ -383,13 +383,27 @@ class ShadowResidualForCausalLM(ShadowResidualPreTrainedModel, GenerationMixin):
     """Causal-LM head for the shadow-residual model."""
 
     config_class = GraniteSwitchConfig
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: GraniteSwitchConfig):
         super().__init__(config)
         self.model = ShadowResidualModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Weight tying is config-driven so the same model works for tied bases
+        # (granite-4.1, tie_word_embeddings=True — lm_head aliases embed_tokens)
+        # and untied bases (granite-4.2, tie_word_embeddings=False — lm_head is a
+        # separately-trained matrix present in the checkpoint). Set as an
+        # INSTANCE attribute (not a class literal) so it reflects this config:
+        # HF reads _tied_weights_keys in tie_weights()/from_pretrained's
+        # missing-key logic. Empty dict => nothing is aliased and post_init's
+        # tie_weights() leaves the distinct lm_head untouched. This runs on every
+        # rank (incl. meta under FSDP), so the parameter-sharing structure is
+        # identical across ranks before the FSDP wrap — see the factory's
+        # tie_weights() call for the FSDP-symmetry rationale.
+        if getattr(config, "tie_word_embeddings", True):
+            self._tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+        else:
+            self._tied_weights_keys = {}
         self.post_init()
 
     def get_input_embeddings(self):
