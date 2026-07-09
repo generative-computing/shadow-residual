@@ -21,6 +21,13 @@ data:
   train_path: ${DATA_ROOT}/train.jsonl
   val_path:   ${DATA_ROOT}/val.jsonl
   max_length: 4096
+  # Granite 4.2 uses ChatML. The trainer falls back to ResponseOnlyCollator
+  # (the standalone chat_template.jinja isn't detected as having {% generation %}
+  # tags), which masks all labels before this marker. The 4.1 default
+  # (<|start_of_role|>assistant<|end_of_role|>) never appears in ChatML-rendered
+  # 4.2 data → every label masked → NaN loss. Set the ChatML assistant marker so
+  # response-only masking finds the assistant turn.
+  assistant_marker: "<|im_start|>assistant\n"
 
 adapter:
   target_modules:
