@@ -202,16 +202,21 @@ def run_inference_base(base_model_name, all_messages, all_documents,
         model = model.to(device)
     model.eval()
 
-    # Build prompts using the base model's chat template
+    # Build prompts using the base model's chat template. render_chat folds
+    # documents into a system message for ChatML tokenizers (Granite 4.2, whose
+    # template ignores documents=) and passes them natively otherwise (4.1) — so
+    # the RAG context reaches the model on both, matching training.
+    from shadow_residual.training.chat_render import render_chat
+
     print(f"Formatting {len(all_messages)} prompts...")
     prompts = []
     for messages, documents in zip(all_messages, all_documents):
         doc_dicts = [{"text": d} for d in documents] if documents else []
-        prompt = tokenizer.apply_chat_template(
+        prompt = render_chat(
+            tokenizer,
             messages,
-            tokenize=False,
-            add_generation_prompt=True,
             documents=doc_dicts,
+            add_generation_prompt=True,
         )
         prompts.append(prompt)
 

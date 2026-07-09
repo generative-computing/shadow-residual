@@ -33,6 +33,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shadow_residual.training.chat_render import render_chat
+
 if TYPE_CHECKING:
     from datasets import Dataset
     from transformers import PreTrainedTokenizerBase
@@ -101,11 +103,14 @@ def load_jsonl_dataset(
             obj = json.loads(line)
             if "messages" not in obj:
                 raise ValueError(f"{path}: row is missing 'messages' field: {obj!r}")
-            text = tokenizer.apply_chat_template(
+            # render_chat folds documents into a system message for ChatML
+            # tokenizers (Granite 4.2, whose template ignores documents=) and
+            # passes them natively otherwise (Granite 4.1). See chat_render.
+            text = render_chat(
+                tokenizer,
                 obj["messages"],
-                tools=obj.get("tools"),
                 documents=obj.get("documents"),
-                tokenize=False,
+                tools=obj.get("tools"),
                 add_generation_prompt=False,
                 enable_thinking=enable_thinking,
             )
