@@ -1,3 +1,6 @@
+# Coding agents
+.claude
+
 # Python
 __pycache__/
 *.py[cod]
@@ -8,6 +11,7 @@ dist/
 .venv/
 venv/
 .uv/
+.env
 
 # Test / cache
 .pytest_cache/
