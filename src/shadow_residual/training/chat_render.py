@@ -5,15 +5,16 @@ so they render prompts identically.
 
 Granite 4.1's chat template renders a ``documents=`` kwarg into a system message.
 The Granite 4.2 pre-release moved to ChatML and its template ignores
-``documents=`` entirely (it stringifies structured content and has no document
-block), so RAG context silently vanishes from the prompt — fatal for an
-answerability task that must ground its decision in the documents.
+``documents=`` entirely, so RAG context silently vanishes from the prompt — fatal
+for an answerability task that must ground its decision in the documents.
 
-For ChatML-style tokenizers (detected by the presence of ``<|im_start|>`` in the
-vocab) we therefore **fold the documents into a system message** using the exact
-text block Granite 4.1 produces natively, then call ``apply_chat_template``
-without ``documents=``. Non-ChatML tokenizers (Granite 4.1) keep the native
-``documents=`` path unchanged.
+For ChatML-style tokenizers (detected by ``<|im_start|>`` in the vocab) we
+therefore inject the retrieved documents the **agentic** way: as a ``tool``
+message (a search/knowledge-base tool response) placed right after the last user
+turn. Granite 4.2's template renders a ``tool`` message as a
+``<tool_response>[...]</tool_response>`` block, so the documents land in the
+prompt as retrieved context — matching how 4.2 natively represents RAG. Non-ChatML
+tokenizers (Granite 4.1) keep the native ``documents=`` path unchanged.
 """
 
 from __future__ import annotations
@@ -23,21 +24,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
-
-# Copied verbatim from Granite 4.1's chat_template.jinja (the
-# documents_system_message prefix/suffix) so a folded prompt is byte-equivalent
-# to what 4.1 renders natively.
-_DOCS_PREFIX = (
-    "You are a helpful assistant with access to the following documents. You may "
-    "use one or more documents to assist with the user query.\n\nYou are given a "
-    "list of documents within <documents></documents> XML tags:\n<documents>"
-)
-_DOCS_SUFFIX = (
-    "\n</documents>\n\nWrite the response to the user's input by strictly aligning "
-    "with the facts in the provided documents. If the information needed to answer "
-    "the question is not available in the documents, inform the user that the "
-    "question cannot be answered based on the available data."
-)
 
 
 def _is_chatml_tokenizer(tokenizer: "PreTrainedTokenizerBase") -> bool:
@@ -63,30 +49,49 @@ def _is_chatml_tokenizer(tokenizer: "PreTrainedTokenizerBase") -> bool:
     return False
 
 
-def _build_documents_system_text(documents: list[Any]) -> str:
-    """Render ``documents`` into 4.1's system-message text block.
-
-    Each document is JSON-serialized (matching 4.1's ``document | tojson``),
-    one per line, wrapped in the documents prefix/suffix.
+def _normalize_document(doc: Any, idx: int) -> dict:
+    """Normalize a document into a {source, document_id, content} record for the
+    agentic tool response. Accepts a plain string, a ``{"text": ...}`` dict (the
+    eval path's shape), or an arbitrary dict (kept, with sensible defaults filled).
     """
-    body = "".join("\n" + json.dumps(doc) for doc in documents)
-    return _DOCS_PREFIX + body + _DOCS_SUFFIX
+    if isinstance(doc, str):
+        return {"source": "knowledge_base", "document_id": str(idx), "content": doc}
+    if isinstance(doc, dict):
+        content = doc.get("content", doc.get("text", ""))
+        return {
+            "source": doc.get("source", "knowledge_base"),
+            "document_id": str(doc.get("document_id", doc.get("doc_id", idx))),
+            "content": content,
+        }
+    return {"source": "knowledge_base", "document_id": str(idx), "content": str(doc)}
 
 
-def _fold_documents_into_messages(messages: list[dict], documents: list[Any]) -> list[dict]:
-    """Return a new messages list with the documents block folded into a system
-    message. If the first message is already ``system``, prepend the block to its
-    content (2 blank lines between, matching 4.1's join); otherwise insert a new
-    leading system message.
+def _tool_message_for_documents(documents: list[Any]) -> dict:
+    """Build a ``tool`` message whose content is a JSON array of the retrieved
+    documents (agentic search-tool response)."""
+    payload = [_normalize_document(d, i) for i, d in enumerate(documents)]
+    return {"role": "tool", "content": json.dumps(payload, indent=2)}
+
+
+def _insert_documents_as_tool(messages: list[dict], documents: list[Any]) -> list[dict]:
+    """Return a new messages list with a ``tool`` (search-response) message
+    carrying the documents, inserted after the LAST user turn (and before any
+    trailing assistant turn). If there is no user turn, append after the last
+    non-assistant message. This mirrors an agentic flow: user asks → tool returns
+    retrieved docs → assistant answers.
     """
-    docs_text = _build_documents_system_text(documents)
     messages = list(messages)
-    if messages and messages[0].get("role") == "system":
-        head = dict(messages[0])
-        existing = head.get("content") or ""
-        head["content"] = (docs_text + "\n\n" + existing) if existing else docs_text
-        return [head] + messages[1:]
-    return [{"role": "system", "content": docs_text}] + messages
+    tool_msg = _tool_message_for_documents(documents)
+    # Find the last user message index.
+    last_user = None
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            last_user = i
+    if last_user is None:
+        # No user turn — insert before the first assistant turn, else append.
+        first_asst = next((i for i, m in enumerate(messages) if m.get("role") == "assistant"), len(messages))
+        return messages[:first_asst] + [tool_msg] + messages[first_asst:]
+    return messages[: last_user + 1] + [tool_msg] + messages[last_user + 1 :]
 
 
 def render_chat(
@@ -102,12 +107,12 @@ def render_chat(
 
     - Non-ChatML tokenizer (Granite 4.1): pass ``documents=`` natively — the
       template renders them (behavior unchanged from before this helper existed).
-    - ChatML tokenizer (Granite 4.2): its template ignores ``documents=``, so fold
-      the documents into a system message (4.1's exact block) and call the
-      template without ``documents=``.
+    - ChatML tokenizer (Granite 4.2): its template ignores ``documents=``, so
+      inject them as a ``tool`` (search-response) message after the last user
+      turn; the template renders it as a ``<tool_response>`` block.
     """
     if documents and _is_chatml_tokenizer(tokenizer):
-        messages = _fold_documents_into_messages(messages, documents)
+        messages = _insert_documents_as_tool(messages, documents)
         return tokenizer.apply_chat_template(
             messages,
             tools=tools,
