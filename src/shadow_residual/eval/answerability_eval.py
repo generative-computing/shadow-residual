@@ -73,6 +73,27 @@ DATASET_FILES = [
 ]
 
 
+def _eos_token_ids(tokenizer):
+    """Return the list of end-of-turn token ids generation should stop on.
+
+    Granite 4.2 (ChatML) ends a turn with <|im_end|>; Granite 4.1 uses
+    <|end_of_text|>. Without an explicit stop, greedy decoding runs to
+    max_new_tokens and repeats the label ('"unanswerable"unanswerable"...').
+    Include the tokenizer's eos plus <|im_end|> when present (its id may differ
+    from eos_token_id on some configs).
+    """
+    ids = []
+    if tokenizer.eos_token_id is not None:
+        ids.append(tokenizer.eos_token_id)
+    try:
+        im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if im_end is not None and im_end != tokenizer.unk_token_id and im_end not in ids:
+            ids.append(im_end)
+    except Exception:
+        pass
+    return ids or None
+
+
 def load_jsonl(path):
     """Load a JSONL file and return a list of parsed dicts."""
     samples = []
@@ -167,7 +188,8 @@ def load_dataset(dataset_path, dataset_size=100000):
 # ---------------------------------------------------------------------------
 
 def run_inference_base(base_model_name, all_messages, all_documents,
-                       batch_size, device_str):
+                       batch_size, device_str, enable_thinking=False,
+                       max_new_tokens=30):
     """Run HuggingFace inference with the base model only (no adapter).
 
     This serves as a baseline to measure the adapter's contribution.
@@ -241,8 +263,10 @@ def run_inference_base(base_model_name, all_messages, all_documents,
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=6,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
+                eos_token_id=_eos_token_ids(tokenizer),
+                pad_token_id=tokenizer.pad_token_id,
             )
 
         for i, output in enumerate(outputs):
@@ -266,7 +290,8 @@ def run_inference_base(base_model_name, all_messages, all_documents,
 # ---------------------------------------------------------------------------
 
 def run_inference_peft(base_model_name, adapter_path, all_messages, all_documents,
-                       batch_size, device_str, enable_thinking=False):
+                       batch_size, device_str, enable_thinking=False,
+                       max_new_tokens=30):
     """Run HuggingFace inference with a PEFT LoRA adapter.
 
     Args:
@@ -318,21 +343,26 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
     model = model.to(device)
     model.eval()
 
-    # Build prompts using the adapter's chat template
-    # The adapter chat template uses `documents` kwarg for document injection
+    # Build prompts. render_chat renders documents natively for Granite 4.1 and
+    # as an agentic <tool_response> for ChatML/4.2 (whose template ignores
+    # documents=) — matching how the adapter was trained.
+    from shadow_residual.training.chat_render import render_chat
+
     print(f"Formatting {len(all_messages)} prompts...")
     prompts = []
     for messages, documents in zip(all_messages, all_documents):
         doc_dicts = [{"text": d} for d in documents] if documents else []
-        prompt = tokenizer.apply_chat_template(
+        prompt = render_chat(
+            tokenizer,
             messages,
-            tokenize=False,
-            add_generation_prompt=True,
             documents=doc_dicts,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
         )
         prompts.append(prompt)
 
     # Generate in batches
+    eos_ids = _eos_token_ids(tokenizer)
     print(f"Running inference ({len(prompts)} samples, batch_size={batch_size})...")
     predictions = []
     start = time.time()
@@ -352,8 +382,10 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=6,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
+                eos_token_id=eos_ids,
+                pad_token_id=tokenizer.pad_token_id,
             )
 
         # Decode only the generated tokens (strip the input)
@@ -378,7 +410,8 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
 # ---------------------------------------------------------------------------
 
 def run_inference_switch_hf(model_path, all_messages, all_documents,
-                            batch_size, device_str, intrinsic_name="answerability"):
+                            batch_size, device_str, intrinsic_name="answerability",
+                            max_new_tokens=30):
     """Run HuggingFace inference with a granite-switch model (baked adapters).
 
     Loads the model built by granite-switch composer and activates the
@@ -458,8 +491,10 @@ def run_inference_switch_hf(model_path, all_messages, all_documents,
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=6,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
+                eos_token_id=_eos_token_ids(tokenizer),
+                pad_token_id=tokenizer.pad_token_id,
             )
 
         for i, output in enumerate(outputs):
@@ -827,10 +862,17 @@ def main():
 
     parser.add_argument(
         "--enable-thinking", action="store_true",
-        help="[peft] Forward enable_thinking=True to the chat template so the "
+        help="[base/peft] Forward enable_thinking=True to the chat template so the "
              "model emits a <think>...</think> reasoning block (Granite 4.2). "
              "Default off. The prediction parser reads the label after </think> "
              "when the block is present, so scoring works either way.",
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=30,
+        help="[base/peft] Max new tokens to generate per sample. Default 30 — "
+             "enough for Granite 4.2's '<think></think>\"unanswerable\"' target "
+             "(the old value of 6 truncated it, causing repeat-loops). Generation "
+             "stops at the eos/<|im_end|> token regardless.",
     )
 
     # Shared arguments
@@ -900,6 +942,8 @@ def main():
             args.base_model,
             all_messages, all_documents,
             args.batch_size, args.device,
+            enable_thinking=args.enable_thinking,
+            max_new_tokens=args.max_new_tokens,
         )
     elif args.mode == "peft":
         raw_predictions = run_inference_peft(
@@ -907,6 +951,7 @@ def main():
             all_messages, all_documents,
             args.batch_size, args.device,
             enable_thinking=args.enable_thinking,
+            max_new_tokens=args.max_new_tokens,
         )
     elif args.mode == "switch":
         raw_predictions = run_inference_switch_hf(
