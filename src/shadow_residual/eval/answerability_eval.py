@@ -217,6 +217,7 @@ def run_inference_base(base_model_name, all_messages, all_documents,
             messages,
             documents=doc_dicts,
             add_generation_prompt=True,
+            enable_thinking=enable_thinking,
         )
         prompts.append(prompt)
 
@@ -265,7 +266,7 @@ def run_inference_base(base_model_name, all_messages, all_documents,
 # ---------------------------------------------------------------------------
 
 def run_inference_peft(base_model_name, adapter_path, all_messages, all_documents,
-                       batch_size, device_str):
+                       batch_size, device_str, enable_thinking=False):
     """Run HuggingFace inference with a PEFT LoRA adapter.
 
     Args:
@@ -563,10 +564,21 @@ def classify_label(text):
 
 
 def process_predictions(raw_predictions):
-    """Process raw model outputs into classification labels."""
+    """Process raw model outputs into classification labels.
+
+    Granite 4.2 (ChatML) emits a ``<think>...</think>`` reasoning block before
+    the answer; the actual label follows the closing tag. When ``</think>`` is
+    present, parse only the text after it so the reasoning prefix (e.g.
+    ``Okay, the user is asking...``) isn't mistaken for the label. Granite 4.1
+    has no think block, so parsing is unchanged for it.
+    """
     processed = []
     for pred in raw_predictions:
-        tokens = pred.strip().split()
+        pred = pred.strip()
+        # 4.2: the verdict is whatever follows the last </think>.
+        if "</think>" in pred:
+            pred = pred.rsplit("</think>", 1)[1].strip()
+        tokens = pred.split()
         first = tokens[0] if tokens else ""
         quoted = re.findall(r'"(.*?)"', first)
         if quoted:
@@ -813,6 +825,14 @@ def main():
         help="[switch-vllm] vLLM tensor parallel size",
     )
 
+    parser.add_argument(
+        "--enable-thinking", action="store_true",
+        help="[peft] Forward enable_thinking=True to the chat template so the "
+             "model emits a <think>...</think> reasoning block (Granite 4.2). "
+             "Default off. The prediction parser reads the label after </think> "
+             "when the block is present, so scoring works either way.",
+    )
+
     # Shared arguments
     parser.add_argument(
         "--dataset-path", type=str, default="./scratch/answerability",
@@ -886,6 +906,7 @@ def main():
             args.base_model, adapter_local,
             all_messages, all_documents,
             args.batch_size, args.device,
+            enable_thinking=args.enable_thinking,
         )
     elif args.mode == "switch":
         raw_predictions = run_inference_switch_hf(
