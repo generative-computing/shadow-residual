@@ -227,10 +227,17 @@
           "title": "Attn Implementation"
         },
         "shared_base_kv": {
-          "default": false,
-          "description": "SR-architecture knob: when True, the adapter stream attends to a single base-only K/V (one cache, K/V computed once from normed_base). Default False = disjoint per-stream K/V.",
-          "title": "Shared Base Kv",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SR-architecture knob: when True, the adapter stream attends to a single base-only K/V (one cache, K/V computed once from normed_base); when False, disjoint per-stream K/V. None (default) = auto: True when 'cross_stream' is in target_modules (SR production default), else False (LoRA/aLoRA; warning logged). Explicit True/False always wins.",
+          "title": "Shared Base Kv"
         }
       },
       "required": [

@@ -33,6 +33,7 @@ from .factory import (
     _build_sr_base,
     _disable_merge_and_unload,
     _register_cross_stream,
+    resolve_shared_base_kv,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,7 +46,7 @@ def load_shadow_residual_peft_model(
     torch_dtype: Optional[torch.dtype] = None,
     adapter_name: str = "default",
     attn_implementation: Optional[str] = None,
-    shared_base_kv: bool = False,
+    shared_base_kv: Optional[bool] = None,
 ):
     """Load a PEFT adapter saved by :func:`get_shadow_residual_peft_model`.
 
@@ -60,7 +61,12 @@ def load_shadow_residual_peft_model(
         shared_base_kv: must match the value the checkpoint was trained
             with. The flag is not serialized into ``adapter_config.json``
             (it is an architecture choice, not a LoRA hyperparameter), so
-            the caller has to supply it.
+            the caller has to supply it. ``None`` (the default)
+            auto-resolves via :func:`resolve_shared_base_kv` from the
+            checkpoint's ``target_modules`` — True when ``"cross_stream"``
+            is present, else False. Since it is not serialized, an SR
+            checkpoint trained with a non-default ``shared_base_kv`` MUST
+            be loaded by passing the same value explicitly here.
 
     Returns:
         :class:`peft.PeftModel`.
@@ -95,6 +101,8 @@ def load_shadow_residual_peft_model(
             "AutoModelForCausalLM + PeftModel.from_pretrained, due to "
             "SR's unfused QKV / gate-up projections."
         )
+
+    shared_base_kv = resolve_shared_base_kv(shared_base_kv, targets)
 
     base_model = _build_sr_base(
         base_model_name_or_path,

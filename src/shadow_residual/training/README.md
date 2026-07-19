@@ -101,7 +101,10 @@ assistant response.
 - Omit `"cross_stream"` → SR takes the single-stream early-exit path (compute
   equivalent to plain LoRA on Granite, modulo unfused-projection numerics).
 - `model.shared_base_kv: true` → adapter attends a single base-only K/V (one
-  cache); forbids LoRA on `k_proj` / `v_proj`.
+  cache); forbids LoRA on `k_proj` / `v_proj`. Leave it unset (the default) to
+  auto-resolve: `true` when `"cross_stream"` is in `target_modules` (the SR
+  production default), `false` otherwise (plain LoRA/aLoRA → K/V on the adapter
+  stream; a warning is logged). An explicit `true`/`false` always wins.
 
 ## Per-module rank
 

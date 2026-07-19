@@ -74,10 +74,16 @@ class ModelConfig(_Strict):
     base: str = Field(..., description="HF model ID or local path, e.g. ibm-granite/granite-4.1-3b")
     attn_implementation: str | None = None  # e.g. "sdpa", "flash_attention_2"
     # SR-architecture knob: when True, the adapter stream attends to a
-    # single base-only K/V (one cache, K/V computed once from normed_base).
-    # Default False = today's behavior (disjoint per-stream K/V, two caches).
-    # Forbids LoRA on k_proj / v_proj when True.
-    shared_base_kv: bool = False
+    # single base-only K/V (one cache, K/V computed once from normed_base);
+    # when False, disjoint per-stream K/V (two caches). Forbids LoRA on
+    # k_proj / v_proj when True.
+    #
+    # None (the default) means "auto": resolved at build time by
+    # resolve_shared_base_kv (peft_shadow_residual/factory.py) from the
+    # adapter's target_modules — True when "cross_stream" is present (the SR
+    # production default), False otherwise (LoRA/aLoRA, K/V on the adapter
+    # stream; a warning is logged). An explicit True/False here always wins.
+    shared_base_kv: bool | None = None
     # Dtype the SR+PEFT model is materialized in. "bf16" (default) loads the
     # whole model — base AND trainable LoRA adapters — in bfloat16. "fp32"
     # loads everything in float32; with accelerate mixed_precision: bf16 this

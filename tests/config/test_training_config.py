@@ -58,6 +58,57 @@ def test_g42_config_validates(monkeypatch):
     assert cfg.adapter.invocation_tokens == "<|im_start|>assistant\n"  # ChatML marker
 
 
+# --- shared_base_kv default + resolution --------------------------------------
+
+def test_shared_base_kv_defaults_to_none():
+    """Unset shared_base_kv is None ('auto'), not a hard False."""
+    cfg = TrainingConfig.model_validate(_minimal())
+    assert cfg.model.shared_base_kv is None
+
+
+def test_shared_base_kv_explicit_values_round_trip():
+    for val in (True, False):
+        cfg = TrainingConfig.model_validate(
+            _minimal(model={"base": "ibm-granite/granite-4.1-3b", "shared_base_kv": val})
+        )
+        assert cfg.model.shared_base_kv is val
+
+
+def test_resolve_shared_base_kv_cross_stream_defaults_true():
+    from shadow_residual.peft_shadow_residual.factory import resolve_shared_base_kv
+
+    assert resolve_shared_base_kv(None, ["q_proj", "o_proj", "cross_stream"]) is True
+
+
+def test_resolve_shared_base_kv_lora_defaults_false_with_warning(caplog):
+    from shadow_residual.peft_shadow_residual.factory import resolve_shared_base_kv
+
+    with caplog.at_level(logging.WARNING):
+        result = resolve_shared_base_kv(None, ["q_proj", "k_proj", "v_proj", "o_proj"])
+    assert result is False
+    assert any("shared_base_kv unset" in r.message for r in caplog.records)
+
+
+def test_resolve_shared_base_kv_explicit_wins(caplog):
+    from shadow_residual.peft_shadow_residual.factory import resolve_shared_base_kv
+
+    # Explicit False on a cross_stream config still yields False, no warning.
+    with caplog.at_level(logging.WARNING):
+        assert resolve_shared_base_kv(False, ["q_proj", "cross_stream"]) is False
+        # Explicit True on a LoRA config yields True, no warning.
+        assert resolve_shared_base_kv(True, ["q_proj", "k_proj"]) is True
+    assert not any("shared_base_kv unset" in r.message for r in caplog.records)
+
+
+def test_resolve_shared_base_kv_scalar_target_modules_defaults_false(caplog):
+    from shadow_residual.peft_shadow_residual.factory import resolve_shared_base_kv
+
+    # Scalar / regex / None target_modules can't name cross_stream -> False.
+    with caplog.at_level(logging.WARNING):
+        assert resolve_shared_base_kv(None, None) is False
+        assert resolve_shared_base_kv(None, "all-linear") is False
+
+
 # --- adapter.target_modules: scalar vs dict -----------------------------------
 
 def test_target_modules_scalar():

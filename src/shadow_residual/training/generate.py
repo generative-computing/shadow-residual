@@ -483,6 +483,7 @@ def run_generation_under_fsdp(
     from shadow_residual.peft_shadow_residual.factory import (
         _build_sr_config,
         _build_sr_peft_model_meta,
+        resolve_shared_base_kv,
     )
 
     is_rank0 = accelerator.process_index == 0
@@ -578,7 +579,9 @@ def run_generation_under_fsdp(
             cfg.model.base,
             torch_dtype=torch.bfloat16,
             attn_implementation=cfg.model.attn_implementation,
-            shared_base_kv=cfg.model.shared_base_kv,
+            shared_base_kv=resolve_shared_base_kv(
+                cfg.model.shared_base_kv, peft_config.target_modules
+            ),
         )
         rebuilt = _build_sr_peft_model_meta(
             sr_config,

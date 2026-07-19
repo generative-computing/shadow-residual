@@ -72,8 +72,18 @@ What determines behavior (no architecture name — it's all fields):
   until the token sequence appears). Requires `task_type="CAUSAL_LM"` (the schema
   sets it). Gated runs force HF gradient_checkpointing off (PEFT #2826); train.py
   re-enables non-reentrant checkpointing explicitly for gated SR.
-- **`model.shared_base_kv: true`** → one base-only K/V cache shared with the
-  adapter's Q; **forbids LoRA on k_proj/v_proj** (rejected at build time).
+- **`model.shared_base_kv`** → one base-only K/V cache shared with the adapter's
+  Q (`true`); **forbids LoRA on k_proj/v_proj** (rejected at build time).
+  **Default is auto** (leave the key unset / `None`): resolved at build time by
+  `resolve_shared_base_kv` from `adapter.target_modules` — `true` when
+  `"cross_stream"` is present (the SR production default), `false` otherwise
+  (plain LoRA/aLoRA → K/V computed on the adapter stream; a **warning is
+  logged**). An explicit `true`/`false` always wins. The flag is **not
+  serialized** into `adapter_config.json`, so an SR checkpoint trained with a
+  non-default value must be loaded by passing the same value explicitly to
+  `load_shadow_residual_peft_model`. Note the "weak SR" ablation (shared K/V with
+  `cross_stream` absent) is still reachable, but only by explicitly setting
+  `shared_base_kv: true` on a no-cross_stream config.
 - **`data.enable_thinking` / `--thinking`** → forwarded to
   `apply_chat_template(enable_thinking=...)`. CLI wins over YAML. Default False.
 
@@ -95,8 +105,11 @@ model = load_shadow_residual_peft_model(base_id, adapter_path,
                                         torch_dtype=..., shared_base_kv=<same as training>)
 ```
 
-`shared_base_kv` is not serialized in `adapter_config.json` — the caller must
-pass the value used at training time.
+`shared_base_kv` is not serialized in `adapter_config.json`. Leaving it unset
+auto-resolves from the checkpoint's `target_modules` (shared when `cross_stream`
+is present, else disjoint), which is correct for any checkpoint trained with the
+auto-default. A checkpoint trained with a **non-default** value must pass the same
+value explicitly at load time.
 
 Answerability eval: `python -m shadow_residual.eval.answerability_eval --mode peft
 --base-model <id> --adapter <path> …`. `--mode peft` is standalone; `--mode
@@ -109,7 +122,10 @@ installed (`[eval-switch]` / `[eval-vllm]`).
    call. `merge_and_unload` is disabled on purpose (it would fold the delta into
    the base linear).
 2. **Disjoint vs shared K/V.** Disjoint = two caches; shared = one base-only
-   cache, no K/V LoRA. The `test_dual_kv_cache_invariant.py` tests pin this.
+   cache, no K/V LoRA. Shared is the auto-default when `"cross_stream"` is in
+   `target_modules`; disjoint/adapter-K/V is the auto-default (with a warning)
+   for plain LoRA/aLoRA — see `resolve_shared_base_kv`. The
+   `test_dual_kv_cache_invariant.py` tests pin the disjoint behavior.
 3. **ALORA three-knob rule.** `alora_invocation_tokens` + `task_type="CAUSAL_LM"`
    + `"cross_stream"` must all be set for gated SR; missing any one silently
    degrades to unconditional LoRA. `test_alora_invocation_invariant.py` pins the

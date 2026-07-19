@@ -190,9 +190,11 @@ When `"cross_stream"` is *not* in `target_modules`, no `CrossStream` site has be
 
 ### 1.6 Shared base K/V (`shared_base_kv=True`)
 
-The dual-stream graph in §1.3 has each stream compute its *own* K and V (the **disjoint-K/V** default, `config.shared_base_kv=False`): two K/V projections per layer, two physically separate caches (`past_key_values` for the adapter, `past_key_values_base` for the base). Shared-base-K/V mode (`config.shared_base_kv=True`, set via `set_shadow_residual(..., shared_base_kv=True)`) collapses that to a **single K/V, computed once from the base stream**, that both streams attend against. It is selected at runtime in `attention_hf.py` (the `if self.shared_base_kv:` branch) and is the dominant production variant — every `sr-*-sharedkv.yaml` config trains it.
+The dual-stream graph in §1.3 can run in two K/V topologies. In **disjoint-K/V** mode (`config.shared_base_kv=False`) each stream computes its *own* K and V: two K/V projections per layer, two physically separate caches (`past_key_values` for the adapter, `past_key_values_base` for the base). **Shared-base-K/V** mode (`config.shared_base_kv=True`, set via `set_shadow_residual(..., shared_base_kv=True)`) collapses that to a **single K/V, computed once from the base stream**, that both streams attend against. It is selected at runtime in `attention_hf.py` (the `if self.shared_base_kv:` branch) and is the dominant production variant — every `sr-*-sharedkv.yaml` config trains it.
 
-What changes versus the disjoint default:
+> **Which is the default?** `shared_base_kv` is a tri-state: `True`, `False`, or unset (`None`). Unset — the config default — is **auto-resolved at build time** by `resolve_shared_base_kv` (`peft_shadow_residual/factory.py`) from the adapter's `target_modules`: **shared (`True`) when `"cross_stream"` is present** (the SR production case), **disjoint (`False`) otherwise** (plain LoRA / aLoRA — K/V is computed on the adapter stream; a warning is logged). An explicit `True`/`False` in the config always wins. The flag is not serialized into `adapter_config.json`, so a checkpoint trained with a non-default value must be reloaded with the same value passed explicitly.
+
+What changes versus disjoint mode:
 
 - **K and V are computed once, under `stream_context("base")`** — `k = k_proj(normed_base)`, `v = v_proj(normed_base)`. Because the call runs in the `"base"` context, any `ShadowResidualLora` wrapper short-circuits to `base_layer(x)`, so the cached K/V is `W_K·normed_base` / `W_V·normed_base` with **frozen weights only**. The cache carries *zero* adapter influence.
 - **The adapter stream computes only Q** — `q_adapt = q_proj(normed_adapt)` under `"adapter"` context (Q LoRA delta fires). It does *not* compute its own K/V; `_shape_qkv` is called with `k=None, v=None` for the adapter.
@@ -217,7 +219,7 @@ What changes versus the disjoint default:
                        past_key_values_base unused. K/V LoRA forbidden.
 ```
 
-The adapter reshapes only the *query* and the *output projection*; it reads the same frozen K/V the unadapted base model would have written. The base stream's Q/K/V/O/MLP stay bit-identical to the unadapted base model, exactly as in the disjoint default. The architectural payoff: because the cache is adapter-independent, an SR adapter can attend over a KV cache populated by the frozen base — keys/values need not be recomputed when the adapter turns on.
+The adapter reshapes only the *query* and the *output projection*; it reads the same frozen K/V the unadapted base model would have written. The base stream's Q/K/V/O/MLP stay bit-identical to the unadapted base model, exactly as in disjoint mode. The architectural payoff: because the cache is adapter-independent, an SR adapter can attend over a KV cache populated by the frozen base — keys/values need not be recomputed when the adapter turns on.
 
 ### 1.7 The fused→unfused weight transfer
 
@@ -397,7 +399,7 @@ Per-token timeline. The collator inserts a single canonical control token at the
 | `gate_proj, up_proj, down_proj`  | `"base"` / `"adapter"` blocks                                    | `ShadowResidualLora`     | Same gating rule: base call → no delta; adapter call → delta + ALORA mask.                                                                                                                            |
 | `cross_stream`                   | not in any stream context (called once per layer on h_base)      | `CrossStreamLora`        | Base layer returns zeros, so output is purely `B(A(h_base))*scaling`, optionally masked by `alora_offsets`.                                                                                            |
 
-> **Documented K/V exception (disjoint-K/V default).** The base stream's K/V cache is filled by a call *under* `stream_context("base")`, so the K/V LoRA delta (if you trained one) is *not* applied to the base K/V — the cache stays adapter-free. The adapter K/V cache fills under `"adapter"`, so it does pick up the delta. Two independent caches, never interleaved.
+> **Documented K/V exception (disjoint-K/V mode).** The base stream's K/V cache is filled by a call *under* `stream_context("base")`, so the K/V LoRA delta (if you trained one) is *not* applied to the base K/V — the cache stays adapter-free. The adapter K/V cache fills under `"adapter"`, so it does pick up the delta. Two independent caches, never interleaved. (For which topology is the default, see the tri-state note in §1.6.)
 
 > **Shared-base-K/V mode (§1.6).** When `shared_base_kv=True`, there is no adapter-side K/V at all: K and V are computed once from `normed_base` under `"base"` context and written to the single cache, so the cache is **adapter-independent regardless of what you trained** — and K/V LoRA is rejected at construction time. The adapter touches attention only through Q and O.
 
@@ -411,7 +413,7 @@ With cross_stream wrapped (the production path), the SR forward behaves as one o
 | **B-pre.** ALORA on, `pos < p`                      | delta gated off: just `Wx`                       | zero (mask)                       | filled with *base-equivalent* values (`k_adapt[pos<p] == k_base[pos<p]`)       | filled with base-side values        |
 | **B-post.** ALORA on, `pos ≥ p`                     | delta fires: `(W + ΔW)x`                         | full delta                        | filled with adapter-side values (delta included)                              | filled with base-side values        |
 
-> **The K/V-cache columns above describe the disjoint-K/V default (§1.3).** Under `shared_base_kv=True` (§1.6), the "Adapter K/V cache write" and "Base K/V cache write" columns collapse: there is a single cache, filled once from the frozen base stream, identical across all three modes — the adapter never writes K/V. ALORA gating and cross-stream still apply to Q/O/MLP exactly as tabulated; only the K/V columns change.
+> **The K/V-cache columns above describe disjoint-K/V mode (§1.3).** Under `shared_base_kv=True` (§1.6, the auto-default when `cross_stream` is present), the "Adapter K/V cache write" and "Base K/V cache write" columns collapse: there is a single cache, filled once from the frozen base stream, identical across all three modes — the adapter never writes K/V. ALORA gating and cross-stream still apply to Q/O/MLP exactly as tabulated; only the K/V columns change.
 
 The defining invariants of Mode B-pre (the "adapters not yet active" regime):
 

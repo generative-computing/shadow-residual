@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shadow Residual — Training &amp; Data Formats (Granite 4.1 / 4.2)</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
+          --accent:#58a6ff; --g41:#3fb950; --g42:#d29922; --raw:#a371f7; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  h2 { font-size: 21px; margin: 40px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 16px; margin: 24px 0 8px; color: var(--accent); }
+  p, li { color: var(--fg); }
+  .sub { color: var(--muted); margin-top: 0; }
+  code { background:#1f2530; padding:1px 5px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  pre { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+        padding:14px 16px; overflow-x:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+        font-size:12.5px; line-height:1.5; }
+  pre.raw   { border-left:4px solid var(--raw); }
+  pre.g41   { border-left:4px solid var(--g41); }
+  pre.g42   { border-left:4px solid var(--g42); }
+  .tag { display:inline-block; font-size:11px; font-weight:600; padding:2px 8px; border-radius:12px;
+         vertical-align:middle; margin-left:8px; }
+  .tag.raw { background:rgba(163,113,247,.18); color:#c9a6ff; }
+  .tag.g41 { background:rgba(63,185,80,.16); color:#69d67e; }
+  .tag.g42 { background:rgba(210,153,34,.16); color:#e3b341; }
+  table { border-collapse:collapse; width:100%; margin:14px 0; font-size:13.5px; }
+  th, td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:#1f2530; }
+  .note { background:#1c2333; border:1px solid #2d3650; border-left:4px solid var(--accent);
+          border-radius:6px; padding:10px 14px; margin:14px 0; font-size:13.5px; }
+  .muted { color:var(--muted); }
+  .hl-role { color:#79c0ff; }   /* role markers */
+  .hl-doc  { color:#e3b341; }   /* document block */
+  .hl-lbl  { color:#7ee787; }   /* supervised label */
+  ul { margin:8px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Shadow Residual — Training &amp; Data Formats</h1>
+<p class="sub">How to train answerability / RAG adapters on Granite&nbsp;4.1 and Granite&nbsp;4.2, and how the same data is rendered for each model family.</p>
+
+<!-- ============================================================= -->
+<h2>1. Running training</h2>
+
+<p>Training is driven by a single Pydantic-validated YAML. Behavior follows the
+fields you set — not an architecture name. Reference configs live in
+<code>src/shadow_residual/config/</code>. The <b>only</b> difference between a 4.1
+and a 4.2 run is <b>which config you point at</b> (plus the base-model path); the
+code auto-adapts to each family's chat format and weight tying.</p>
+
+<h3>Pick the config for your model family</h3>
+<table>
+  <tr><th>Model family</th><th>Config</th><th>What it sets</th></tr>
+  <tr>
+    <td><b>Granite 4.1</b> (tied embeddings, role-tag chat format)</td>
+    <td><code>sr-qo-mlp-r32-c32-sharedkv.yaml</code></td>
+    <td><code>base: ibm-granite/granite-4.1-3b</code>; invocation marker
+        <code>&lt;|start_of_role|&gt;assistant&lt;|end_of_role|&gt;</code></td>
+  </tr>
+  <tr>
+    <td><b>Granite 4.2</b> (untied <code>lm_head</code>, ChatML format)</td>
+    <td><code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code></td>
+    <td><code>base: ${BASE_MODEL}</code> (supply the path); ChatML markers
+        <code>&lt;|im_start|&gt;assistant\n</code> for both
+        <code>invocation_tokens</code> and <code>assistant_marker</code></td>
+  </tr>
+</table>
+
+<div class="note">
+The <b>same code</b> handles both. It detects the family from the tokenizer and:
+respects <code>config.tie_word_embeddings</code> (4.2 ships a separate
+<code>lm_head.weight</code>); uses the ChatML markers from the 4.2 config for
+label masking + aLoRA gating; and renders RAG <code>documents</code> the way each
+family's template expects (see §2). No manual per-model surgery needed.
+</div>
+
+<h3>On the current server</h3>
+<p>Single GPU:</p>
+<pre># Granite 4.1
+sr-train \
+  --config src/shadow_residual/config/sr-qo-mlp-r32-c32-sharedkv.yaml \
+  --train-data /data/train.jsonl \
+  --val-data   /data/eval.jsonl \
+  --output-dir ./checkpoints
+
+# Granite 4.2 — the config reads model.base from $BASE_MODEL
+BASE_MODEL=/path/to/granite-4.2-3b \
+sr-train \
+  --config src/shadow_residual/config/sr-qo-mlp-r32-c32-sharedkv-g42.yaml \
+  --train-data /data/train.jsonl --val-data /data/eval.jsonl \
+  --output-dir ./checkpoints</pre>
+
+<p>Multi-GPU (DDP for 3b; FSDP for 8b / larger):</p>
+<pre># DDP (e.g. 3b on 4 GPUs)
+accelerate launch --num_processes 4 --multi_gpu --mixed_precision bf16 \
+  -m shadow_residual.training.train --config &lt;cfg&gt;.yaml \
+  --train-data /data/train.jsonl --val-data /data/eval.jsonl --output-dir ./ckpt
+
+# FSDP (e.g. 8b on 8 GPUs) — uses the shipped accelerate FSDP config
+accelerate launch --config_file src/shadow_residual/config/accelerate/fsdp_4gpu.yaml \
+  --num_processes 8 --main_process_port 0 \
+  -m shadow_residual.training.train --config &lt;cfg&gt;.yaml \
+  --train-data /data/train.jsonl --val-data /data/eval.jsonl --output-dir ./ckpt</pre>
+
+<div class="note">
+<b>FSDP note:</b> the untied-<code>lm_head</code> handling is FSDP-safe — the tie
+decision is config-driven and settled in the model's <code>__init__</code> (runs
+on every rank, incl. meta), so the parameter structure is identical across ranks
+before the FSDP wrap. Validated end-to-end on both 8b runs.
+</div>
+
+<h3>On Vela</h3>
+<p>Job YAMLs live in <code>examples/vela/</code>. They clone the repo in-pod,
+<code>pip install -e ".[train]"</code>, then <code>accelerate launch</code> the
+trainer against COS-mounted data, and finally run the answerability eval. Fill in
+the token/secret placeholders, then:</p>
+<pre>oc login --token=… --server=…
+helm template -f examples/vela/sr_sharedkv.yaml \
+  --set-string "environmentVariables[0].value=$(date -u +%Y%m%dT%H%M%SZ)" \
+  mlbatch/pytorchjob-generator | oc create -f -
+oc logs -f -c pytorch &lt;jobName&gt;-master-0     # follow</pre>
+<p class="muted">Pin <code>trl&lt;1.7</code> (already in pyproject) — 1.7 crashes on
+Granite configs. The Vela image ships torch 2.6 + CUDA 12.4. <code>eval_loss: nan</code>
+per epoch is expected (prompt-only eval rows have no labels for the trainer's CE);
+the post-training generation is the real eval.</p>
+
+<h3>Evaluation</h3>
+<pre>python -m shadow_residual.eval.answerability_eval --mode peft \
+  --base-model &lt;base-model-or-path&gt; \
+  --adapter-path ./checkpoints --adapter-sub-path . \
+  --dataset-path /path/to/answerability_eval \
+  --device cuda --batch-size 8
+# --enable-thinking  (default off) toggles the 4.2 &lt;think&gt; reasoning block.
+# --max-new-tokens   (default 30) — enough for 4.2's &lt;think&gt;&lt;/think&gt;"label" target.</pre>
+
+<!-- ============================================================= -->
+<h2>2. Data format &amp; how it renders per model</h2>
+
+<p>Training data is JSONL, one chat conversation per row. The last message is the
+assistant's <b>supervised target</b>; optional <code>documents</code> carry the RAG
+context. The two model families render that context <b>differently</b> — the code
+handles the split automatically.</p>
+
+<h3>Raw data row <span class="tag raw">INPUT (JSONL)</span></h3>
+<pre class="raw">{
+  "messages": [
+    { "role": "user",      "content": "What is the capital city of France?" },
+    { "role": "assistant", "content": "\"answerable\"" }
+  ],
+  "documents": [
+    { "doc_id": "",
+      "text": "The capital city of France is Paris. It is known for its iconic landmarks like the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city has a population of over 2.2 million people." }
+  ]
+}</pre>
+<p class="muted">The assistant target here is the literal <code>"answerable"</code>
+(quoted). <code>documents</code> is passed alongside <code>messages</code>; the code
+decides how to inject it.</p>
+
+<h3>Rendered for Granite 4.1 <span class="tag g41">role-tag format · native documents</span></h3>
+<pre class="g41">&lt;|start_of_role|&gt;system&lt;|end_of_role|&gt;You are a helpful assistant with access to the following documents. You may use one or more documents to assist with the user query.
+
+You are given a list of documents within &lt;documents&gt;&lt;/documents&gt; XML tags:
+&lt;documents&gt;
+{"doc_id": "", "text": "The capital city of France is Paris. It is known for its iconic landmarks like the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city has a population of over 2.2 million people."}
+&lt;/documents&gt;
+
+Write the response to the user's input by strictly aligning with the facts in the provided documents. If the information needed to answer the question is not available in the documents, inform the user that the question cannot be answered based on the available data.&lt;|end_of_text|&gt;
+&lt;|start_of_role|&gt;user&lt;|end_of_role|&gt;What is the capital city of France?&lt;|end_of_text|&gt;
+&lt;|start_of_role|&gt;assistant&lt;|end_of_role|&gt;"answerable"&lt;|end_of_text|&gt;</pre>
+<p class="muted">4.1's chat template renders <code>documents=</code> <b>natively</b>
+into a <code>system</code> turn wrapped in <code>&lt;documents&gt;…&lt;/documents&gt;</code>.
+Role framing is <code>&lt;|start_of_role|&gt;…&lt;|end_of_role|&gt;</code>. The supervised
+label is the bare <code>"answerable"</code> after the assistant marker.</p>
+
+<h3>Rendered for Granite 4.2 <span class="tag g42">ChatML format · documents as tool response</span></h3>
+<pre class="g42">&lt;|im_start|&gt;system
+&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+What is the capital city of France?&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+&lt;tool_response&gt;
+[
+  {
+    "source": "knowledge_base",
+    "document_id": "",
+    "content": "The capital city of France is Paris. It is known for its iconic landmarks like the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city has a population of over 2.2 million people."
+  }
+]
+&lt;/tool_response&gt;
+&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+&lt;think&gt;&lt;/think&gt;"answerable"&lt;|im_end|&gt;</pre>
+<p class="muted">4.2's ChatML template <b>ignores the <code>documents=</code> kwarg</b>,
+so the code injects the documents as an <b>agentic tool response</b> — a
+<code>tool</code> message rendered as a <code>&lt;tool_response&gt;[…]</code> block
+(normalized to <code>{source, document_id, content}</code>) after the user turn.
+The assistant turn carries an empty <code>&lt;think&gt;&lt;/think&gt;</code> reasoning
+block before the label.</p>
+
+<h3>What differs, side by side</h3>
+<table>
+  <tr><th>Aspect</th><th>Granite 4.1</th><th>Granite 4.2</th></tr>
+  <tr><td>Role framing</td>
+      <td><code>&lt;|start_of_role|&gt;R&lt;|end_of_role|&gt;</code></td>
+      <td><code>&lt;|im_start|&gt;R\n … &lt;|im_end|&gt;</code> (ChatML)</td></tr>
+  <tr><td>Documents</td>
+      <td>native <code>&lt;documents&gt;…&lt;/documents&gt;</code> in a system turn</td>
+      <td>agentic <code>&lt;tool_response&gt;[…]&lt;/tool_response&gt;</code> (a <code>tool</code> message)</td></tr>
+  <tr><td>Assistant target</td>
+      <td><code>"answerable"</code></td>
+      <td><code>&lt;think&gt;&lt;/think&gt;"answerable"</code></td></tr>
+  <tr><td>End-of-turn</td>
+      <td><code>&lt;|end_of_text|&gt;</code></td>
+      <td><code>&lt;|im_end|&gt;</code></td></tr>
+  <tr><td>Weight tying</td>
+      <td><code>tie_word_embeddings=True</code></td>
+      <td><code>False</code> (separate trained <code>lm_head.weight</code>)</td></tr>
+</table>
+
+<div class="note">
+Both renderings contain the <b>same documents and the same label</b> — only the
+framing differs. This is why RAG context reaches the model on both families, and
+why the eval must strip the 4.2 <code>&lt;think&gt;&lt;/think&gt;</code> prefix before
+reading the label. The rendering logic lives in
+<code>src/shadow_residual/training/chat_render.py</code> and is shared by training
+(<code>data.py</code>) and evaluation (<code>answerability_eval.py</code>) so they
+stay identical.
+</div>
+
+</div>
+</body>
+</html>

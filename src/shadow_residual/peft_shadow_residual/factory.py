@@ -57,6 +57,42 @@ logger = logging.getLogger(__name__)
 CROSS_STREAM_NAME = "cross_stream"
 
 
+def resolve_shared_base_kv(shared_base_kv: Optional[bool], target_modules) -> bool:
+    """Resolve the effective ``shared_base_kv`` for a build.
+
+    ``shared_base_kv=None`` means "auto": the flag defaults to the shared
+    base-only K/V topology (the SR production variant) when the adapter
+    opts into shadow residual (``"cross_stream"`` in ``target_modules``),
+    and to disjoint / adapter-computed K/V otherwise (plain LoRA / aLoRA).
+    An explicit ``True`` / ``False`` always wins over the auto default.
+
+    A scalar ``target_modules`` ("all-linear", a regex, or ``None``) can't
+    name ``cross_stream``, so it resolves to ``False`` — consistent with
+    :func:`_reject_kv_lora_when_shared`, which also leaves scalar shapes
+    alone.
+
+    When the auto path lands on ``False`` for a LoRA/aLoRA config, a
+    warning is logged so the topology choice is visible (K/V is computed
+    on the adapter stream, not shared from the frozen base).
+    """
+    has_cross_stream = (
+        target_modules is not None
+        and not isinstance(target_modules, str)
+        and CROSS_STREAM_NAME in target_modules
+    )
+    if shared_base_kv is not None:
+        return bool(shared_base_kv)
+    if has_cross_stream:
+        return True
+    logger.warning(
+        "shared_base_kv unset and 'cross_stream' not in target_modules "
+        "(LoRA/aLoRA config) — defaulting to shared_base_kv=False: K/V is "
+        "computed on the adapter stream (disjoint topology). Set "
+        "shared_base_kv explicitly to silence this warning."
+    )
+    return False
+
+
 def _register_cross_stream(lora_config: LoraConfig) -> None:
     """Attach SR custom-module dispatch to ``lora_config``.
 
@@ -428,7 +464,7 @@ def get_shadow_residual_peft_model(
     torch_dtype: Optional[torch.dtype] = None,
     adapter_name: str = "default",
     attn_implementation: Optional[str] = None,
-    shared_base_kv: bool = False,
+    shared_base_kv: Optional[bool] = None,
 ):
     """Build a :class:`peft.PeftModel` for shadow-residual + LoRA.
 
@@ -450,11 +486,15 @@ def get_shadow_residual_peft_model(
         shared_base_kv: when True, the adapter stream attends to a
             single base-only K/V (one cache; K/V computed once from
             ``normed_base``). Forbids K/V LoRA. See
-            :mod:`shadow_residual.shadow_residual.attention_hf`.
+            :mod:`shadow_residual.shadow_residual.attention_hf`. ``None``
+            (the default) auto-resolves via :func:`resolve_shared_base_kv`:
+            True when ``"cross_stream"`` is in ``target_modules``, else
+            False (with a warning).
 
     Returns:
         :class:`peft.PeftModel`.
     """
+    shared_base_kv = resolve_shared_base_kv(shared_base_kv, lora_config.target_modules)
     if shared_base_kv:
         _reject_kv_lora_when_shared(lora_config)
     logger.info(

@@ -84,7 +84,10 @@ print(tokenizer.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_token
 ```
 
 `shared_base_kv` is an architecture choice, not a LoRA hyperparameter, so it is
-not stored in `adapter_config.json` — pass the same value used at training time.
+not stored in `adapter_config.json`. Leaving it unset auto-resolves from the
+checkpoint's `target_modules` (shared when `cross_stream` is present, else
+disjoint), which is correct for any adapter trained with the auto-default. If the
+adapter was trained with a non-default value, pass the same value explicitly.
 
 ## Training SR adapters
 
@@ -190,10 +193,12 @@ padding-free packing. A 50-row synthetic sample lives at
   but load needs the dedicated `load_shadow_residual_peft_model`.
 - **`merge_and_unload` is disabled.** Folding the delta into the base linear
   would contaminate the frozen-base path and break the whole invariant.
-- **Disjoint vs shared base K/V.** The default keeps two disjoint K/V caches
-  (base + adapter). `shared_base_kv=True` (the production variant) computes K/V
-  once from the base stream and lets the adapter's Q attend it — one cache,
-  adapter-independent — and forbids K/V LoRA (no place for the delta to land).
+- **Disjoint vs shared base K/V.** Disjoint keeps two K/V caches (base + adapter);
+  `shared_base_kv=True` (the production variant) computes K/V once from the base
+  stream and lets the adapter's Q attend it — one cache, adapter-independent — and
+  forbids K/V LoRA (no place for the delta to land). Left unset, the flag
+  auto-resolves at build time: shared when `"cross_stream"` is in `target_modules`,
+  disjoint otherwise (plain LoRA/aLoRA, with a warning). An explicit value wins.
 - **Unfused projections.** SR uses per-projection Q/K/V and gate/up so a separate
   LoRA can attach to each. This changes the reduction order vs. upstream Granite's
   fused kernels, so SR is *equivalent* but not bit-identical to a stock
