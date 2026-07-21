@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shadow Residual — Training Manual</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --panel2: #eff1f3;
+    --border: #d0d7de;
+    --fg: #1f2328;
+    --muted: #656d76;
+    --accent: #0969da;
+    --accent2: #1a7f37;
+    --warn: #9a6700;
+    --danger: #cf222e;
+    --code-bg: #f6f8fa;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .layout { display: flex; min-height: 100vh; }
+  nav {
+    width: 260px;
+    flex: 0 0 260px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    padding: 24px 18px;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+  }
+  nav h1 { font-size: 16px; margin: 0 0 4px; letter-spacing: .3px; }
+  nav .tag { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+  nav a {
+    display: block;
+    color: var(--muted);
+    text-decoration: none;
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 13.5px;
+  }
+  nav a:hover { color: var(--fg); background: var(--panel2); }
+  nav a.sub { padding-left: 22px; font-size: 12.5px; }
+  nav .grp { margin-top: 14px; color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; padding: 0 10px 4px; }
+  main { flex: 1; padding: 40px 52px 120px; max-width: 980px; }
+  h2 { font-size: 26px; margin: 48px 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  h2:first-child { margin-top: 0; }
+  h3 { font-size: 18px; margin: 30px 0 10px; color: var(--accent2); }
+  h4 { font-size: 15px; margin: 20px 0 8px; }
+  p { color: var(--fg); }
+  code { font-family: var(--mono); font-size: .88em; background: var(--code-bg); padding: 2px 6px; border-radius: 4px; color: #0550ae; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; color: #1f2328; }
+  .lead { color: var(--muted); font-size: 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--border); padding: 8px 11px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); color: var(--accent); font-weight: 600; }
+  td code { white-space: nowrap; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin: 16px 0; }
+  .note, .warn, .danger {
+    border-radius: 8px; padding: 12px 16px; margin: 16px 0; font-size: 14px;
+    border-left: 4px solid var(--accent);
+    background: #ddf4ff;
+  }
+  .warn { border-left-color: var(--warn); background: #fff8c5; }
+  .danger { border-left-color: var(--danger); background: #ffebe9; }
+  .note b, .warn b, .danger b { color: var(--fg); }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; background: var(--panel2); border: 1px solid var(--border); color: var(--muted); margin-left: 6px; }
+  ul.tree { list-style: none; padding-left: 0; font-family: var(--mono); font-size: 13px; }
+  .muted { color: var(--muted); }
+
+  /* Flow diagram */
+  .flow { display: flex; flex-direction: column; gap: 0; margin: 20px 0; }
+  .flow-step {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 18px; position: relative;
+  }
+  .flow-step .n {
+    display: inline-flex; width: 24px; height: 24px; border-radius: 50%;
+    background: var(--accent); color: #06101f; font-weight: 700; font-size: 13px;
+    align-items: center; justify-content: center; margin-right: 10px;
+  }
+  .flow-step.optional .n { background: var(--warn); }
+  .flow-step .title { font-weight: 600; font-size: 15px; }
+  .flow-step .body { color: var(--muted); font-size: 13.5px; margin-top: 6px; margin-left: 34px; }
+  .flow-arrow { text-align: center; color: var(--border); font-size: 20px; line-height: 1; padding: 4px 0; }
+  .badge-opt { font-size: 10.5px; background: rgba(240,182,74,.15); color: var(--warn); padding: 1px 7px; border-radius: 10px; margin-left: 8px; border: 1px solid rgba(240,182,74,.3);}
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 820px) { .grid2 { grid-template-columns: 1fr; } nav { display: none; } main { padding: 24px; } }
+  .mode-head { display: flex; align-items: center; gap: 10px; }
+  .k { color: var(--accent2); }
+</style>
+</head>
+<body>
+<div class="layout">
+<nav>
+  <h1>Shadow Residual</h1>
+  <div class="tag">Training Script Manual</div>
+  <div class="grp">Overview</div>
+  <a href="#intro">1. What SR is</a>
+  <a href="#structure">2. Project structure</a>
+  <div class="grp">Reference</div>
+  <a href="#config">3. Configuration schema</a>
+  <a href="#cli">4. Script inputs (CLI)</a>
+  <a href="#modes">5. Modes of operation</a>
+  <div class="grp">Workflow</div>
+  <a href="#flow">6. End-to-end flow</a>
+  <a href="#flow" class="sub">6a. Data preparation</a>
+  <a href="#flow" class="sub">6b. Training</a>
+  <a href="#flow" class="sub">6c. Generation</a>
+  <a href="#serving">7. Serving / eval</a>
+  <a href="#invariants">8. Invariants</a>
+</nav>
+
+<main>
+
+<h2 id="intro">1. What Shadow Residual is</h2>
+<p class="lead">Shadow Residual (SR) is a PEFT adapter that runs two parallel streams per decoder layer.</p>
+<div class="card">
+  <p>Each decoder layer runs:</p>
+  <ul>
+    <li><b>A frozen base stream</b> — bit-exact with the unadapted base model. Q/K/V/O/MLP use the base weights with no delta.</li>
+    <li><b>A trainable adapter stream</b> — LoRA deltas plus a per-layer rank-R <code>cross_stream</code> injection drawn from the base stream.</li>
+  </ul>
+  <p>Only <code>norm(h_adapt)</code> — the adapter stream's normed hidden state — reaches the LM head. Under the hood SR is an ordinary PEFT adapter; it just requires two custom PEFT module types (<code>CrossStreamLora</code>, <code>ShadowResidualLora</code>) and a dedicated loader.</p>
+</div>
+<p>Crucially, <b>there is no architecture name in the config</b>. Behavior is determined entirely by which fields are set. This manual documents the single training entry point, <code>sr-train</code>, and everything around it.</p>
+
+<h2 id="structure">2. Project structure</h2>
+<pre><code>src/shadow_residual/
+├── shadow_residual/          # the HF model
+│   ├── modeling_hf.py            ShadowResidualModel / …ForCausalLM
+│   ├── decoder_hf.py             dual-stream + single-stream early-exit
+│   ├── attention_hf.py           disjoint vs shared-base K/V
+│   ├── cross_stream.py           no-op site PEFT wraps into CrossStreamLora
+│   ├── model_config.py           vendored ShadowResidualConfig
+│   ├── config_helpers.py         validate / set_shadow_residual
+│   └── weight_transfer.py        fused→unfused QKV / gate-up slicing
+├── peft_shadow_residual/     # PEFT integration
+│   ├── factory.py                get_shadow_residual_peft_model  (TRAINING)
+│   ├── load.py                   load_shadow_residual_peft_model (SERVING)
+│   ├── cross_stream_lora.py      CrossStreamLora (rank-R B·A)
+│   └── stream_gated_lora.py      ShadowResidualLora
+├── config/                   # config schema + reference YAMLs
+│   ├── training_config.py        Pydantic schema (this manual §3)
+│   ├── adapters.py               to_peft_config / to_training_arguments
+│   └── *.yaml                    lora / alora / sr reference configs
+├── training/                 # ← the training script lives here
+│   ├── train.py                  sr-train entry point (§4)
+│   ├── generate.py               post-training / standalone generation (§6c)
+│   ├── data.py                   JSONL loader, collators, aLoRA sanity check
+│   └── chat_render.py            chat-template rendering
+└── eval/answerability_eval.py    peft / switch / vllm eval modes</code></pre>
+
+<h3>Reference config YAMLs</h3>
+<table>
+  <tr><th>File</th><th>What it configures</th></tr>
+  <tr><td><code>lora-qkvo-mlp-r16.yaml</code></td><td>Plain LoRA (no <code>cross_stream</code>, no invocation tokens) → single-stream early-exit.</td></tr>
+  <tr><td><code>alora-all-linear-r16.yaml</code></td><td>aLoRA — gated activation via <code>invocation_tokens</code>, no cross_stream.</td></tr>
+  <tr><td><code>sr-qo-mlp-r32-c32-sharedkv.yaml</code></td><td>SR production config, Granite 4.1 3B, shared-base K/V.</td></tr>
+  <tr><td><code>sr-qo-mlp-r32-c32-sharedkv-8b.yaml</code></td><td>Same, 8B base.</td></tr>
+  <tr><td><code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code></td><td>Same, Granite 4.2 base.</td></tr>
+</table>
+
+<h2 id="config">3. Configuration schema</h2>
+<p>The YAML is validated by a strict Pydantic model (<code>training_config.py</code>). Unknown keys fail loudly. <code>${VAR}</code> references are resolved from the environment (unset → error). Below is every block.</p>
+
+<h3><span class="k">model:</span></h3>
+<table>
+  <tr><th>Field</th><th>Type / default</th><th>Meaning</th></tr>
+  <tr><td><code>base</code></td><td>str <span class="pill">required</span></td><td>HF model ID or local path, e.g. <code>ibm-granite/granite-4.1-3b</code>.</td></tr>
+  <tr><td><code>attn_implementation</code></td><td>str / null</td><td><code>sdpa</code>, <code>flash_attention_2</code>, …</td></tr>
+  <tr><td><code>shared_base_kv</code></td><td>bool / <b>null (auto)</b></td><td>One base-only K/V cache shared with the adapter Q (<code>true</code>) vs disjoint per-stream (<code>false</code>). Auto-resolves from <code>target_modules</code> (§5). <code>true</code> forbids LoRA on k_proj/v_proj. <b>Not serialized</b> — must be passed at load time if non-default.</td></tr>
+  <tr><td><code>param_dtype</code></td><td><code>bf16</code> / <code>fp32</code></td><td><code>bf16</code>: whole model in bfloat16. <code>fp32</code> + accelerate <code>mixed_precision: bf16</code>: bf16 compute via AMP, fp32 master weights/grads/optimizer — recommended for 8B/30B stability.</td></tr>
+</table>
+
+<h3><span class="k">data:</span></h3>
+<table>
+  <tr><th>Field</th><th>Type / default</th><th>Meaning</th></tr>
+  <tr><td><code>train_path</code> / <code>val_path</code></td><td>str <span class="pill">required</span></td><td>JSONL datasets (row shape in §6a).</td></tr>
+  <tr><td><code>max_length</code></td><td>int / 8192</td><td>Max sequence length.</td></tr>
+  <tr><td><code>assistant_marker</code></td><td>str / null</td><td>Response-template string for label masking; only used when the chat template lacks <code>{% generation %}</code> markers.</td></tr>
+  <tr><td><code>enable_thinking</code></td><td>bool / false</td><td>Forwarded to <code>apply_chat_template(enable_thinking=…)</code>. CLI <code>--thinking</code> wins.</td></tr>
+</table>
+
+<h3><span class="k">adapter:</span></h3>
+<table>
+  <tr><th>Field</th><th>Type / default</th><th>Meaning</th></tr>
+  <tr><td><code>target_modules</code></td><td>int OR dict / 32</td><td>Carries both module selection AND rank. Scalar int → uniform rank on <code>all-linear</code>. Dict <code>{name: rank}</code> → per-module names and ranks. Include <code>cross_stream</code> here to engage SR dual-stream.</td></tr>
+  <tr><td><code>alpha</code></td><td>int / null</td><td>Defaults to 2 × (max) rank.</td></tr>
+  <tr><td><code>dropout</code></td><td>float / 0.0</td><td>LoRA dropout.</td></tr>
+  <tr><td><code>bias</code></td><td>none / all / lora_only</td><td>LoRA bias handling.</td></tr>
+  <tr><td><code>invocation_tokens</code></td><td>str / null</td><td>When set → aLoRA-style gated activation (delta off until the token sequence appears). Forces gradient_checkpointing off (PEFT #2826).</td></tr>
+</table>
+
+<h3><span class="k">optimizer:</span> · <span class="k">scheduler:</span> · <span class="k">batch:</span></h3>
+<div class="grid2">
+<table>
+  <tr><th>optimizer</th><th>default</th></tr>
+  <tr><td><code>name</code></td><td>paged_adamw_8bit</td></tr>
+  <tr><td><code>learning_rate</code></td><td>2.0e-4</td></tr>
+  <tr><td><code>weight_decay</code></td><td>0.01</td></tr>
+  <tr><td><code>max_grad_norm</code></td><td>1.0</td></tr>
+  <tr><th>scheduler</th><th>default</th></tr>
+  <tr><td><code>type</code></td><td>cosine</td></tr>
+  <tr><td><code>warmup_ratio</code></td><td>0.05</td></tr>
+</table>
+<table>
+  <tr><th>batch</th><th>default</th></tr>
+  <tr><td><code>per_device_train</code></td><td>1</td></tr>
+  <tr><td><code>gradient_accumulation</code></td><td>16</td></tr>
+  <tr><td><code>per_device_eval</code></td><td>1</td></tr>
+  <tr><td><code>gradient_checkpointing</code></td><td>true</td></tr>
+  <tr><td><code>gradient_checkpointing_kwargs</code></td><td><code>{use_reentrant: false}</code></td></tr>
+</table>
+</div>
+
+<h3><span class="k">validation:</span> · <span class="k">save:</span> · <span class="k">runtime:</span></h3>
+<div class="grid2">
+<table>
+  <tr><th>validation</th><th>default</th></tr>
+  <tr><td><code>strategy</code></td><td>epoch</td></tr>
+  <tr><td><code>load_best_model_at_end</code></td><td>true</td></tr>
+  <tr><td><code>metric_for_best_model</code></td><td>eval_loss</td></tr>
+  <tr><td><code>early_stopping_patience</code></td><td>3</td></tr>
+  <tr><td><code>stop_on_nan</code></td><td>true</td></tr>
+  <tr><th>save</th><th>default</th></tr>
+  <tr><td><code>strategy</code></td><td>epoch</td></tr>
+  <tr><td><code>total_limit</code></td><td>3</td></tr>
+  <tr><td><code>output_dir</code></td><td><span class="pill">required</span></td></tr>
+</table>
+<table>
+  <tr><th>runtime</th><th>default</th></tr>
+  <tr><td><code>num_train_epochs</code></td><td>3</td></tr>
+  <tr><td><code>seed</code></td><td>42</td></tr>
+  <tr><td><code>logging_steps</code></td><td>1</td></tr>
+  <tr><td><code>dataloader_num_workers</code></td><td>4</td></tr>
+  <tr><td><code>report_to</code></td><td>[tensorboard]</td></tr>
+  <tr><td><code>fsdp</code></td><td>false (bool or dict)</td></tr>
+</table>
+</div>
+
+<h3><span class="k">generation:</span> <span class="badge-opt">optional block</span></h3>
+<p>Omit the whole block to disable post-training generation. When present, <code>input_path</code> is required.</p>
+<table>
+  <tr><th>Field</th><th>default</th><th>Meaning</th></tr>
+  <tr><td><code>input_path</code></td><td><span class="pill">required</span></td><td>Eval JSONL to generate against.</td></tr>
+  <tr><td><code>max_new_tokens</code></td><td>256</td><td></td></tr>
+  <tr><td><code>temperature</code> / <code>top_p</code> / <code>do_sample</code></td><td>0.0 / 1.0 / false</td><td>Sampling only applied when <code>do_sample=true</code>.</td></tr>
+  <tr><td><code>batch_size</code></td><td>8</td><td>Halved automatically on CUDA OOM, down to 1.</td></tr>
+  <tr><td><code>output_filename</code></td><td>predictions.jsonl</td><td>Written into the output dir.</td></tr>
+  <tr><td><code>debug_probability</code></td><td>0.0</td><td>Fraction of batches to log decoded prompt+output.</td></tr>
+</table>
+
+<h2 id="cli">4. Script inputs — the CLI</h2>
+<p>Entry point: <code>sr-train</code> (equivalently <code>python -m shadow_residual.training.train</code>). The YAML is <b>required</b>; named flags override matching YAML fields.</p>
+
+<h4>Overrides for the most-edited fields</h4>
+<table>
+  <tr><th>Flag</th><th>Overrides</th></tr>
+  <tr><td><code>--config</code> <span class="pill">required</span></td><td>Path to the training-config YAML.</td></tr>
+  <tr><td><code>--output-dir</code></td><td><code>save.output_dir</code></td></tr>
+  <tr><td><code>--train-data</code> / <code>--val-data</code></td><td><code>data.train_path</code> / <code>data.val_path</code></td></tr>
+  <tr><td><code>--lr</code></td><td><code>optimizer.learning_rate</code></td></tr>
+  <tr><td><code>--epochs</code></td><td><code>runtime.num_train_epochs</code></td></tr>
+  <tr><td><code>--seed</code></td><td><code>runtime.seed</code></td></tr>
+  <tr><td><code>--lora-r</code></td><td>Replaces <code>adapter.target_modules</code> with a uniform scalar rank.</td></tr>
+  <tr><td><code>--lora-alpha</code></td><td><code>adapter.alpha</code></td></tr>
+  <tr><td><code>--batch-size</code> / <code>--grad-accum</code></td><td><code>batch.per_device_train</code> / <code>batch.gradient_accumulation</code></td></tr>
+</table>
+
+<h4>Behavior flags</h4>
+<table>
+  <tr><th>Flag</th><th>Effect</th></tr>
+  <tr><td><code>--thinking</code> / <code>--enable-thinking</code></td><td>Sets <code>data.enable_thinking=True</code>.</td></tr>
+  <tr><td><code>--wandb</code></td><td>Sets <code>runtime.report_to=['wandb']</code>.</td></tr>
+  <tr><td><code>--max-steps N</code></td><td>Caps training to N optimizer steps (takes precedence over epochs). For short diagnostic runs that still exercise the generate path.</td></tr>
+  <tr><td><code>--skip-post-train-generate</code></td><td>Skips in-process generation. Use when running generate as a separate process (avoids post-training CUDA residue that OOMs the FSDP gather+rebuild at 30B).</td></tr>
+  <tr><td><code>--no-grad-checkpoint</code></td><td>Disables non-reentrant gradient checkpointing for gated SR (diagnostic; safe only when activations fit, e.g. 3B/DDP).</td></tr>
+  <tr><td><code>--debug-collator</code></td><td>Periodically logs a decoded training example + labels; also enables generation debug printing.</td></tr>
+  <tr><td><code>--quantize</code></td><td class="muted">Reserved — currently raises <code>NotImplementedError</code> (4-bit QLoRA not supported on this path).</td></tr>
+</table>
+
+<h4>Invocation examples</h4>
+<pre><code># Local, single GPU
+sr-train --config src/shadow_residual/config/sr-qo-mlp-r32-c32-sharedkv.yaml \
+         --train-data /data/train.jsonl --val-data /data/eval.jsonl \
+         --output-dir ./ckpt
+
+# Multi-GPU (DDP / FSDP)
+accelerate launch --num_processes 4 --multi_gpu --mixed_precision bf16 \
+  -m shadow_residual.training.train --config &lt;cfg&gt;.yaml \
+  --train-data … --val-data … --output-dir ./ckpt</code></pre>
+
+<h2 id="modes">5. Modes of operation</h2>
+<p>There is no <code>--mode</code> flag. The mode emerges from two YAML fields: whether <code>cross_stream</code> is in <code>target_modules</code>, and whether <code>invocation_tokens</code> is set.</p>
+
+<div class="card">
+  <div class="mode-head"><span class="n" style="display:inline-flex;width:22px;height:22px;border-radius:50%;background:var(--muted);color:#000;align-items:center;justify-content:center;font-weight:700;font-size:12px;">A</span><h3 style="margin:0;">Plain LoRA — single-stream early-exit</h3></div>
+  <p><code>cross_stream</code> absent · <code>invocation_tokens</code> unset.</p>
+  <p class="muted">Dual-stream forward is skipped (early-exit path ≈ plain LoRA on Granite). <code>shared_base_kv</code> auto-resolves to <code>false</code> (K/V on the adapter stream; a warning is logged). Reference: <code>lora-qkvo-mlp-r16.yaml</code>.</p>
+</div>
+
+<div class="card">
+  <div class="mode-head"><span class="n" style="display:inline-flex;width:22px;height:22px;border-radius:50%;background:var(--muted);color:#000;align-items:center;justify-content:center;font-weight:700;font-size:12px;">B</span><h3 style="margin:0;">aLoRA — gated activation</h3></div>
+  <p><code>cross_stream</code> absent · <code>invocation_tokens</code> set.</p>
+  <p class="muted">The delta stays off until the invocation token sequence appears in the input. Requires <code>task_type="CAUSAL_LM"</code> (schema sets it). Forces HF gradient_checkpointing off; train.py re-enables non-reentrant checkpointing explicitly. Reference: <code>alora-all-linear-r16.yaml</code>.</p>
+</div>
+
+<div class="card">
+  <div class="mode-head"><span class="n" style="display:inline-flex;width:22px;height:22px;border-radius:50%;background:var(--accent2);color:#000;align-items:center;justify-content:center;font-weight:700;font-size:12px;">C</span><h3 style="margin:0;">Shadow Residual (dual-stream)</h3></div>
+  <p><code>cross_stream</code> present in <code>target_modules</code>.</p>
+  <p class="muted">Dual-stream SR forward engages. <code>shared_base_kv</code> auto-resolves to <code>true</code> (one base-only K/V cache), which forbids LoRA on k_proj/v_proj. Optionally combine with <code>invocation_tokens</code> for <b>gated SR</b>. References: the <code>sr-qo-mlp-*-sharedkv*.yaml</code> configs.</p>
+</div>
+
+<div class="note"><b>The <code>shared_base_kv</code> auto rule:</b> unset (<code>null</code>) means resolve from <code>target_modules</code> — <code>true</code> if <code>cross_stream</code> is present, else <code>false</code>. An explicit <code>true</code>/<code>false</code> always wins. Because it is not serialized into <code>adapter_config.json</code>, a checkpoint trained with a non-default value <b>must pass the same value explicitly</b> to the loader at serve time.</div>
+
+<h4>Also mode-shaping</h4>
+<ul>
+  <li><b><code>param_dtype</code></b> — <code>fp32</code> master weights for 8B/30B stability vs <code>bf16</code> throughout.</li>
+  <li><b><code>runtime.fsdp</code> + accelerate launch</b> — DDP vs FSDP sharding; drives the FSDP-aware post-training generate path.</li>
+  <li><b>Response-only masking</b> — auto: TRL <code>assistant_only_loss=True</code> when the chat template has <code>{% generation %}</code> markers, else the hand-rolled <code>ResponseOnlyCollator</code> (masks everything before the <em>last</em> assistant marker).</li>
+</ul>
+
+<h2 id="flow">6. End-to-end flow</h2>
+<p>The full lifecycle around the training script. Optional steps are marked in amber.</p>
+
+<div class="flow">
+  <div class="flow-step">
+    <span class="n">1</span><span class="title">Data preparation</span>
+    <div class="body">Produce <code>train.jsonl</code> / <code>val.jsonl</code>. See §6a for row shape.</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step">
+    <span class="n">2</span><span class="title">Author / pick a config YAML</span>
+    <div class="body">Choose mode via fields (§5). Set <code>${VAR}</code> env references for paths.</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step">
+    <span class="n">3</span><span class="title">Launch <code>sr-train</code></span>
+    <div class="body">Tokenizer load → invocation-token IDs → PEFT config → SR+PEFT model build → gated-SR checkpointing → dataset load + aLoRA sanity check → SFTTrainer.</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step">
+    <span class="n">4</span><span class="title">Train + save</span>
+    <div class="body"><code>trainer.train()</code> → <code>save_model</code> + tokenizer to <code>output_dir</code>. Guard: fails loudly if the save is sharded (no <code>adapter_model.safetensors</code>).</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step optional">
+    <span class="n">5</span><span class="title">Post-training generation <span class="badge-opt">optional</span></span>
+    <div class="body">Runs if a <code>generation:</code> block is present and <code>--skip-post-train-generate</code> is not set. Uses the in-memory model (FSDP-aware). See §6c.</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step optional">
+    <span class="n">6</span><span class="title">Standalone generate / eval <span class="badge-opt">optional</span></span>
+    <div class="body">Fresh process against the saved checkpoint (§6c), then answerability eval (§7).</div>
+  </div>
+</div>
+
+<h3 id="flow-a">6a. Data preparation</h3>
+<p>Both training and generation read JSONL. One JSON object per line.</p>
+<h4>Training / eval row shape</h4>
+<pre><code>{
+  "messages":  [{"role": "user", "content": "..."},
+                {"role": "assistant", "content": "..."}],
+  "tools":     [...],   // OPTIONAL — passed verbatim to apply_chat_template
+  "documents": [...],   // OPTIONAL — passed verbatim to apply_chat_template
+  "ground_truth": "..." // OPTIONAL — for eval rows; read by the scorer
+}</code></pre>
+<ul>
+  <li><b><code>messages</code> is required.</b> <code>tools</code> / <code>documents</code> are forwarded as-is to the chat template — the template (Granite's) renders them; the loader does not reshape.</li>
+  <li>For <b>generation/eval rows</b>, <code>messages</code> should <b>not</b> include a trailing gold assistant turn — put the gold in <code>ground_truth</code>. The generator renders with <code>add_generation_prompt=True</code>.</li>
+  <li>Each row is rendered to a single <code>text</code> column via the chat template. <code>enable_thinking</code> is threaded through here.</li>
+</ul>
+<div class="note"><b>Label masking is response-only.</b> Loss is computed on the <em>final</em> assistant turn only. In multi-turn RAG data, masking from the first marker would train the model to reproduce long intermediate factual turns — the collator scans from the end.</div>
+<div class="warn"><b>Gated (aLoRA) data check:</b> when <code>invocation_tokens</code> is set, <code>sr-train</code> samples the first rows and refuses to start if the invocation token sequence is absent (the adapter would never activate). A partial match logs a warning.</div>
+
+<h3 id="flow-b">6b. Training — what the script does step by step</h3>
+<ol>
+  <li>Load tokenizer; set pad token and right-padding.</li>
+  <li>If gated: encode <code>invocation_tokens</code> → IDs, attach to the PEFT config.</li>
+  <li>Build <code>LoraConfig</code> from the adapter block (<code>to_peft_config</code>).</li>
+  <li>Build the SR+PEFT model via <code>get_shadow_residual_peft_model</code> (base + adapter streams; <code>shared_base_kv</code> resolved here).</li>
+  <li>For gated SR: enable non-reentrant gradient checkpointing + <code>enable_input_require_grads</code>.</li>
+  <li>Load train/val datasets; run the aLoRA sanity check if gated.</li>
+  <li>Build <code>SFTConfig</code>; pick the response-only masking path (assistant_only_loss vs collator).</li>
+  <li><code>SFTTrainer.train()</code> with early-stopping + stop-on-NaN callbacks.</li>
+  <li>Save adapter + tokenizer; guard against a sharded/non-consolidated save.</li>
+</ol>
+
+<h3 id="flow-c">6c. Generation</h3>
+<p><code>run_generation</code> in <code>generate.py</code> is the single source of truth. It is called two ways:</p>
+<ul>
+  <li><b>Post-training (in train.py):</b> uses the in-memory PEFT model, no reload. Under FSDP it dispatches to <code>run_generation_under_fsdp</code> (gather FULL_STATE_DICT → tear down shards → rebuild non-FSDP on rank 0 → generate). Non-FSDP: only rank 0 generates.</li>
+  <li><b>Standalone CLI:</b> loads a saved checkpoint from disk via the SR loader, then generates. Useful to give generation a clean CUDA context at 30B.</li>
+</ul>
+<pre><code>python -m shadow_residual.training.generate \
+    --config path/to/training_config.yaml \
+    --checkpoint /path/to/saved/adapter \
+    [--data eval.jsonl]     # defaults to cfg.generation.input_path
+    [--out predictions.jsonl]  # defaults to &lt;checkpoint&gt;/&lt;output_filename&gt;
+    [--limit N] [--debug-generate 0.01]</code></pre>
+<p>Output rows preserve the input row verbatim and add one key, <code>generated_content</code>. Batch size halves on OOM down to 1. Left-padding is applied for generation and restored afterward.</p>
+
+<h2 id="serving">7. Serving / evaluation</h2>
+<p>Load through the SR loader — <b>not</b> <code>PeftModel.from_pretrained</code>, which can't re-register SR's custom modules.</p>
+<pre><code>from shadow_residual.peft_shadow_residual import load_shadow_residual_peft_model
+model = load_shadow_residual_peft_model(
+    base_id, adapter_path,
+    torch_dtype=...,
+    shared_base_kv=&lt;same value used at training&gt;,  # not serialized!
+)</code></pre>
+<p>Answerability eval:</p>
+<pre><code>python -m shadow_residual.eval.answerability_eval --mode peft \
+    --base-model &lt;id&gt; --adapter &lt;path&gt; …</code></pre>
+<p><code>--mode peft</code> is standalone. <code>--mode switch</code> / <code>--mode vllm</code> require the optional <code>granite-switch</code> dependency.</p>
+
+<h2 id="invariants">8. Invariants — do not break these</h2>
+<div class="danger">
+  <ol style="margin:0;">
+    <li><b>Frozen base stream.</b> Never let a LoRA delta reach a <code>stream_context("base")</code> call. <code>merge_and_unload</code> is disabled on purpose.</li>
+    <li><b>Disjoint vs shared K/V.</b> Disjoint = two caches; shared = one base-only cache, no K/V LoRA. Shared is auto-default when <code>cross_stream</code> is present.</li>
+    <li><b>ALORA three-knob rule.</b> <code>invocation_tokens</code> + <code>task_type="CAUSAL_LM"</code> + <code>cross_stream</code> must all be set for gated SR; missing any one silently degrades to unconditional LoRA.</li>
+  </ol>
+</div>
+<div class="warn"><b>Git protocol:</b> never commit or push in this repo. Stage only; the maintainer reviews and commits. Never sign commits as Claude.</div>
+
+<p class="muted" style="margin-top:40px; font-size:12.5px;">Generated from <code>src/shadow_residual/training/train.py</code>, <code>generate.py</code>, <code>data.py</code>, <code>config/training_config.py</code>, and <code>config/adapters.py</code>. See <code>docs/sr_architecture_explainer.md</code> for the architecture deep dive.</p>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shadow Residual — Talk</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --panel2: #eff1f3;
+    --border: #d0d7de;
+    --fg: #1f2328;
+    --muted: #656d76;
+    --accent: #0969da;
+    --accent2: #1a7f37;
+    --warn: #9a6700;
+    --danger: #cf222e;
+    --code-bg: #f6f8fa;
+    --raw: #8250df;
+    --g41: #1a7f37;
+    --g42: #9a6700;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .layout { display: flex; min-height: 100vh; }
+  nav {
+    width: 270px;
+    flex: 0 0 270px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    padding: 24px 18px;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+  }
+  nav h1 { font-size: 16px; margin: 0 0 4px; letter-spacing: .3px; }
+  nav .tag { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+  nav a {
+    display: block;
+    color: var(--muted);
+    text-decoration: none;
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 13.5px;
+  }
+  nav a:hover { color: var(--fg); background: var(--panel2); }
+  nav a.sub { padding-left: 22px; font-size: 12.5px; }
+  nav .grp { margin-top: 14px; color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; padding: 0 10px 4px; }
+  main { flex: 1; padding: 40px 52px 120px; max-width: 1000px; }
+  h2 { font-size: 26px; margin: 48px 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  h2:first-child { margin-top: 0; }
+  .part-divider {
+    margin: 72px 0 8px; padding: 22px 26px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 5px solid var(--accent); border-radius: 10px;
+  }
+  .part-divider .kicker { color: var(--accent); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px; }
+  .part-divider h2 { border: 0; margin: 4px 0 6px; padding: 0; font-size: 28px; }
+  .part-divider p { color: var(--muted); margin: 0; font-size: 14.5px; }
+  h3 { font-size: 18px; margin: 30px 0 10px; color: var(--accent2); }
+  h4 { font-size: 15px; margin: 20px 0 8px; }
+  p { color: var(--fg); }
+  code { font-family: var(--mono); font-size: .88em; background: var(--code-bg); padding: 2px 6px; border-radius: 4px; color: #0550ae; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; color: #1f2328; }
+  pre.raw { border-left: 4px solid var(--raw); }
+  pre.g41 { border-left: 4px solid var(--g41); }
+  pre.g42 { border-left: 4px solid var(--g42); }
+  .lead { color: var(--muted); font-size: 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--border); padding: 8px 11px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); color: var(--accent); font-weight: 600; }
+  td code { white-space: nowrap; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin: 16px 0; }
+  .note, .warn, .danger {
+    border-radius: 8px; padding: 12px 16px; margin: 16px 0; font-size: 14px;
+    border-left: 4px solid var(--accent);
+    background: #ddf4ff;
+  }
+  .warn { border-left-color: var(--warn); background: #fff8c5; }
+  .danger { border-left-color: var(--danger); background: #ffebe9; }
+  .note b, .warn b, .danger b { color: var(--fg); }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; background: var(--panel2); border: 1px solid var(--border); color: var(--muted); margin-left: 6px; }
+  .muted { color: var(--muted); }
+  .tag { display:inline-block; font-size:11px; font-weight:600; padding:2px 8px; border-radius:12px; vertical-align:middle; margin-left:8px; }
+  .tag.raw { background:rgba(130,80,223,.12); color:#8250df; }
+  .tag.g41 { background:rgba(26,127,55,.12); color:#1a7f37; }
+  .tag.g42 { background:rgba(154,103,0,.12); color:#9a6700; }
+
+  /* Flow diagram */
+  .flow { display: flex; flex-direction: column; gap: 0; margin: 20px 0; }
+  .flow-step {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 18px; position: relative;
+  }
+  .flow-step .n {
+    display: inline-flex; width: 24px; height: 24px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-weight: 700; font-size: 13px;
+    align-items: center; justify-content: center; margin-right: 10px;
+  }
+  .flow-step.optional .n { background: var(--warn); }
+  .flow-step .title { font-weight: 600; font-size: 15px; }
+  .flow-step .body { color: var(--muted); font-size: 13.5px; margin-top: 6px; margin-left: 34px; }
+  .flow-arrow { text-align: center; color: var(--border); font-size: 20px; line-height: 1; padding: 4px 0; }
+  .badge-opt { font-size: 10.5px; background: rgba(154,103,0,.15); color: var(--warn); padding: 1px 7px; border-radius: 10px; margin-left: 8px; border: 1px solid rgba(154,103,0,.3);}
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } nav { display: none; } main { padding: 24px; } }
+  .mode-head { display: flex; align-items: center; gap: 10px; }
+  .k { color: var(--accent2); }
+
+  .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin: 18px 0; }
+  .caption { color: var(--muted); font-size: 13px; margin-top: 8px; text-align: center; }
+  svg { display: block; max-width: 100%; height: auto; }
+  .file { font-family: var(--mono); color: #1a7f37; }
+</style>
+</head>
+<body>
+<div class="layout">
+<nav>
+  <h1>Shadow Residual</h1>
+  <div class="tag">Talk</div>
+
+  <div class="grp">Part 1 · Architecture</div>
+  <a href="#intro">1.1 What SR is</a>
+  <a href="#structure" class="sub">Project structure</a>
+  <a href="#classes">1.2 Class hierarchy</a>
+
+  <div class="grp">Part 2 · Data preparation</div>
+  <a href="#data-format">2.1 Data format &amp; rendering</a>
+  <a href="#thinking">2.2 Thinking / reasoning content</a>
+
+  <div class="grp">Part 3 · Training</div>
+  <a href="#running">3.1 Running training</a>
+  <a href="#config">3.2 Configuration schema</a>
+  <a href="#cli">3.3 Script inputs (CLI)</a>
+  <a href="#modes">3.4 Modes of operation</a>
+  <a href="#flow">3.5 End-to-end flow</a>
+
+  <a href="#advanced" class="grp" style="display:block;">Part 4 · Advanced details</a>
+  <a href="#adv-crossnoop">4.1 Why W-cross is a no-op</a>
+  <a href="#adv-peft">4.2 PEFT implementation</a>
+  <a href="#adv-earlyexit">4.3 Adapter-only early-exit</a>
+  <a href="#adv-kv">4.4 Disjoint vs shared-base K/V</a>
+  <a href="#adv-alora">4.5 aLoRA gating (FASO-style)</a>
+  <a href="#adv-transfer">4.6 Fused→unfused transfer</a>
+  <a href="#adv-fsdp">4.7 FSDP &amp; post-train generate</a>
+  <a href="#adv-merge">4.8 Why merge is disabled</a>
+</nav>
+
+<main>
+
+<!-- ============================================================ -->
+<!-- PART 1 — ARCHITECTURE                                         -->
+<!-- ============================================================ -->
+<h2 id="intro">1.1 What Shadow Residual is</h2>
+<p class="lead">Shadow Residual (SR) is a PEFT adapter that runs two parallel streams per decoder layer.</p>
+<div class="card">
+  <p>Each decoder layer runs:</p>
+  <ul>
+    <li><b>A frozen base stream</b> — bit-exact with the unadapted base model. Q/K/V/O/MLP use the base weights with no delta.</li>
+    <li><b>A trainable adapter stream</b> — LoRA deltas plus a per-layer rank-R <code>cross_stream</code> injection drawn from the base stream.</li>
+  </ul>
+  <p>Only <code>norm(h_adapt)</code> — the adapter stream's normed hidden state — reaches the LM head. Under the hood SR is an ordinary PEFT adapter; it just requires two custom PEFT module types (<code>CrossStreamLora</code>, <code>ShadowResidualLora</code>) and a dedicated loader.</p>
+</div>
+<p>Crucially, <b>there is no architecture name in the config</b>. Behavior is determined entirely by which fields are set. This deck documents the single training entry point, <code>sr-train</code>, and everything around it.</p>
+
+<h3 id="structure">Project structure</h3>
+<pre><code>src/shadow_residual/
+├── shadow_residual/          # the HF model
+│   ├── modeling_hf.py            ShadowResidualModel / …ForCausalLM
+│   ├── decoder_hf.py             dual-stream + single-stream early-exit
+│   ├── attention_hf.py           disjoint vs shared-base K/V
+│   ├── cross_stream.py           no-op site PEFT wraps into CrossStreamLora
+│   ├── model_config.py           vendored ShadowResidualConfig
+│   ├── config_helpers.py         validate / set_shadow_residual
+│   └── weight_transfer.py        fused→unfused QKV / gate-up slicing
+├── peft_shadow_residual/     # PEFT integration
+│   ├── factory.py                get_shadow_residual_peft_model  (TRAINING)
+│   ├── load.py                   load_shadow_residual_peft_model (SERVING)
+│   ├── cross_stream_lora.py      CrossStreamLora (rank-R B·A)
+│   └── stream_gated_lora.py      ShadowResidualLora
+├── config/                   # config schema + reference YAMLs
+│   ├── training_config.py        Pydantic schema (see §3.2)
+│   ├── adapters.py               to_peft_config / to_training_arguments
+│   └── *.yaml                    lora / alora / sr reference configs
+├── training/                 # ← the training script lives here
+│   ├── train.py                  sr-train entry point (§3.3)
+│   ├── generate.py               post-training / standalone generation
+│   ├── data.py                   JSONL loader, collators, aLoRA sanity check
+│   └── chat_render.py            chat-template rendering
+└── eval/answerability_eval.py    peft / switch / vllm eval modes</code></pre>
+
+<h3>Reference config YAMLs</h3>
+<table>
+  <tr><th>File</th><th>What it configures</th></tr>
+  <tr><td><code>lora-qkvo-mlp-r16.yaml</code></td><td>Plain LoRA (no <code>cross_stream</code>, no invocation tokens) → single-stream early-exit.</td></tr>
+  <tr><td><code>alora-all-linear-r16.yaml</code></td><td>aLoRA — gated activation via <code>invocation_tokens</code>, no cross_stream.</td></tr>
+  <tr><td><code>sr-qo-mlp-r32-c32-sharedkv.yaml</code></td><td>SR production config, Granite 4.1 3B, shared-base K/V.</td></tr>
+  <tr><td><code>sr-qo-mlp-r32-c32-sharedkv-8b.yaml</code></td><td>Same, 8B base.</td></tr>
+  <tr><td><code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code></td><td>Same, Granite 4.2 base.</td></tr>
+</table>
+
+<h2 id="classes">1.2 The class hierarchy — what inherits from what</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 980 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Class hierarchy">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#656d76"/>
+    </marker>
+    <marker id="arrW" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8250df"/>
+    </marker>
+  </defs>
+  <style>
+    .b { fill: #eef1f5; stroke: #d0d7de; }
+    .lbl { font: 13px ui-monospace, monospace; fill: #1f2328; }
+    .sub { font: 11px ui-monospace, monospace; fill: #656d76; }
+    .edge { stroke: #656d76; fill: none; stroke-width: 1.4; }
+    .accent { stroke: #0969da; }
+    .base   { fill: #ddeefb; stroke: #7fb2df; }
+    .adapt  { fill: #ffebe9; stroke: #f0a8ad; }
+    .cross  { fill: #fff8c5; stroke: #d9bf6b; }
+    .peft   { fill: #f3ecfd; stroke: #c3a6ef; }
+    .wrap   { stroke: #8250df; fill: none; stroke-width: 1.6; stroke-dasharray: 5 3; }
+  </style>
+
+  <!-- Upstream parent -->
+  <rect class="b" x="20"  y="20"  width="280" height="58" rx="8"/>
+  <text class="lbl" x="34" y="46">GraniteMoeHybridPreTrainedModel</text>
+  <text class="sub" x="34" y="64">transformers (upstream)</text>
+
+  <!-- ShadowResidualPreTrainedModel -->
+  <rect class="b accent" x="20"  y="120" width="280" height="58" rx="8"/>
+  <text class="lbl" x="34" y="146">ShadowResidualPreTrainedModel</text>
+  <text class="sub" x="34" y="164">config_class = ShadowResidualConfig</text>
+
+  <!-- ShadowResidualModel -->
+  <rect class="b adapt" x="20"  y="220" width="280" height="58" rx="8"/>
+  <text class="lbl" x="34" y="246">ShadowResidualModel</text>
+  <text class="sub" x="34" y="264">embed + layers[N] + norm</text>
+
+  <!-- ShadowResidualForCausalLM -->
+  <rect class="b adapt" x="20" y="300" width="280" height="50" rx="8"/>
+  <text class="lbl" x="34" y="324">ShadowResidualForCausalLM</text>
+  <text class="sub" x="34" y="342">+ lm_head, GenerationMixin</text>
+
+  <!-- decoder layer -->
+  <rect class="b adapt" x="380" y="220" width="280" height="58" rx="8"/>
+  <text class="lbl" x="394" y="246">ShadowResidualDecoderLayer</text>
+  <text class="sub" x="394" y="264">self_attn + gate/up/down + cross_stream</text>
+
+  <!-- self_attn module -->
+  <rect class="b base" x="380" y="300" width="280" height="50" rx="8"/>
+  <text class="lbl" x="394" y="324">ShadowResidualAttention</text>
+  <text class="sub" x="394" y="342">q_proj k_proj v_proj o_proj (StreamGated)</text>
+
+  <!-- cross_stream site -->
+  <rect class="b cross" x="700" y="220" width="260" height="58" rx="8"/>
+  <text class="lbl" x="714" y="246">CrossStream  (no-op site)</text>
+  <text class="sub" x="714" y="264">wrapped at PEFT-time ↓</text>
+
+  <!-- _StreamGatedLinear marker -->
+  <rect class="b" x="700" y="300" width="260" height="50" rx="8"/>
+  <text class="lbl" x="714" y="324">_StreamGatedLinear</text>
+  <text class="sub" x="714" y="342">marker subclass of nn.Linear ↓</text>
+
+  <!-- PEFT wrappers row -->
+  <rect class="peft" x="700" y="380" width="260" height="60" rx="8"/>
+  <text class="lbl" x="714" y="404">CrossStreamLora</text>
+  <text class="sub" x="714" y="422">LoraLayer, rank-R B·A only</text>
+  <text class="sub" x="714" y="436">(no base contribution)</text>
+
+  <rect class="peft" x="380" y="380" width="280" height="60" rx="8"/>
+  <text class="lbl" x="394" y="404">ShadowResidualLora</text>
+  <text class="sub" x="394" y="422">peft lora.Linear + stream gate:</text>
+  <text class="sub" x="394" y="436">delta OFF on stream_context("base")</text>
+
+  <!-- inheritance / containment edges -->
+  <path class="edge" d="M160,78 V120" marker-end="url(#arr)"/>
+  <path class="edge" d="M160,178 V220" marker-end="url(#arr)"/>
+  <path class="edge" d="M160,278 V300" marker-end="url(#arr)"/>
+  <path class="edge accent" d="M300,250 H380" marker-end="url(#arr)"/>
+  <path class="edge accent" d="M520,278 V300" marker-end="url(#arr)"/>
+  <path class="edge accent" d="M660,250 H700" marker-end="url(#arr)"/>
+  <path class="edge accent" d="M660,325 H700" marker-end="url(#arr)"/>
+
+  <!-- PEFT-time wrapping edges (dashed purple) -->
+  <path class="wrap" d="M830,278 V380" marker-end="url(#arrW)"/>
+  <path class="wrap" d="M700,350 C620,350 600,368 560,380" marker-end="url(#arrW)"/>
+</svg>
+<div class="caption">Inheritance (vertical, gray) and containment (horizontal, blue). SR inherits directly from
+<code>GraniteMoeHybridPreTrainedModel</code>. The decoder layer holds attention, MLP projections (all
+<code>_StreamGatedLinear</code>), and a no-op <code>CrossStream</code> site. The dashed purple edges show the
+<b>PEFT-time wrapping</b>: <code>CrossStream</code> → <code>CrossStreamLora</code> (pure rank-R B·A, no base
+contribution) and each <code>_StreamGatedLinear</code> → <code>ShadowResidualLora</code> (stock PEFT LoRA
+plus a stream gate that turns the delta OFF whenever the layer computes under the frozen base stream).</div>
+</div>
+
+<div class="note">SR needs these two custom wrappers because vanilla PEFT can't handle them: <code>CrossStream</code>
+has <b>no weight</b> to read shapes from (it's a no-op site), and the Q/K/V/O/MLP projections need a
+<b>per-call gate</b> so the LoRA delta never contaminates the frozen base stream. Both are registered via
+PEFT's <code>LoraConfig._register_custom_module({type: wrapper})</code> in <code>factory.py</code>.</div>
+
+<!-- ============================================================ -->
+<!-- PART 2 — DATA PREPARATION                                     -->
+<!-- ============================================================ -->
+<h2 id="data-format">2.1 Data format &amp; how it renders per model</h2>
+
+<p>Training data is JSONL, one chat conversation per row. The last message is the
+assistant's <b>supervised target</b>; optional <code>documents</code> carry the RAG
+context. The two model families render that context <b>differently</b> — the code
+handles the split automatically.</p>
+
+<h3>Raw data row <span class="tag raw">INPUT (JSONL)</span></h3>
+<pre class="raw">{
+  "messages": [
+    { "role": "user",      "content": "What is the capital city of France?" },
+    { "role": "assistant", "content": "\"answerable\"" }
+  ],
+  "documents": [
+    { "doc_id": "",
+      "text": "The capital city of France is Paris. It is known for its iconic landmarks like the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city has a population of over 2.2 million people." }
+  ]
+}</pre>
+<p class="muted">The assistant target here is the literal <code>"answerable"</code>
+(quoted). <code>documents</code> is passed alongside <code>messages</code>; the code
+decides how to inject it.</p>
+
+<h3>Rendered for Granite 4.1 <span class="tag g41">role-tag format · native documents</span></h3>
+<pre class="g41">&lt;|start_of_role|&gt;system&lt;|end_of_role|&gt;You are a helpful assistant with access to the following documents. You may use one or more documents to assist with the user query.
+
+You are given a list of documents within &lt;documents&gt;&lt;/documents&gt; XML tags:
+&lt;documents&gt;
+{"doc_id": "", "text": "The capital city of France is Paris. It is known for its iconic landmarks like the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city has a population of over 2.2 million people."}
+&lt;/documents&gt;
+
+Write the response to the user's input by strictly aligning with the facts in the provided documents. If the information needed to answer the question is not available in the documents, inform the user that the question cannot be answered based on the available data.&lt;|end_of_text|&gt;
+&lt;|start_of_role|&gt;user&lt;|end_of_role|&gt;What is the capital city of France?&lt;|end_of_text|&gt;
+&lt;|start_of_role|&gt;assistant&lt;|end_of_role|&gt;"answerable"&lt;|end_of_text|&gt;</pre>
+<p class="muted">4.1's chat template renders <code>documents=</code> <b>natively</b>
+into a <code>system</code> turn wrapped in <code>&lt;documents&gt;…&lt;/documents&gt;</code>.
+Role framing is <code>&lt;|start_of_role|&gt;…&lt;|end_of_role|&gt;</code>. The supervised
+label is the bare <code>"answerable"</code> after the assistant marker.</p>
+
+<h3>Rendered for Granite 4.2 <span class="tag g42">ChatML format · documents as tool response</span></h3>
+<pre class="g42">&lt;|im_start|&gt;system
+&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+What is the capital city of France?&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+&lt;tool_response&gt;
+[
+  {
+    "source": "knowledge_base",
+    "document_id": "",
+    "content": "The capital city of France is Paris. It is known for its iconic landmarks like the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city has a population of over 2.2 million people."
+  }
+]
+&lt;/tool_response&gt;
+&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+&lt;think&gt;&lt;/think&gt;"answerable"&lt;|im_end|&gt;</pre>
+<p class="muted">4.2's ChatML template <b>ignores the <code>documents=</code> kwarg</b>,
+so the code injects the documents as an <b>agentic tool response</b> — a
+<code>tool</code> message rendered as a <code>&lt;tool_response&gt;[…]</code> block
+(normalized to <code>{source, document_id, content}</code>) after the user turn.
+The assistant turn carries an empty <code>&lt;think&gt;&lt;/think&gt;</code> reasoning
+block before the label.</p>
+
+<h3>What differs, side by side</h3>
+<table>
+  <tr><th>Aspect</th><th>Granite 4.1</th><th>Granite 4.2</th></tr>
+  <tr><td>Role framing</td>
+      <td><code>&lt;|start_of_role|&gt;R&lt;|end_of_role|&gt;</code></td>
+      <td><code>&lt;|im_start|&gt;R\n … &lt;|im_end|&gt;</code> (ChatML)</td></tr>
+  <tr><td>Documents</td>
+      <td>native <code>&lt;documents&gt;…&lt;/documents&gt;</code> in a system turn</td>
+      <td>agentic <code>&lt;tool_response&gt;[…]&lt;/tool_response&gt;</code> (a <code>tool</code> message)</td></tr>
+  <tr><td>Assistant target</td>
+      <td><code>"answerable"</code></td>
+      <td><code>&lt;think&gt;&lt;/think&gt;"answerable"</code></td></tr>
+  <tr><td>End-of-turn</td>
+      <td><code>&lt;|end_of_text|&gt;</code></td>
+      <td><code>&lt;|im_end|&gt;</code></td></tr>
+  <tr><td>Weight tying</td>
+      <td><code>tie_word_embeddings=True</code></td>
+      <td><code>False</code> (separate trained <code>lm_head.weight</code>)</td></tr>
+</table>
+
+<div class="note">
+Both renderings contain the <b>same documents and the same label</b> — only the
+framing differs. This is why RAG context reaches the model on both families, and
+why the eval must strip the 4.2 <code>&lt;think&gt;&lt;/think&gt;</code> prefix before
+reading the label. The rendering logic lives in
+<code>src/shadow_residual/training/chat_render.py</code> and is shared by training
+(<code>data.py</code>) and evaluation (<code>answerability_eval.py</code>) so they
+stay identical.
+</div>
+
+<h2 id="thinking">2.2 Handling the thinking / reasoning content</h2>
+
+<p>Granite 4.2 (ChatML) can emit a <code>&lt;think&gt;…&lt;/think&gt;</code> reasoning
+block before its answer; Granite 4.1 has no such block. A single boolean —
+<code>enable_thinking</code> — controls whether that block is requested, and it flows
+through the <b>same</b> <code>render_chat()</code> helper on both the training and eval
+paths, so the two never drift. Below is the full lifecycle of thinking content.</p>
+
+<h3>The <code>enable_thinking</code> flag and the <code>reasoning_content</code> key</h3>
+
+<p>Two distinct things control thinking, and it helps to keep them apart:</p>
+
+<ul>
+  <li><b><code>enable_thinking</code></b> carries <u>no</u> reasoning text. On Granite 4.2 it only
+      shapes the <b>trailing generation prompt</b> (appended when <code>add_generation_prompt=True</code>):
+      <code>&lt;think&gt;\n</code> when true (model generates its own reasoning) vs empty
+      <code>&lt;think&gt;&lt;/think&gt;</code> when false. It does not affect how an already-present
+      assistant message is laid out, and Granite 4.1 ignores it entirely.</li>
+  <li><b><code>reasoning_content</code></b> (a field on the assistant message) is the <b>only supported
+      way to supply reasoning text</b> on 4.2. If non-empty, the template wraps it as
+      <code>&lt;think&gt;\n{reasoning_content}\n&lt;/think&gt;\n{content}</code> — you provide plain text,
+      the template adds the tags. Inlining <code>&lt;think&gt;…&lt;/think&gt;</code> in <code>content</code>
+      does <u>not</u> work: the generation prompt appends its own <code>&lt;think&gt;</code> opener, so a
+      model trained that way emits a second block — you get <b>two <code>&lt;think&gt;</code> sections</b>.</li>
+</ul>
+
+<p>The flag's value is forwarded through the shared <code>render_chat()</code> helper on both paths:</p>
+
+<table>
+  <tr><th>Path</th><th>Source of <code>enable_thinking</code> (default <code>False</code>)</th></tr>
+  <tr>
+    <td><b>Training</b></td>
+    <td><code>data.enable_thinking</code> in the YAML, overridable by <code>--thinking</code> on
+        <code>sr-train</code> (CLI wins).</td>
+  </tr>
+  <tr>
+    <td><b>Evaluation</b></td>
+    <td><code>--enable-thinking</code> flag on <code>answerability_eval</code>.</td>
+  </tr>
+</table>
+
+<div class="note">
+SR's loader passes <code>messages</code> through verbatim — it does <b>not</b> populate
+<code>reasoning_content</code>, so that key only takes effect if your JSONL rows already carry it.
+And keep training and eval in agreement: thinking is a prompt-rendering choice, so flip
+<code>enable_thinking</code> on for both sides or neither. The reference answerability adapters are
+trained <b>thinking-off</b> and evaluated <b>without</b> <code>--enable-thinking</code>.
+</div>
+
+<h3>Thinking in the training target</h3>
+
+<p>When thinking is <b>off</b> (the default), Granite 4.2's assistant turn still carries an
+<b>empty</b> reasoning block — the template emits <code>&lt;think&gt;&lt;/think&gt;</code>
+immediately before the label:</p>
+
+<pre class="g42">&lt;|im_start|&gt;assistant
+&lt;think&gt;&lt;/think&gt;"answerable"&lt;|im_end|&gt;</pre>
+
+<p>The supervised label is the bare <code>"answerable"</code> that follows the empty tags
+(the <code>&lt;think&gt;&lt;/think&gt;</code> pair is part of the unmasked assistant turn the
+model is trained to reproduce). Granite 4.1 has no reasoning block, so its target is just
+<code>"answerable"</code>. Response-only masking is unaffected either way: loss is computed
+on the final assistant turn regardless of whether it opens with an empty think block.</p>
+
+<h3>Thinking in generated output — the eval parser</h3>
+
+<p>At generation time a 4.2 model produces whatever the template shaped it for. If a
+non-empty reasoning block appears, the classifier must not mistake the reasoning prose for
+the label. <code>process_predictions()</code> in <code>answerability_eval.py</code> handles
+this by <b>reading only the text after the last <code>&lt;/think&gt;</code></b>:</p>
+
+<pre class="g42">pred = pred.strip()
+# 4.2: the verdict is whatever follows the last &lt;/think&gt;.
+if "&lt;/think&gt;" in pred:
+    pred = pred.rsplit("&lt;/think&gt;", 1)[1].strip()
+# ... then take the first token / quoted word as the label</pre>
+
+<ul>
+  <li><b>With a think block</b> (e.g. <code>&lt;think&gt;Okay, the user is asking…&lt;/think&gt;"unanswerable"</code>)
+      → everything up to and including <code>&lt;/think&gt;</code> is discarded; the label is
+      parsed from the remainder.</li>
+  <li><b>With an empty block</b> (<code>&lt;think&gt;&lt;/think&gt;"answerable"</code>) → the split
+      leaves <code>"answerable"</code>, parsed as normal.</li>
+  <li><b>No block at all</b> (Granite 4.1) → the <code>&lt;/think&gt;</code> branch is skipped;
+      parsing is unchanged.</li>
+</ul>
+
+<div class="note">
+Set <code>--max-new-tokens</code> large enough to cover the reasoning block plus the label
+when thinking is on. The default (30) is sized for the thinking-off
+<code>&lt;think&gt;&lt;/think&gt;"label"</code> target; a real reasoning trace needs more room
+or it will be truncated before the label is emitted.
+</div>
+
+<!-- ============================================================ -->
+<!-- PART 3 — TRAINING                                             -->
+<!-- ============================================================ -->
+<h2 id="running">3.1 Running training</h2>
+
+<p>Training is driven by a single Pydantic-validated YAML. Behavior follows the
+fields you set — not an architecture name. Reference configs live in
+<code>src/shadow_residual/config/</code>. The <b>only</b> difference between a 4.1
+and a 4.2 run is <b>which config you point at</b> (plus the base-model path); the
+code auto-adapts to each family's chat format and weight tying.</p>
+
+<h3>Pick the config for your model family</h3>
+<table>
+  <tr><th>Model family</th><th>Config</th><th>What it sets</th></tr>
+  <tr>
+    <td><b>Granite 4.1</b> (tied embeddings, role-tag chat format)</td>
+    <td><code>sr-qo-mlp-r32-c32-sharedkv.yaml</code></td>
+    <td><code>base: ibm-granite/granite-4.1-3b</code>; invocation marker
+        <code>&lt;|start_of_role|&gt;assistant&lt;|end_of_role|&gt;</code></td>
+  </tr>
+  <tr>
+    <td><b>Granite 4.2</b> (untied <code>lm_head</code>, ChatML format)</td>
+    <td><code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code></td>
+    <td><code>base: ${BASE_MODEL}</code> (supply the path); ChatML markers
+        <code>&lt;|im_start|&gt;assistant\n</code> for both
+        <code>invocation_tokens</code> and <code>assistant_marker</code></td>
+  </tr>
+</table>
+
+<div class="note">
+The <b>same code</b> handles both. It detects the family from the tokenizer and:
+respects <code>config.tie_word_embeddings</code> (4.2 ships a separate
+<code>lm_head.weight</code>); uses the ChatML markers from the 4.2 config for
+label masking + aLoRA gating; and renders RAG <code>documents</code> the way each
+family's template expects (see §2.1). No manual per-model surgery needed.
+</div>
+
+<h3>On the current server</h3>
+<p>Single GPU:</p>
+<pre># Granite 4.1
+sr-train \
+  --config src/shadow_residual/config/sr-qo-mlp-r32-c32-sharedkv.yaml \
+  --train-data /data/train.jsonl \
+  --val-data   /data/eval.jsonl \
+  --output-dir ./checkpoints
+
+# Granite 4.2 — the config reads model.base from $BASE_MODEL
+BASE_MODEL=/path/to/granite-4.2-3b \
+sr-train \
+  --config src/shadow_residual/config/sr-qo-mlp-r32-c32-sharedkv-g42.yaml \
+  --train-data /data/train.jsonl --val-data /data/eval.jsonl \
+  --output-dir ./checkpoints</pre>
+
+<p>Multi-GPU (DDP for 3b; FSDP for 8b / larger):</p>
+<pre># DDP (e.g. 3b on 4 GPUs)
+accelerate launch --num_processes 4 --multi_gpu --mixed_precision bf16 \
+  -m shadow_residual.training.train --config &lt;cfg&gt;.yaml \
+  --train-data /data/train.jsonl --val-data /data/eval.jsonl --output-dir ./ckpt
+
+# FSDP (e.g. 8b on 8 GPUs) — uses the shipped accelerate FSDP config
+accelerate launch --config_file src/shadow_residual/config/accelerate/fsdp_4gpu.yaml \
+  --num_processes 8 --main_process_port 0 \
+  -m shadow_residual.training.train --config &lt;cfg&gt;.yaml \
+  --train-data /data/train.jsonl --val-data /data/eval.jsonl --output-dir ./ckpt</pre>
+
+<div class="note">
+<b>FSDP note:</b> the untied-<code>lm_head</code> handling is FSDP-safe — the tie
+decision is config-driven and settled in the model's <code>__init__</code> (runs
+on every rank, incl. meta), so the parameter structure is identical across ranks
+before the FSDP wrap. Validated end-to-end on both 8b runs.
+</div>
+
+<h3>On Vela</h3>
+<p>Job YAMLs live in <code>examples/vela/</code>. They clone the repo in-pod,
+<code>pip install -e ".[train]"</code>, then <code>accelerate launch</code> the
+trainer against COS-mounted data, and finally run the answerability eval. Fill in
+the token/secret placeholders, then:</p>
+<pre>oc login --token=… --server=…
+helm template -f examples/vela/sr_sharedkv.yaml \
+  --set-string "environmentVariables[0].value=$(date -u +%Y%m%dT%H%M%SZ)" \
+  mlbatch/pytorchjob-generator | oc create -f -
+oc logs -f -c pytorch &lt;jobName&gt;-master-0     # follow</pre>
+<p class="muted">Pin <code>trl&lt;1.7</code> (already in pyproject) — 1.7 crashes on
+Granite configs. The Vela image ships torch 2.6 + CUDA 12.4. <code>eval_loss: nan</code>
+per epoch is expected (prompt-only eval rows have no labels for the trainer's CE);
+the post-training generation is the real eval.</p>
+
+<h3>Evaluation</h3>
+<pre>python -m shadow_residual.eval.answerability_eval --mode peft \
+  --base-model &lt;base-model-or-path&gt; \
+  --adapter-path ./checkpoints --adapter-sub-path . \
+  --dataset-path /path/to/answerability_eval \
+  --device cuda --batch-size 8
+# --enable-thinking  (default off) toggles the 4.2 &lt;think&gt; reasoning block.
+# --max-new-tokens   (default 30) — enough for 4.2's &lt;think&gt;&lt;/think&gt;"label" target.</pre>
+
+<h2 id="config">3.2 Configuration schema</h2>
+<p>The YAML is validated by a strict Pydantic model (<code>training_config.py</code>). Unknown keys fail loudly. <code>${VAR}</code> references are resolved from the environment (unset → error). Below is every block.</p>
+
+<h3><span class="k">model:</span></h3>
+<table>
+  <tr><th>Field</th><th>Type / default</th><th>Meaning</th></tr>
+  <tr><td><code>base</code></td><td>str <span class="pill">required</span></td><td>HF model ID or local path, e.g. <code>ibm-granite/granite-4.1-3b</code>.</td></tr>
+  <tr><td><code>attn_implementation</code></td><td>str / null</td><td><code>sdpa</code>, <code>flash_attention_2</code>, …</td></tr>
+  <tr><td><code>shared_base_kv</code></td><td>bool / <b>null (auto)</b></td><td>One base-only K/V cache shared with the adapter Q (<code>true</code>) vs disjoint per-stream (<code>false</code>). Auto-resolves from <code>target_modules</code> (§3.4). <code>true</code> forbids LoRA on k_proj/v_proj. <b>Not serialized</b> — must be passed at load time if non-default.</td></tr>
+  <tr><td><code>param_dtype</code></td><td><code>bf16</code> / <code>fp32</code></td><td><code>bf16</code>: whole model in bfloat16. <code>fp32</code> + accelerate <code>mixed_precision: bf16</code>: bf16 compute via AMP, fp32 master weights/grads/optimizer — recommended for 8B/30B stability.</td></tr>
+</table>
+
+<h3><span class="k">data:</span></h3>
+<table>
+  <tr><th>Field</th><th>Type / default</th><th>Meaning</th></tr>
+  <tr><td><code>train_path</code> / <code>val_path</code></td><td>str <span class="pill">required</span></td><td>JSONL datasets (row shape in §2.1).</td></tr>
+  <tr><td><code>max_length</code></td><td>int / 8192</td><td>Max sequence length.</td></tr>
+  <tr><td><code>assistant_marker</code></td><td>str / null</td><td>Response-template string for label masking; only used when the chat template lacks <code>{% generation %}</code> markers.</td></tr>
+  <tr><td><code>enable_thinking</code></td><td>bool / false</td><td>Forwarded to <code>apply_chat_template(enable_thinking=…)</code>. CLI <code>--thinking</code> wins. See §2.2.</td></tr>
+</table>
+
+<h3><span class="k">adapter:</span></h3>
+<table>
+  <tr><th>Field</th><th>Type / default</th><th>Meaning</th></tr>
+  <tr><td><code>target_modules</code></td><td>int OR dict / 32</td><td>Carries both module selection AND rank. Scalar int → uniform rank on <code>all-linear</code>. Dict <code>{name: rank}</code> → per-module names and ranks. Include <code>cross_stream</code> here to engage SR dual-stream.</td></tr>
+  <tr><td><code>alpha</code></td><td>int / null</td><td>Defaults to 2 × (max) rank.</td></tr>
+  <tr><td><code>dropout</code></td><td>float / 0.0</td><td>LoRA dropout.</td></tr>
+  <tr><td><code>bias</code></td><td>none / all / lora_only</td><td>LoRA bias handling.</td></tr>
+  <tr><td><code>invocation_tokens</code></td><td>str / null</td><td>When set → aLoRA-style gated activation (delta off until the token sequence appears). Forces gradient_checkpointing off (PEFT #2826).</td></tr>
+</table>
+
+<h3><span class="k">optimizer:</span> · <span class="k">scheduler:</span> · <span class="k">batch:</span></h3>
+<div class="grid2">
+<table>
+  <tr><th>optimizer</th><th>default</th></tr>
+  <tr><td><code>name</code></td><td>paged_adamw_8bit</td></tr>
+  <tr><td><code>learning_rate</code></td><td>2.0e-4</td></tr>
+  <tr><td><code>weight_decay</code></td><td>0.01</td></tr>
+  <tr><td><code>max_grad_norm</code></td><td>1.0</td></tr>
+  <tr><th>scheduler</th><th>default</th></tr>
+  <tr><td><code>type</code></td><td>cosine</td></tr>
+  <tr><td><code>warmup_ratio</code></td><td>0.05</td></tr>
+</table>
+<table>
+  <tr><th>batch</th><th>default</th></tr>
+  <tr><td><code>per_device_train</code></td><td>1</td></tr>
+  <tr><td><code>gradient_accumulation</code></td><td>16</td></tr>
+  <tr><td><code>per_device_eval</code></td><td>1</td></tr>
+  <tr><td><code>gradient_checkpointing</code></td><td>true</td></tr>
+  <tr><td><code>gradient_checkpointing_kwargs</code></td><td><code>{use_reentrant: false}</code></td></tr>
+</table>
+</div>
+
+<h3><span class="k">validation:</span> · <span class="k">save:</span> · <span class="k">runtime:</span></h3>
+<div class="grid2">
+<table>
+  <tr><th>validation</th><th>default</th></tr>
+  <tr><td><code>strategy</code></td><td>epoch</td></tr>
+  <tr><td><code>load_best_model_at_end</code></td><td>true</td></tr>
+  <tr><td><code>metric_for_best_model</code></td><td>eval_loss</td></tr>
+  <tr><td><code>early_stopping_patience</code></td><td>3</td></tr>
+  <tr><td><code>stop_on_nan</code></td><td>true</td></tr>
+  <tr><th>save</th><th>default</th></tr>
+  <tr><td><code>strategy</code></td><td>epoch</td></tr>
+  <tr><td><code>total_limit</code></td><td>3</td></tr>
+  <tr><td><code>output_dir</code></td><td><span class="pill">required</span></td></tr>
+</table>
+<table>
+  <tr><th>runtime</th><th>default</th></tr>
+  <tr><td><code>num_train_epochs</code></td><td>3</td></tr>
+  <tr><td><code>seed</code></td><td>42</td></tr>
+  <tr><td><code>logging_steps</code></td><td>1</td></tr>
+  <tr><td><code>dataloader_num_workers</code></td><td>4</td></tr>
+  <tr><td><code>report_to</code></td><td>[tensorboard]</td></tr>
+  <tr><td><code>fsdp</code></td><td>false (bool or dict)</td></tr>
+</table>
+</div>
+
+<h3><span class="k">generation:</span> <span class="badge-opt">optional block</span></h3>
+<p>Omit the whole block to disable post-training generation. When present, <code>input_path</code> is required.</p>
+<table>
+  <tr><th>Field</th><th>default</th><th>Meaning</th></tr>
+  <tr><td><code>input_path</code></td><td><span class="pill">required</span></td><td>Eval JSONL to generate against.</td></tr>
+  <tr><td><code>max_new_tokens</code></td><td>256</td><td></td></tr>
+  <tr><td><code>temperature</code> / <code>top_p</code> / <code>do_sample</code></td><td>0.0 / 1.0 / false</td><td>Sampling only applied when <code>do_sample=true</code>.</td></tr>
+  <tr><td><code>batch_size</code></td><td>8</td><td>Halved automatically on CUDA OOM, down to 1.</td></tr>
+  <tr><td><code>output_filename</code></td><td>predictions.jsonl</td><td>Written into the output dir.</td></tr>
+  <tr><td><code>debug_probability</code></td><td>0.0</td><td>Fraction of batches to log decoded prompt+output.</td></tr>
+</table>
+
+<h2 id="cli">3.3 Script inputs — the CLI</h2>
+<p>Entry point: <code>sr-train</code> (equivalently <code>python -m shadow_residual.training.train</code>). The YAML is <b>required</b>; named flags override matching YAML fields.</p>
+
+<h4>Overrides for the most-edited fields</h4>
+<table>
+  <tr><th>Flag</th><th>Overrides</th></tr>
+  <tr><td><code>--config</code> <span class="pill">required</span></td><td>Path to the training-config YAML.</td></tr>
+  <tr><td><code>--output-dir</code></td><td><code>save.output_dir</code></td></tr>
+  <tr><td><code>--train-data</code> / <code>--val-data</code></td><td><code>data.train_path</code> / <code>data.val_path</code></td></tr>
+  <tr><td><code>--lr</code></td><td><code>optimizer.learning_rate</code></td></tr>
+  <tr><td><code>--epochs</code></td><td><code>runtime.num_train_epochs</code></td></tr>
+  <tr><td><code>--seed</code></td><td><code>runtime.seed</code></td></tr>
+  <tr><td><code>--lora-r</code></td><td>Replaces <code>adapter.target_modules</code> with a uniform scalar rank.</td></tr>
+  <tr><td><code>--lora-alpha</code></td><td><code>adapter.alpha</code></td></tr>
+  <tr><td><code>--batch-size</code> / <code>--grad-accum</code></td><td><code>batch.per_device_train</code> / <code>batch.gradient_accumulation</code></td></tr>
+</table>
+
+<h4>Behavior flags</h4>
+<table>
+  <tr><th>Flag</th><th>Effect</th></tr>
+  <tr><td><code>--thinking</code> / <code>--enable-thinking</code></td><td>Sets <code>data.enable_thinking=True</code>.</td></tr>
+  <tr><td><code>--wandb</code></td><td>Sets <code>runtime.report_to=['wandb']</code>.</td></tr>
+  <tr><td><code>--max-steps N</code></td><td>Caps training to N optimizer steps (takes precedence over epochs). For short diagnostic runs that still exercise the generate path.</td></tr>
+  <tr><td><code>--skip-post-train-generate</code></td><td>Skips in-process generation. Use when running generate as a separate process (avoids post-training CUDA residue that OOMs the FSDP gather+rebuild at 30B).</td></tr>
+  <tr><td><code>--no-grad-checkpoint</code></td><td>Disables non-reentrant gradient checkpointing for gated SR (diagnostic; safe only when activations fit, e.g. 3B/DDP).</td></tr>
+  <tr><td><code>--debug-collator</code></td><td>Periodically logs a decoded training example + labels; also enables generation debug printing.</td></tr>
+  <tr><td><code>--quantize</code></td><td class="muted">Reserved — currently raises <code>NotImplementedError</code> (4-bit QLoRA not supported on this path).</td></tr>
+</table>
+
+<h2 id="modes">3.4 Modes of operation</h2>
+<p>There is no <code>--mode</code> flag. The mode emerges from two YAML fields: whether <code>cross_stream</code> is in <code>target_modules</code>, and whether <code>invocation_tokens</code> is set.</p>
+
+<div class="card">
+  <div class="mode-head"><span style="display:inline-flex;width:22px;height:22px;border-radius:50%;background:var(--muted);color:#fff;align-items:center;justify-content:center;font-weight:700;font-size:12px;">A</span><h3 style="margin:0;">Plain LoRA — single-stream early-exit</h3></div>
+  <p><code>cross_stream</code> absent · <code>invocation_tokens</code> unset.</p>
+  <p class="muted">Dual-stream forward is skipped (early-exit path ≈ plain LoRA on Granite). <code>shared_base_kv</code> auto-resolves to <code>false</code> (K/V on the adapter stream; a warning is logged). Reference: <code>lora-qkvo-mlp-r16.yaml</code>.</p>
+</div>
+
+<div class="card">
+  <div class="mode-head"><span style="display:inline-flex;width:22px;height:22px;border-radius:50%;background:var(--muted);color:#fff;align-items:center;justify-content:center;font-weight:700;font-size:12px;">B</span><h3 style="margin:0;">aLoRA — gated activation</h3></div>
+  <p><code>cross_stream</code> absent · <code>invocation_tokens</code> set.</p>
+  <p class="muted">The delta stays off until the invocation token sequence appears in the input. Requires <code>task_type="CAUSAL_LM"</code> (schema sets it). Forces HF gradient_checkpointing off; train.py re-enables non-reentrant checkpointing explicitly. Reference: <code>alora-all-linear-r16.yaml</code>.</p>
+</div>
+
+<div class="card">
+  <div class="mode-head"><span style="display:inline-flex;width:22px;height:22px;border-radius:50%;background:var(--accent2);color:#fff;align-items:center;justify-content:center;font-weight:700;font-size:12px;">C</span><h3 style="margin:0;">Shadow Residual (dual-stream)</h3></div>
+  <p><code>cross_stream</code> present in <code>target_modules</code>.</p>
+  <p class="muted">Dual-stream SR forward engages. <code>shared_base_kv</code> auto-resolves to <code>true</code> (one base-only K/V cache), which forbids LoRA on k_proj/v_proj. Optionally combine with <code>invocation_tokens</code> for <b>gated SR</b>. References: the <code>sr-qo-mlp-*-sharedkv*.yaml</code> configs.</p>
+</div>
+
+<div class="note"><b>The <code>shared_base_kv</code> auto rule:</b> unset (<code>null</code>) means resolve from <code>target_modules</code> — <code>true</code> if <code>cross_stream</code> is present, else <code>false</code>. An explicit <code>true</code>/<code>false</code> always wins. Because it is not serialized into <code>adapter_config.json</code>, a checkpoint trained with a non-default value <b>must pass the same value explicitly</b> to the loader at serve time.</div>
+
+<h4>Also mode-shaping</h4>
+<ul>
+  <li><b><code>param_dtype</code></b> — <code>fp32</code> master weights for 8B/30B stability vs <code>bf16</code> throughout.</li>
+  <li><b><code>runtime.fsdp</code> + accelerate launch</b> — DDP vs FSDP sharding; drives the FSDP-aware post-training generate path.</li>
+  <li><b>Response-only masking</b> — auto: TRL <code>assistant_only_loss=True</code> when the chat template has <code>{% generation %}</code> markers, else the hand-rolled <code>ResponseOnlyCollator</code> (masks everything before the <em>last</em> assistant marker).</li>
+</ul>
+
+<h2 id="flow">3.5 End-to-end flow</h2>
+<p>The full lifecycle around the training script. Optional steps are marked in amber.</p>
+
+<div class="flow">
+  <div class="flow-step">
+    <span class="n">1</span><span class="title">Data preparation</span>
+    <div class="body">Produce <code>train.jsonl</code> / <code>val.jsonl</code>. See §2.1 for row shape.</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step">
+    <span class="n">2</span><span class="title">Author / pick a config YAML</span>
+    <div class="body">Choose mode via fields (§3.4). Set <code>${VAR}</code> env references for paths.</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step">
+    <span class="n">3</span><span class="title">Launch <code>sr-train</code></span>
+    <div class="body">Tokenizer load → invocation-token IDs → PEFT config → SR+PEFT model build → gated-SR checkpointing → dataset load + aLoRA sanity check → SFTTrainer.</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step">
+    <span class="n">4</span><span class="title">Train + save</span>
+    <div class="body"><code>trainer.train()</code> → <code>save_model</code> + tokenizer to <code>output_dir</code>. Guard: fails loudly if the save is sharded (no <code>adapter_model.safetensors</code>).</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step optional">
+    <span class="n">5</span><span class="title">Post-training generation <span class="badge-opt">optional</span></span>
+    <div class="body">Runs if a <code>generation:</code> block is present and <code>--skip-post-train-generate</code> is not set. Uses the in-memory model (FSDP-aware).</div>
+  </div>
+  <div class="flow-arrow">↓</div>
+  <div class="flow-step optional">
+    <span class="n">6</span><span class="title">Standalone generate / eval <span class="badge-opt">optional</span></span>
+    <div class="body">Fresh process against the saved checkpoint, then answerability eval (§3.1).</div>
+  </div>
+</div>
+
+<h3>What the script does, step by step</h3>
+<ol>
+  <li>Load tokenizer; set pad token and right-padding.</li>
+  <li>If gated: encode <code>invocation_tokens</code> → IDs, attach to the PEFT config.</li>
+  <li>Build <code>LoraConfig</code> from the adapter block (<code>to_peft_config</code>).</li>
+  <li>Build the SR+PEFT model via <code>get_shadow_residual_peft_model</code> (base + adapter streams; <code>shared_base_kv</code> resolved here).</li>
+  <li>For gated SR: enable non-reentrant gradient checkpointing + <code>enable_input_require_grads</code>.</li>
+  <li>Load train/val datasets; run the aLoRA sanity check if gated.</li>
+  <li>Build <code>SFTConfig</code>; pick the response-only masking path (assistant_only_loss vs collator).</li>
+  <li><code>SFTTrainer.train()</code> with early-stopping + stop-on-NaN callbacks.</li>
+  <li>Save adapter + tokenizer; guard against a sharded/non-consolidated save.</li>
+</ol>
+
+<div class="note"><b>Gated (aLoRA) data check:</b> when <code>invocation_tokens</code> is set, <code>sr-train</code> samples the first rows and refuses to start if the invocation token sequence is absent (the adapter would never activate). A partial match logs a warning.</div>
+
+<!-- ============================================================ -->
+<!-- PART 4 — ADVANCED DETAILS                                     -->
+<!-- ============================================================ -->
+<div class="part-divider" id="advanced">
+  <div class="kicker">Part 4</div>
+  <h2>Advanced details</h2>
+  <p>Deeper mechanics for the curious: how the dual-stream architecture is glued to PEFT, how it collapses
+  to plain LoRA when cross-stream is off, how the K/V regimes and aLoRA gating work, and how it all scales
+  under FSDP.</p>
+</div>
+
+<h2 id="adv-crossnoop">4.1 Why <code>W<sub>cross</sub></code> is a no-op in the base model</h2>
+
+<p>The per-layer cross-stream edge is <code>h_adapt += B(A · h_base)</code> — a rank-R
+projection from the base stream into the adapter stream. But in the base model the
+<code>cross_stream</code> site is a <b>zero-output <code>nn.Module</code></b> with no
+parameters at all:</p>
+
+<pre><code>class CrossStream(nn.Module):
+    """No-op site that PEFT can wrap with a CrossStreamLora layer."""
+    def __init__(self, hidden_size):
+        self.in_features = self.out_features = hidden_size
+        self.register_buffer("_device_anchor", torch.zeros(1), persistent=False)
+    @property
+    def weight(self): return self._device_anchor
+    def forward(self, h_base, *a, **k): return torch.zeros_like(h_base)</code></pre>
+
+<p>The decoder calls <code>h_adapt = h_adapt + self.cross_stream(h_base)</code>, which adds
+<b>zero</b> until PEFT installs a <code>CrossStreamLora</code> in its place. The rank-R
+<code>A</code> / <code>B</code> weights live on the <em>installed adapter</em>, not on the
+base module. Two reasons it has to be a real module rather than nothing:</p>
+
+<ul>
+  <li><b>It's a targetable site.</b> PEFT's <code>LoraModel</code> discovers what to wrap by
+      walking named child modules and matching <code>target_modules</code>. Listing
+      <code>"cross_stream"</code> only works if there is a child module by that name to find
+      and replace. There is no <code>nn.Linear</code> in the SR decoder whose
+      <code>(input, output)</code> is <code>(h_base, h_adapt)</code> — the two streams are
+      independent accumulators, so PEFT's "intercept an existing linear" rule can't synthesize
+      the edge. The no-op site is what gives PEFT something to replace.</li>
+  <li><b>The device anchor.</b> <code>peft…_replace_module</code> calls
+      <code>next(child.parameters())</code> to find a device for the new adapter weights. A
+      truly empty module raises <code>StopIteration</code>. The one-element
+      <code>_device_anchor</code> buffer (and the <code>weight</code> property) satisfy PEFT's
+      introspection without adding any trainable parameter.</li>
+</ul>
+
+<div class="note">Cross-stream is the <b>only</b> base→adapter coupling within a layer. Everything
+else keeps the two streams parallel and independent. That is why the wrapped/unwrapped state of
+<code>cross_stream</code> is the right runtime signal for whether the dual-stream forward is worth
+running at all (§4.3).</div>
+
+<h2 id="adv-peft">4.2 The PEFT implementation — two custom wrappers</h2>
+
+<p>Vanilla PEFT only knows how to wrap <code>nn.Linear</code>-shaped modules and always applies
+the delta. SR needs two things PEFT can't provide out of the box, so it registers two custom
+module types via <code>LoraConfig._register_custom_module({type: wrapper})</code> in
+<code>factory.py</code>:</p>
+
+<table>
+  <tr><th>Target type</th><th>Wrapper</th><th>What it adds</th></tr>
+  <tr>
+    <td><code>CrossStream</code></td>
+    <td><code>CrossStreamLora</code></td>
+    <td>Implements <code>LoraLayer</code> directly. Owns rank-R <code>lora_A</code>/<code>lora_B</code>
+        <code>ModuleDict</code>s (A ← Kaiming, B ← 0, so the edge starts at exactly zero).
+        <code>forward(x) = 0 + Σ B(A(x))·scaling</code> — the base layer contributes nothing.
+        <code>merge</code>/<code>unmerge</code> are no-ops (no base weight to fold into).</td>
+  </tr>
+  <tr>
+    <td><code>_StreamGatedLinear</code></td>
+    <td><code>ShadowResidualLora</code></td>
+    <td>Subclasses stock <code>peft.tuners.lora.Linear</code>. Adds a one-line gate at the top of
+        <code>forward</code>: if <code>current_stream() == "base"</code> → return
+        <code>base_layer(x)</code> (delta OFF); else delegate to stock PEFT (delta ON, with any
+        variants like aLoRA/DoRA). Inherits everything else for free.</td>
+  </tr>
+</table>
+
+<p>The stream gate is the whole trick behind the frozen-base guarantee:</p>
+
+<pre><code>def forward(self, x, *args, **kwargs):
+    if current_stream() != "base":
+        return super().forward(x, *args, **kwargs)   # stock peft: base + LoRA delta
+    kwargs.pop("alora_offsets", None)
+    kwargs.pop("adapter_names", None)
+    return self.base_layer(x, *args, **kwargs)        # frozen-base path: no delta</code></pre>
+
+<p>Every Q/K/V/O/MLP projection is a <code>_StreamGatedLinear</code> (a marker subclass of
+<code>nn.Linear</code>, behaviourally identical). The marker subclass is the dispatch key: PEFT
+matches on exact <code>type(module)</code>, so only the SR decoder's projections get the
+stream-gated wrapper — not the <code>lm_head</code> or unrelated linears.</p>
+
+<div class="note"><b>Why a marker subclass, not <code>nn.Linear</code> directly?</b> If SR targeted plain
+<code>nn.Linear</code>, PEFT would also wrap the <code>lm_head</code> and any other linear in the
+graph. The distinct <code>_StreamGatedLinear</code> type lets the registry select exactly the
+decoder projections that need the per-call stream gate.</div>
+
+<h2 id="adv-earlyexit">4.3 The adapter-only early-exit</h2>
+
+<p>The base model is <b>always</b> <code>ShadowResidualForCausalLM</code> — construction never
+branches on whether cross-stream is configured. Instead the <em>forward</em> branches at runtime.
+At the top of the decoder loop the model asks <code>_any_cross_stream_wrapped(self.layers)</code>:
+is any <code>cross_stream</code> site an installed <code>CrossStreamLora</code> (vs. a bare
+<code>CrossStream</code>)?</p>
+
+<pre><code>cross_stream_active = _any_cross_stream_wrapped(self.layers)
+if cross_stream_active or shared_base_kv:
+    #  → dual-stream path: maintain (h_base, h_adapt)
+else:
+    #  → adapter-only early-exit: only h_adapt</code></pre>
+
+<p>When neither condition holds, the early-exit collapses the layer to a single stream. <b>What
+gets skipped:</b> the base Q/K/V/O pass, the base MLP, the <code>cross_stream(h_base)</code> call,
+the <code>cat([h_base, h_adapt])</code> layernorm fusion, and the <code>h_base</code>
+initialization. <b>What still runs:</b> one Q/K/V/O/MLP pass on <code>h_adapt</code> with every
+LoRA delta firing, and aLoRA gating via PEFT's hook. Result: compute equal to plain LoRA on
+Granite — no dual-stream surcharge — which is exactly what you want when training LoRA/aLoRA
+without cross-stream.</p>
+
+<div class="note"><b>Note the <code>or shared_base_kv</code>.</b> Shared-base-K/V mode <em>also</em>
+takes the dual-stream branch even with no cross-stream wrapper installed (the "weak SR" ablation).
+The gate is "cross-stream active <em>or</em> shared K/V requested", not cross-stream alone.</div>
+
+<div class="warn"><b>The gate is only meaningful after <code>get_peft_model</code>.</b> "Is this
+<code>CrossStream</code> wrapped?" is only true once PEFT has installed its wrappers. Forwarding
+the bare SR base before <code>get_peft_model</code> always takes the early-exit path.</div>
+
+<h2 id="adv-kv">4.4 Disjoint vs shared-base K/V</h2>
+
+<p>Within the dual-stream forward there are two ways to handle attention keys/values, selected by
+<code>config.shared_base_kv</code>. Both keep the base trunk's attention reads adapter-free; they
+differ in how many K/V projections and caches exist per layer.</p>
+
+<div class="grid2">
+<div class="card">
+  <h4>Disjoint K/V <span class="pill">shared_base_kv=false</span></h4>
+  <p class="muted">Each stream computes its <em>own</em> K and V. Two K/V projection calls per
+  layer, two physically separate caches:</p>
+  <ul>
+    <li><code>past_key_values_base</code> — <code>W<sub>kv</sub>·normed_base</code>, computed under
+        <code>stream_context("base")</code> (delta gated off), read by the base attention.</li>
+    <li><code>past_key_values</code> — computed under <code>"adapter"</code> on
+        <code>normed_adapt</code> (K/V LoRA delta may fire), read by the adapter attention.</li>
+  </ul>
+  <p class="muted">K/V LoRA on the adapter is allowed; it never leaks into the base reads because
+  the caches are disjoint.</p>
+</div>
+<div class="card">
+  <h4>Shared-base K/V <span class="pill">shared_base_kv=true</span></h4>
+  <p class="muted">K and V are computed <em>once</em>, under <code>"base"</code> from
+  <code>normed_base</code> (frozen). Both streams' queries attend that single K/V:</p>
+  <ul>
+    <li>The adapter stream computes only <b>Q</b> (Q LoRA fires) and <b>O</b>; it does not
+        compute its own K/V.</li>
+    <li>Only <code>past_key_values</code> is written; <code>past_key_values_base</code> is unused.</li>
+    <li><b>K/V LoRA is structurally forbidden</b> — <code>_reject_kv_lora_when_shared</code> raises
+        at build time if <code>k_proj</code>/<code>v_proj</code> appear in
+        <code>target_modules</code>.</li>
+  </ul>
+  <p class="muted">The payoff: the adapter can attend over a KV cache populated by the frozen base,
+  so keys/values need not be recomputed when the adapter turns on.</p>
+</div>
+</div>
+
+<div class="note"><b>Which is the default?</b> <code>config.shared_base_kv</code> is <code>false</code>
+at the model level, but the <em>training</em> layer resolves an unset (<code>null</code>) YAML value
+to <b><code>true</code> when <code>cross_stream</code> is present</b> — the SR production default —
+and <code>false</code> otherwise. It is <b>not serialized</b> into <code>adapter_config.json</code>,
+so a checkpoint trained with a non-default value must pass the same value explicitly at load time
+(see §3.4).</div>
+
+<h2 id="adv-alora">4.5 aLoRA gating (FASO-style mid-sequence activation)</h2>
+
+<p>SR-PEFT is aLoRA-class: the adapter contributes <b>nothing</b> on tokens before an activation
+marker, and the full delta at and after it. This is how the adapter can be "invoked" partway
+through a sequence (e.g. only for the assistant's answerability verdict) while the prompt tokens
+stay bit-identical to the base model — the property that makes the base KV cache reusable.</p>
+
+<p>The mechanism is almost entirely <b>stock PEFT</b>. Set
+<code>LoraConfig.alora_invocation_tokens=[ids…]</code> (with <code>task_type="CAUSAL_LM"</code>) and:</p>
+
+<ol>
+  <li>PEFT auto-attaches <code>ALoraLinearVariant</code> to every wrapped projection.</li>
+  <li>A <b>pre-forward hook</b> on every <code>LoraLayer</code> scans <code>input_ids</code>,
+      finds the <em>rightmost</em> match of the invocation sequence, and computes per-row
+      <code>alora_offsets</code> = number of trailing positions at/after the match.</li>
+  <li>The variant builds <code>mask = pos ≥ (T − offset)</code> and <b>only runs the LoRA matmul on
+      the post-marker rows</b> — the delta arithmetic itself is gated, not just zeroed afterward.</li>
+</ol>
+
+<p><code>CrossStreamLora</code> participates in the same flow: because it inherits
+<code>LoraLayer</code>, it receives <code>alora_offsets</code> from the same hook and masks its
+rank-R contribution to the trailing positions, mirroring <code>ALoraLinearVariant</code>. The SR
+decoder itself computes no mask and threads no activation kwarg — PEFT drives gating end-to-end,
+and <code>alora_invocation_tokens</code> round-trips through <code>adapter_config.json</code>.</p>
+
+<div class="danger"><b>The three-knob rule.</b> aLoRA gating fires only if all three are set:
+<code>alora_invocation_tokens</code>, <code>task_type="CAUSAL_LM"</code>, and (for gated SR)
+<code>"cross_stream"</code> in <code>target_modules</code>. Miss any one and PEFT silently falls
+back to unconditional LoRA — no error. The invariant tests
+(<code>test_alora_invocation_invariant.py</code>) pin the pre-invocation logits/KV equality; the
+<code>task_type</code> requirement was discovered <em>by</em> those tests.</div>
+
+<h2 id="adv-transfer">4.6 The fused→unfused weight transfer</h2>
+
+<p>Upstream <code>GraniteMoeHybridForCausalLM</code> stores the MLP gate/up as a single fused
+<code>shared_mlp.input_linear</code>. SR uses <em>unfused</em> per-projection tensors so PEFT can
+attach a separate LoRA to each. <code>transfer_base_weights(src, dst)</code> slices the fused
+weights into the SR layout:</p>
+
+<pre><code>shared_mlp.input_linear.weight  [2I, H]  →  gate_proj.weight  [I, H]
+                                            up_proj.weight    [I, H]
+shared_mlp.output_linear.weight          →  down_proj.weight
+q_proj / k_proj / v_proj / o_proj        →  copied as-is (already unfused upstream)</code></pre>
+
+<p>The copy is <code>torch.no_grad().copy_</code> into pre-allocated destination tensors, so shapes
+must match exactly (a mismatch is a hard fail). Numerics are <b>not</b> bit-identical to a fused
+forward because the reduction order changes (two separate matmuls vs one) — a documented divergence,
+and the reason "plain LoRA on the SR base" is functionally but not bit-wise equal to LoRA on stock
+Granite.</p>
+
+<h2 id="adv-fsdp">4.7 FSDP &amp; post-training generation</h2>
+
+<p>8B and larger runs shard with FSDP (via <code>accelerate launch</code> + the shipped
+<code>fsdp_4gpu.yaml</code>). Two SR-specific concerns:</p>
+
+<h3>Untied <code>lm_head</code> is FSDP-safe</h3>
+<p>Granite 4.1 ties <code>lm_head</code> to <code>embed_tokens</code>; Granite 4.2 ships a separate
+trained <code>lm_head.weight</code>. SR settles the tie decision in the model's <code>__init__</code>
+from <code>config.tie_word_embeddings</code> — which runs on <em>every</em> rank (including meta
+init) <b>before</b> the FSDP wrap. So the parameter structure is identical across ranks when FSDP
+flattens, and there is no divergence. Only when tied does SR register
+<code>_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}</code>.</p>
+
+<h3>Post-training generation under FSDP</h3>
+<p>After training, <code>train.py</code> can generate against the in-memory model. Under FSDP the
+model is sharded, so <code>run_generation_under_fsdp</code> does a careful gather/rebuild
+(verified at 30B on 4×80GB H100):</p>
+<ol>
+  <li><b>All ranks</b> gather a <code>FULL_STATE_DICT</code> (<code>rank0_only=True</code>,
+      <code>offload_to_cpu=True</code>).</li>
+  <li><b>All ranks</b> null every caller-side reference to the FSDP module
+      (<code>release_model_refs()</code> — e.g. <code>trainer.model</code>). This is load-bearing:
+      the ~16GB flat-param shard stays pinned otherwise and the rebuild OOMs.</li>
+  <li><b>All ranks</b> <code>accelerator.free_memory()</code> (drops the ~29GB reserved arena) +
+      <code>del</code> + <code>gc</code> + <code>empty_cache</code> → rank 0 returns to ~0GB.</li>
+  <li><b>Rank 0 only</b> rebuilds a fresh non-FSDP SR+PEFT model (meta init) →
+      <code>load_state_dict</code> → <code>.to("cuda:0")</code> → <code>run_generation</code>.</li>
+</ol>
+
+<div class="warn"><b>Two escape hatches for scale.</b> Use <code>--skip-post-train-generate</code> to run
+generation as a <em>separate process</em> against the saved checkpoint — a fresh CUDA context
+sidesteps the post-training residue that OOMs the in-process gather+rebuild at 30B. And the FSDP
+save <b>must</b> consolidate (<code>fsdp_state_dict_type: FULL_STATE_DICT</code>): with
+<code>SHARDED_STATE_DICT</code>, <code>save_model</code> writes <code>.distcp</code> shards and no
+<code>adapter_model.safetensors</code>, which loads as nothing. <code>train.py</code> fails loudly on
+rank 0 if the consolidated adapter files are missing.</div>
+
+<h2 id="adv-merge">4.8 Why <code>merge_and_unload</code> is disabled</h2>
+
+<p>Standard PEFT lets you fold the LoRA delta into the base weight
+(<code>merge_and_unload</code>). SR <b>monkey-patches it to raise <code>NotImplementedError</code></b>
+(<code>factory.py:_disable_merge_and_unload</code>), on both the returned model and its
+<code>base_model</code>. Folding <code>W + ΔW</code> into the base linear would silently contaminate
+the frozen base stream: the next <code>stream_context("base")</code> call would return
+<code>(W + ΔW)x</code> instead of <code>Wx</code>, breaking the invariant the whole architecture
+exists to guarantee. Save/load is unaffected — it goes through the state-dict path
+(<code>save_pretrained</code> / <code>load_shadow_residual_peft_model</code>), not merge.</p>
+
+<p class="muted" style="margin-top:40px; font-size:12.5px;">Assembled for the talk from
+<code>docs/sr_architecture_explainer.html</code>, <code>docs/training_and_data_formats.html</code>,
+<code>docs/training_manual.html</code>, and <code>docs/shadow_residual_peft.html</code>.</p>
+
+</main>
+</div>
+</body>
+</html>

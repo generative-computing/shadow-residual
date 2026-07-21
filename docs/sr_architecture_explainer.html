@@ -1,0 +1,1715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Shadow-Residual Architecture &mdash; Internal Explainer</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --panel-2: #eff1f3;
+    --text: #1f2328;
+    --muted: #656d76;
+    --accent: #0969da;
+    --base: #0a5ca8;
+    --adapter: #cf222e;
+    --cross: #9a6700;
+    --frozen: #6c7a89;
+    --good: #1a7f37;
+    --warn: #9a6700;
+    --bad: #cf222e;
+    --code-bg: #f6f8fa;
+    --border: #d0d7de;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+  header { padding: 28px 24px; background: linear-gradient(135deg, #f6f8fa 0%, #eaeef2 100%); border-bottom: 1px solid var(--border); }
+  header h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: .2px; }
+  header .sub { color: var(--muted); }
+  h2 { margin-top: 56px; padding-bottom: 6px; border-bottom: 1px solid var(--border); font-size: 22px; }
+  h3 { margin-top: 32px; font-size: 17px; color: var(--accent); }
+  h4 { margin-top: 22px; font-size: 15px; color: var(--text); }
+  p { color: var(--text); }
+  code, pre { font-family: ui-monospace, SF Mono, Menlo, monospace; font-size: 13.5px; }
+  code { background: var(--code-bg); border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; color: #0550ae; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; overflow-x: auto; color: #1f2328; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin: 14px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 13px; color: var(--muted); margin: 8px 0 14px; }
+  .swatch { display: inline-block; width: 14px; height: 14px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--accent); font-weight: 600; }
+  td code { font-size: 12.5px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border); background: var(--panel-2); color: var(--muted); margin-right: 6px; }
+  .pill.base { color: var(--base); border-color: #b6d3ec; background: #ddeefb; }
+  .pill.adapter { color: var(--adapter); border-color: #f0c0c4; background: #ffebe9; }
+  .pill.cross { color: var(--cross); border-color: #e6d08a; background: #fff8c5; }
+  .pill.frozen { color: var(--muted); }
+  .note { border-left: 3px solid var(--accent); background: #ddf4ff; padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 12px 0; }
+  .warn { border-left: 3px solid var(--warn); background: #fff8c5; padding: 10px 14px; border-radius: 0 8px 8px 0; }
+  .toc { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; }
+  .toc ol { margin: 0; padding-left: 22px; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .file { font-family: ui-monospace, monospace; color: #1a7f37; }
+  svg { display: block; max-width: 100%; height: auto; }
+  .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin: 18px 0; }
+  .caption { color: var(--muted); font-size: 13px; margin-top: 8px; text-align: center; }
+  .small { font-size: 13px; color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 220px 1fr; gap: 6px 14px; }
+  .kv .k { color: var(--muted); }
+  .kv .v code { font-size: 12.5px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap" style="padding-bottom: 0;">
+    <h1>Shadow-Residual + PEFT &mdash; Architecture Explainer</h1>
+    <div class="sub">An internal walkthrough of the SR module layout, on-disk files, PEFT integration (save/load), invocation flows, and what is actually trainable.</div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#arch">Architecture &mdash; modules and on-disk layout</a></li>
+    <li><a href="#peft">Relation to PEFT &mdash; save / load / why standard PEFT is not enough</a></li>
+    <li><a href="#flows">Invocation flows &mdash; ALORA gating and the activation sequence</a></li>
+    <li><a href="#training">What gets trained &mdash; frozen vs. active</a></li>
+  </ol>
+</div>
+
+<div class="legend">
+  <span><span class="swatch" style="background:#0a5ca8"></span>base stream / frozen</span>
+  <span><span class="swatch" style="background:#cf222e"></span>adapter stream / trainable LoRA</span>
+  <span><span class="swatch" style="background:#9a6700"></span>cross-stream injection (B&middot;A)</span>
+  <span><span class="swatch" style="background:#6c7a89"></span>frozen weight</span>
+  <span><span class="swatch" style="background:#1a7f37"></span>trainable weight</span>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="arch">1. Architecture &mdash; modules and on-disk layout</h2>
+
+<p>
+Shadow-residual (SR) is a per-layer compute graph that maintains <strong>two parallel hidden-state streams</strong>
+through every attention/MLP block: a frozen <em>base stream</em> bit-identical to the unadapted base model
+(modulo a documented K/V exception), and a trainable <em>adapter stream</em> that carries LoRA deltas plus a
+per-layer rank-R cross-stream injection from the base. There is no final-step merge: after the last layer the
+adapter stream is normed and projected directly through <code>lm_head</code>.
+</p>
+
+<p>
+SR lives entirely under <span class="file">src/shadow_residual/</span> &mdash; this is a self-contained,
+standalone package (no <code>granite-switch</code> dependency on the train/serve path). There are two
+top-level subpackages: <span class="file">shadow_residual/</span> (the model) and
+<span class="file">peft_shadow_residual/</span> (the PEFT integration). Training drivers live under
+<span class="file">training/</span>.
+</p>
+
+<h3>1.1 Module &harr; file map</h3>
+
+<div class="panel">
+<pre>
+src/shadow_residual/
+&#x251C;&#x2500;&#x2500; shadow_residual/                       <span class="small">- the SR model itself (HF backend)</span>
+&#x2502;   &#x251C;&#x2500;&#x2500; modeling_hf.py                    ShadowResidualModel, ShadowResidualForCausalLM
+&#x2502;   &#x251C;&#x2500;&#x2500; decoder_hf.py                     ShadowResidualDecoderLayer (dual-stream + early-exit)
+&#x2502;   &#x251C;&#x2500;&#x2500; attention_hf.py                   ShadowResidualAttention (disjoint vs shared-base K/V)
+&#x2502;   &#x251C;&#x2500;&#x2500; cross_stream.py                   CrossStream &mdash; no-op nn.Module site
+&#x2502;   &#x251C;&#x2500;&#x2500; model_config.py                   VENDORED ShadowResidualConfig (GraniteSwitchConfig alias)
+&#x2502;   &#x251C;&#x2500;&#x2500; _stream_gated_linear.py           _StreamGatedLinear (nn.Linear marker subclass)
+&#x2502;   &#x251C;&#x2500;&#x2500; _stream_context.py                stream_context() / current_stream() (contextvar)
+&#x2502;   &#x251C;&#x2500;&#x2500; weight_transfer.py                fused-&gt;unfused QKV / gate-up slicing
+&#x2502;   &#x2514;&#x2500;&#x2500; config_helpers.py                 set_shadow_residual / validate_shadow_residual_config
+&#x2502;
+&#x251C;&#x2500;&#x2500; peft_shadow_residual/                  <span class="small">- PEFT integration</span>
+&#x2502;   &#x251C;&#x2500;&#x2500; factory.py                        get_shadow_residual_peft_model + _build_sr_base
+&#x2502;   &#x251C;&#x2500;&#x2500; load.py                           load_shadow_residual_peft_model
+&#x2502;   &#x251C;&#x2500;&#x2500; cross_stream_lora.py              CrossStreamLora &mdash; LoraLayer wrapping a CrossStream site
+&#x2502;   &#x2514;&#x2500;&#x2500; stream_gated_lora.py              ShadowResidualLora &mdash; PeftLoraLinear with stream-gate
+&#x2502;
+&#x251C;&#x2500;&#x2500; config/                                <span class="small">- unified training-config schema + reference YAMLs</span>
+&#x2502;   &#x251C;&#x2500;&#x2500; training_config.py                Pydantic schema (no architecture name; field-driven)
+&#x2502;   &#x251C;&#x2500;&#x2500; adapters.py                       to_peft_config / to_training_arguments / build_callbacks
+&#x2502;   &#x2514;&#x2500;&#x2500; *.yaml                            lora / alora / sr reference configs
+&#x2502;
+&#x2514;&#x2500;&#x2500; training/                              <span class="small">- HF Trainer drivers + data utilities</span>
+    &#x251C;&#x2500;&#x2500; train.py                          unified YAML-driven training entry (== sr-train)
+    &#x251C;&#x2500;&#x2500; generate.py                       post-training / standalone generation (FSDP-aware)
+    &#x251C;&#x2500;&#x2500; data.py                           JSONL loader, ResponseOnlyCollator, aLoRA sanity check
+    &#x251C;&#x2500;&#x2500; chat_render.py                    per-family chat-template rendering (4.1 / 4.2)
+    &#x251C;&#x2500;&#x2500; collator.py                       DataCollatorForSingleExpert{,Packed}
+    &#x251C;&#x2500;&#x2500; add_labels.py                     stamp 'labels' column from activation_sequence
+    &#x2514;&#x2500;&#x2500; pack_stats.py                     pad-free packing analyzer
+</pre>
+</div>
+
+<h3>1.2 The class hierarchy &mdash; what inherits from what</h3>
+
+<div class="diagram">
+<svg viewBox="0 0 980 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Class hierarchy">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#656d76"/>
+    </marker>
+  </defs>
+  <style>
+    .b { fill: #eef1f5; stroke: #d0d7de; }
+    .lbl { font: 13px ui-monospace, monospace; fill: #1f2328; }
+    .sub { font: 11px ui-monospace, monospace; fill: #656d76; }
+    .edge { stroke: #656d76; fill: none; stroke-width: 1.4; }
+    .accent { stroke: #0969da; }
+    .base   { fill: #ddeefb; stroke: #7fb2df; }
+    .adapt  { fill: #ffebe9; stroke: #f0a8ad; }
+    .cross  { fill: #fff8c5; stroke: #d9bf6b; }
+  </style>
+
+  <!-- Upstream parent -->
+  <rect class="b" x="20"  y="20"  width="280" height="58" rx="8"/>
+  <text class="lbl" x="34" y="46">GraniteMoeHybridPreTrainedModel</text>
+  <text class="sub" x="34" y="64">transformers (upstream)</text>
+
+  <!-- ShadowResidualPreTrainedModel -->
+  <rect class="b accent" x="20"  y="120" width="280" height="58" rx="8"/>
+  <text class="lbl" x="34" y="146">ShadowResidualPreTrainedModel</text>
+  <text class="sub" x="34" y="164">config_class = ShadowResidualConfig</text>
+
+  <!-- ShadowResidualModel -->
+  <rect class="b adapt" x="20"  y="220" width="280" height="58" rx="8"/>
+  <text class="lbl" x="34" y="246">ShadowResidualModel</text>
+  <text class="sub" x="34" y="264">embed + layers[N] + norm</text>
+
+  <!-- ShadowResidualForCausalLM -->
+  <rect class="b adapt" x="20" y="300" width="280" height="50" rx="8"/>
+  <text class="lbl" x="34" y="324">ShadowResidualForCausalLM</text>
+  <text class="sub" x="34" y="342">+ lm_head, GenerationMixin</text>
+
+  <!-- decoder layer -->
+  <rect class="b adapt" x="380" y="220" width="280" height="58" rx="8"/>
+  <text class="lbl" x="394" y="246">ShadowResidualDecoderLayer</text>
+  <text class="sub" x="394" y="264">self_attn + gate/up/down + cross_stream</text>
+
+  <!-- self_attn module -->
+  <rect class="b base" x="380" y="300" width="280" height="50" rx="8"/>
+  <text class="lbl" x="394" y="324">ShadowResidualAttention</text>
+  <text class="sub" x="394" y="342">q_proj k_proj v_proj o_proj (StreamGated)</text>
+
+  <!-- cross_stream site -->
+  <rect class="b cross" x="700" y="220" width="260" height="58" rx="8"/>
+  <text class="lbl" x="714" y="246">CrossStream  (no-op site)</text>
+  <text class="sub" x="714" y="264">replaced by CrossStreamLora at PEFT-time</text>
+
+  <!-- _StreamGatedLinear marker -->
+  <rect class="b" x="700" y="300" width="260" height="50" rx="8"/>
+  <text class="lbl" x="714" y="324">_StreamGatedLinear</text>
+  <text class="sub" x="714" y="342">marker subclass of nn.Linear</text>
+
+  <!-- inheritance / containment edges -->
+  <path class="edge" d="M160,78 V120" marker-end="url(#arr)"/>
+  <path class="edge" d="M160,178 V220" marker-end="url(#arr)"/>
+  <path class="edge" d="M160,278 V300" marker-end="url(#arr)"/>
+  <path class="edge accent" d="M300,250 H380" marker-end="url(#arr)"/>
+  <path class="edge accent" d="M520,278 V300" marker-end="url(#arr)"/>
+  <path class="edge accent" d="M660,250 H700" marker-end="url(#arr)"/>
+  <path class="edge accent" d="M660,325 H700" marker-end="url(#arr)"/>
+</svg>
+<div class="caption">Inheritance (vertical, gray) and containment (horizontal, blue). SR inherits directly from
+<code>GraniteMoeHybridPreTrainedModel</code> &mdash; no GraniteSwitch detour. The decoder layer holds
+attention, MLP projections (all <code>_StreamGatedLinear</code>), and a no-op <code>CrossStream</code>
+site that PEFT will later wrap.</div>
+</div>
+
+<h3>1.3 Per-layer compute graph (dual-stream, cross-stream active)</h3>
+
+<div class="diagram">
+<svg viewBox="0 0 980 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Per-layer compute graph">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0969da"/>
+    </marker>
+    <marker id="arrA" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#cf222e"/>
+    </marker>
+    <marker id="arrB" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0a5ca8"/>
+    </marker>
+    <marker id="arrC" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9a6700"/>
+    </marker>
+  </defs>
+  <style>
+    .lane-base   { fill: #ddeefb; stroke: #7fb2df; }
+    .lane-adapt  { fill: #ffebe9; stroke: #f0a8ad; }
+    .box         { fill: #eef1f5; stroke: #d0d7de; }
+    .boxA        { fill: #ffebe9; stroke: #f0a8ad; }
+    .boxB        { fill: #ddeefb; stroke: #7fb2df; }
+    .boxC        { fill: #fff8c5; stroke: #d9bf6b; }
+    .edgeA       { stroke: #cf222e; fill: none; stroke-width: 1.6; }
+    .edgeB       { stroke: #0a5ca8; fill: none; stroke-width: 1.6; }
+    .edgeC       { stroke: #9a6700; fill: none; stroke-width: 2; }
+    .lbl         { font: 13px ui-monospace, monospace; fill: #1f2328; }
+    .sub         { font: 11px ui-monospace, monospace; fill: #656d76; }
+    .title       { font: 13px -apple-system, sans-serif; fill: #1f2328; }
+  </style>
+
+  <!-- lane backgrounds -->
+  <rect class="lane-base"  x="40"  y="20" width="380" height="500" rx="10" opacity="0.35"/>
+  <rect class="lane-adapt" x="540" y="20" width="380" height="500" rx="10" opacity="0.35"/>
+  <text class="title" x="60"  y="42">base stream  &mdash;  h_base  (frozen Q/O/MLP)</text>
+  <text class="title" x="560" y="42">adapter stream  &mdash;  h_adapt  (trainable LoRA)</text>
+
+  <!-- Inputs -->
+  <rect class="boxB" x="120" y="60" width="220" height="36" rx="6"/>
+  <text class="lbl" x="146" y="84">h_base  (from prev layer)</text>
+  <rect class="boxA" x="620" y="60" width="220" height="36" rx="6"/>
+  <text class="lbl" x="650" y="84">h_adapt (from prev layer)</text>
+
+  <!-- input layernorm fused -->
+  <rect class="box" x="320" y="120" width="320" height="36" rx="6"/>
+  <text class="lbl" x="340" y="144">input_layernorm( cat[h_base, h_adapt] )</text>
+
+  <!-- attention block -->
+  <rect class="boxB" x="80" y="180" width="280" height="60" rx="6"/>
+  <text class="lbl"  x="100" y="204">q_proj/k_proj/v_proj/o_proj   (base ctx)</text>
+  <text class="sub"  x="100" y="222">delta gated OFF; writes pkv_base cache</text>
+
+  <rect class="boxA" x="600" y="180" width="280" height="60" rx="6"/>
+  <text class="lbl"  x="620" y="204">q_proj/k_proj/v_proj/o_proj   (adapter ctx)</text>
+  <text class="sub"  x="620" y="222">LoRA delta fires; writes past_key_values</text>
+
+  <!-- residual + adds -->
+  <rect class="boxB" x="120" y="260" width="220" height="36" rx="6"/>
+  <text class="lbl" x="142" y="284">h_base += o_base * &mu;_res</text>
+  <rect class="boxA" x="620" y="260" width="220" height="36" rx="6"/>
+  <text class="lbl" x="642" y="284">h_adapt += o_adapt * &mu;_res</text>
+
+  <!-- post attn LN fused -->
+  <rect class="box" x="320" y="320" width="320" height="36" rx="6"/>
+  <text class="lbl" x="334" y="344">post_attention_layernorm( cat[...] )</text>
+
+  <!-- MLP -->
+  <rect class="boxB" x="80" y="380" width="280" height="60" rx="6"/>
+  <text class="lbl" x="100" y="404">gate/up/down  (base ctx)</text>
+  <text class="sub" x="100" y="422">delta gated OFF; bit-exact base MLP</text>
+
+  <rect class="boxA" x="600" y="380" width="280" height="60" rx="6"/>
+  <text class="lbl" x="620" y="404">gate/up/down  (adapter ctx)</text>
+  <text class="sub" x="620" y="422">LoRA delta fires</text>
+
+  <!-- cross stream merge -->
+  <rect class="boxC" x="600" y="460" width="280" height="42" rx="6"/>
+  <text class="lbl" x="620" y="486">h_adapt += cross_stream(h_base)   <tspan fill="#9a6700">[B&middot;A]</tspan></text>
+
+  <!-- edges -->
+  <path class="edgeB" d="M230,96 V120" marker-end="url(#arrB)"/>
+  <path class="edgeA" d="M730,96 V120" marker-end="url(#arrA)"/>
+  <path class="edgeB" d="M380,156 H260 V180" marker-end="url(#arrB)"/>
+  <path class="edgeA" d="M580,156 H700 V180" marker-end="url(#arrA)"/>
+  <path class="edgeB" d="M220,240 V260" marker-end="url(#arrB)"/>
+  <path class="edgeA" d="M730,240 V260" marker-end="url(#arrA)"/>
+  <path class="edgeB" d="M230,296 V320" marker-end="url(#arrB)"/>
+  <path class="edgeA" d="M730,296 V320" marker-end="url(#arrA)"/>
+  <path class="edgeB" d="M380,356 H260 V380" marker-end="url(#arrB)"/>
+  <path class="edgeA" d="M580,356 H700 V380" marker-end="url(#arrA)"/>
+  <!-- cross stream arrow base->adapter -->
+  <path class="edgeC" d="M340,460 C440,460 540,481 600,481" marker-end="url(#arrC)"/>
+  <text class="sub" x="380" y="450" fill="#9a6700">cross_stream(h_base)</text>
+</svg>
+<div class="caption">One decoder layer in dual-stream mode. Layernorms run on a concatenated tensor for fused-batch
+efficiency, then the two streams diverge under <code>stream_context("base")</code> vs
+<code>stream_context("adapter")</code>. K/V caches are <strong>disjoint</strong>: the base stream owns
+<code>past_key_values_base</code> (frozen, adapter-free); the adapter stream owns the user's
+<code>past_key_values</code>. The end-of-layer <code>cross_stream(h_base)</code> is the only base&rarr;adapter
+information channel.</div>
+</div>
+
+<h3>1.4 Inter-layer wiring &mdash; how stream <em>i</em> connects to stream <em>i+1</em></h3>
+
+<p>
+The previous diagram zoomed into one layer. This one zooms <em>out</em>: the embedding feeds layer 0,
+each layer hands two streams to the next, and the final layer hands the adapter stream to the head.
+A few things become important only at this scale:
+</p>
+
+<ul>
+  <li><strong>Streams are per-layer-pair connected.</strong> Layer <em>i</em>'s <code>h_base</code> output
+      feeds layer <em>i+1</em>'s <code>h_base</code> input &mdash; nothing else. Same for
+      <code>h_adapt</code>. There is no skip from layer <em>i</em>'s adapter into layer <em>j</em>'s base
+      (that would break the frozen-base invariant), and no skip from layer <em>i</em>'s base into layer
+      <em>j</em>'s adapter for any <em>j &ne; i</em>.</li>
+  <li><strong>Cross-stream is strictly local.</strong> The <em>only</em> base&rarr;adapter coupling lives
+      at the bottom of each layer: <code>h_adapt += cross_stream(h_base)</code>. It writes into
+      <em>this layer's</em> <code>h_adapt</code> output, which is what the next layer's adapter input
+      consumes. Information from the base stream therefore reaches the adapter stream <em>one layer
+      later</em>, recursively.</li>
+  <li><strong>Embedding is shared, not duplicated.</strong> <code>embed_tokens(input_ids) &times;
+      embedding_multiplier</code> runs once. The result <em>is</em> <code>h_base</code>; <code>h_adapt</code>
+      is <code>h_base.clone()</code> at layer 0. The two streams diverge only inside the layer stack.</li>
+  <li><strong>The head only sees the adapter stream.</strong> After layer <em>N&minus;1</em>,
+      <code>h_base</code> is discarded; <code>norm(h_adapt)</code> goes through <code>lm_head</code>.
+      The base stream's purpose is purely to feed <code>cross_stream(&middot;)</code> at every layer; it
+      is never read at the head.</li>
+  <li><strong>K/V caches are also per-layer-paired.</strong> Layer <em>i</em>'s base K/V live in slot
+      <em>i</em> of <code>past_key_values_base</code>; layer <em>i</em>'s adapter K/V live in slot
+      <em>i</em> of <code>past_key_values</code>. The two caches share <em>indices</em> but never
+      <em>tensors</em>; one layer's base K/V never becomes another layer's adapter K/V.</li>
+</ul>
+
+<div class="diagram">
+<svg viewBox="0 0 720 2080" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Inter-layer wiring (vertical)">
+  <defs>
+    <marker id="arrIB" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0a5ca8"/>
+    </marker>
+    <marker id="arrIA" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#cf222e"/>
+    </marker>
+    <marker id="arrIC" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9a6700"/>
+    </marker>
+    <marker id="arrK" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#656d76"/>
+    </marker>
+  </defs>
+  <style>
+    .embed   { fill: #eef1f5; stroke: #d0d7de; }
+    .layer   { fill: #f6f8fa; stroke: #d0d7de; }
+    .lbase   { fill: #ddeefb; stroke: #7fb2df; }
+    .ladapt  { fill: #ffebe9; stroke: #f0a8ad; }
+    .ln      { fill: #eef1f5; stroke: #d0d7de; }
+    .attn    { fill: #e6f3ea; stroke: #94cca4; }
+    .mlp     { fill: #e6f3ea; stroke: #94cca4; }
+    .csite   { fill: #fff8c5; stroke: #d9bf6b; }
+    .head    { fill: #eef1f5; stroke: #d0d7de; }
+    .kvbase  { fill: #ddeefb; stroke: #7fb2df; }
+    .kvadapt { fill: #ffebe9; stroke: #f0a8ad; }
+    .lbl     { font: 12px ui-monospace, monospace; fill: #1f2328; }
+    .lblS    { font: 11px ui-monospace, monospace; fill: #1f2328; }
+    .sub     { font: 10px ui-monospace, monospace; fill: #656d76; }
+    .ttl     { font: 13px -apple-system, sans-serif; fill: #1f2328; font-weight: 600; }
+    .ttlBig  { font: 14px -apple-system, sans-serif; fill: #1f2328; font-weight: 700; }
+    .eB      { stroke: #0a5ca8; fill: none; stroke-width: 1.8; }
+    .eA      { stroke: #cf222e; fill: none; stroke-width: 1.8; }
+    .eC      { stroke: #9a6700; fill: none; stroke-width: 2; stroke-dasharray: 5 3; }
+    .eK      { stroke: #656d76; fill: none; stroke-width: 1.2; stroke-dasharray: 3 3; }
+    .laneCap { font: 12px -apple-system, sans-serif; font-weight: 600; }
+  </style>
+
+  <!-- title -->
+  <text class="ttlBig" x="20" y="26">Inter-layer dataflow (cross-stream active) &mdash; read top-to-bottom</text>
+  <text class="sub"    x="20" y="44">left lane = base stream (frozen)   |   right lane = adapter stream (trainable)   |   gold dashed = per-layer cross-stream merge</text>
+
+  <!-- lane backgrounds running full height -->
+  <rect class="lbase"  x="80"  y="64" width="240" height="1900" rx="14" opacity="0.18"/>
+  <rect class="ladapt" x="400" y="64" width="240" height="1900" rx="14" opacity="0.18"/>
+  <text class="laneCap" x="100" y="84"  fill="#0a5ca8">h_base lane</text>
+  <text class="laneCap" x="420" y="84"  fill="#cf222e">h_adapt lane</text>
+
+  <!-- ===== EMBEDDING (single source for both streams) ===== -->
+  <rect class="embed" x="200" y="100" width="320" height="64" rx="8"/>
+  <text class="lbl" x="220" y="124">embed_tokens(input_ids)</text>
+  <text class="sub" x="220" y="142">e &times;= embedding_multiplier</text>
+  <text class="sub" x="220" y="158">h_base = e ;  h_adapt = e.clone()</text>
+
+  <!-- splits to lanes -->
+  <path class="eB" d="M260,164 V190 H200 V214" marker-end="url(#arrIB)"/>
+  <path class="eA" d="M460,164 V190 H520 V214" marker-end="url(#arrIA)"/>
+
+  <!--
+    LAYER TEMPLATE (height = 480) :
+      y +0    layer header bar
+      y +24   (lane h_base in)        |   (lane h_adapt in)
+      y +60   input_layernorm   (spans both lanes)
+      y +104  attn (base)            |   attn (adapter)
+      y +192  + residual (base)      |   + residual (adapter)
+      y +228  post_attn LN     (spans both)
+      y +272  MLP (base)             |   MLP (adapter)
+      y +344  + residual (base)      |   + residual (adapter)
+      y +380  cross_stream(h_base) -> h_adapt  (gold dashed arrow, base lane to adapter lane)
+      y +420  layer h_base out       |   layer h_adapt out
+  -->
+
+  <!-- ============= LAYER 0 (y = 220 .. 700) ============= -->
+  <g transform="translate(0,220)">
+    <rect class="layer" x="80" y="0" width="560" height="460" rx="12"/>
+    <text class="ttl"   x="100" y="20">layer 0  &mdash;  ShadowResidualDecoderLayer</text>
+    <text class="sub"   x="100" y="36">writes KV slot 0 in BOTH caches (pkv_base[0], pkv_adapt[0])</text>
+
+    <!-- shared input layernorm -->
+    <rect class="ln" x="200" y="56" width="320" height="32" rx="6"/>
+    <text class="lblS" x="216" y="76">input_layernorm( cat[h_base, h_adapt] )</text>
+    <!-- bridges from each lane into the shared LN, and back -->
+    <path class="eB" d="M200,222 V120" stroke-dasharray="0" stroke-width="0" />
+
+    <!-- ATTN row -->
+    <rect class="attn" x="100" y="104" width="180" height="84" rx="6"/>
+    <text class="lblS" x="114" y="124">attn  (stream_context = base)</text>
+    <text class="sub"  x="114" y="142">q/k/v/o &mdash; LoRA &Delta; gated OFF</text>
+    <text class="sub"  x="114" y="158">writes pkv_base[0]</text>
+    <text class="sub"  x="114" y="178">o_base = o_proj(attn(q_base, k_base, v_base))</text>
+
+    <rect class="attn" x="420" y="104" width="200" height="84" rx="6"/>
+    <text class="lblS" x="434" y="124">attn  (stream_context = adapter)</text>
+    <text class="sub"  x="434" y="142">q/k/v/o + LoRA &Delta; (also ALORA-gated)</text>
+    <text class="sub"  x="434" y="158">writes pkv_adapt[0]</text>
+    <text class="sub"  x="434" y="178">o_adapt = o_proj(attn(q_adapt, k_adapt, v_adapt))</text>
+
+    <!-- + residual after attn -->
+    <rect class="lbase"  x="100" y="200" width="180" height="28" rx="5"/>
+    <text class="lblS"  x="114" y="218">h_base += o_base * &mu;_res</text>
+    <rect class="ladapt" x="420" y="200" width="200" height="28" rx="5"/>
+    <text class="lblS"  x="434" y="218">h_adapt += o_adapt * &mu;_res</text>
+
+    <!-- shared post-attn LN -->
+    <rect class="ln" x="200" y="240" width="320" height="32" rx="6"/>
+    <text class="lblS" x="216" y="260">post_attention_layernorm( cat[...] )</text>
+
+    <!-- MLP row -->
+    <rect class="mlp" x="100" y="288" width="180" height="68" rx="6"/>
+    <text class="lblS" x="114" y="308">MLP  (stream_context = base)</text>
+    <text class="sub"  x="114" y="324">gate/up/down &mdash; &Delta; gated OFF</text>
+    <text class="sub"  x="114" y="346">m_base = down(silu(gate)*up)</text>
+
+    <rect class="mlp" x="420" y="288" width="200" height="68" rx="6"/>
+    <text class="lblS" x="434" y="308">MLP  (stream_context = adapter)</text>
+    <text class="sub"  x="434" y="324">gate/up/down + LoRA &Delta;</text>
+    <text class="sub"  x="434" y="346">m_adapt = down(silu(gate)*up)</text>
+
+    <!-- + residual after MLP -->
+    <rect class="lbase"  x="100" y="368" width="180" height="28" rx="5"/>
+    <text class="lblS"  x="114" y="386">h_base += m_base * &mu;_res</text>
+    <rect class="ladapt" x="420" y="368" width="200" height="28" rx="5"/>
+    <text class="lblS"  x="434" y="386">h_adapt += m_adapt * &mu;_res</text>
+
+    <!-- cross-stream merge (sits in the adapter lane, sourced from base lane) -->
+    <rect class="csite" x="280" y="408" width="340" height="36" rx="6"/>
+    <text class="lblS"  x="296" y="430">h_adapt += cross_stream(h_base)
+      <tspan fill="#9a6700">&nbsp; [B&middot;A], R&times;H</tspan></text>
+
+    <!-- intra-layer arrows: lane -> shared LN -> back -->
+    <path class="eB" d="M190,228 H210 V88" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,228 V88"   marker-end="url(#arrIA)"/>
+    <!-- LN -> attn (split) -->
+    <path class="eB" d="M260,88  V104" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,88  V104" marker-end="url(#arrIA)"/>
+    <!-- attn -> + residual -->
+    <path class="eB" d="M190,188 V200" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,188 V200" marker-end="url(#arrIA)"/>
+    <!-- residual -> post-attn LN -->
+    <path class="eB" d="M190,228 H210 V240" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,228 V240"      marker-end="url(#arrIA)"/>
+    <!-- LN -> MLP -->
+    <path class="eB" d="M260,272 V288" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,272 V288" marker-end="url(#arrIA)"/>
+    <!-- MLP -> + residual -->
+    <path class="eB" d="M190,356 V368" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,356 V368" marker-end="url(#arrIA)"/>
+    <!-- residual -> cross-stream (gold from base lane to merge box) -->
+    <path class="eC" d="M190,396 V420 H280" marker-end="url(#arrIC)"/>
+    <!-- adapter residual -> cross-stream merge box (continues straight down) -->
+    <path class="eA" d="M520,396 V408" marker-end="url(#arrIA)"/>
+  </g>
+
+  <!-- arrows from layer 0 outputs (y=680 = 220+460) downward into layer 1 inputs -->
+  <path class="eB" d="M190,690 V740" marker-end="url(#arrIB)"/>
+  <path class="eA" d="M520,690 V740" marker-end="url(#arrIA)"/>
+  <text class="sub" x="200" y="708" fill="#0a5ca8">h_base out (layer 0) &rarr; h_base in (layer 1)</text>
+  <text class="sub" x="420" y="725" fill="#cf222e">h_adapt out (layer 0) &rarr; h_adapt in (layer 1)</text>
+
+  <!-- ============= LAYER 1 (y = 740 .. 1220) ============= -->
+  <g transform="translate(0,740)">
+    <rect class="layer" x="80" y="0" width="560" height="460" rx="12"/>
+    <text class="ttl"   x="100" y="20">layer 1  &mdash;  same wiring as layer 0</text>
+    <text class="sub"   x="100" y="36">writes pkv_base[1] / pkv_adapt[1]</text>
+
+    <rect class="ln" x="200" y="56" width="320" height="32" rx="6"/>
+    <text class="lblS" x="216" y="76">input_layernorm( cat[h_base, h_adapt] )</text>
+
+    <rect class="attn" x="100" y="104" width="180" height="84" rx="6"/>
+    <text class="lblS" x="114" y="124">attn (base)</text>
+    <text class="sub"  x="114" y="142">&Delta; OFF; pkv_base[1]</text>
+    <text class="sub"  x="114" y="158">o_base &rarr; +residual</text>
+
+    <rect class="attn" x="420" y="104" width="200" height="84" rx="6"/>
+    <text class="lblS" x="434" y="124">attn (adapter)</text>
+    <text class="sub"  x="434" y="142">+LoRA &Delta;; pkv_adapt[1]</text>
+    <text class="sub"  x="434" y="158">o_adapt &rarr; +residual</text>
+
+    <rect class="lbase"  x="100" y="200" width="180" height="28" rx="5"/>
+    <text class="lblS"   x="114" y="218">h_base += o_base * &mu;_res</text>
+    <rect class="ladapt" x="420" y="200" width="200" height="28" rx="5"/>
+    <text class="lblS"   x="434" y="218">h_adapt += o_adapt * &mu;_res</text>
+
+    <rect class="ln" x="200" y="240" width="320" height="32" rx="6"/>
+    <text class="lblS" x="216" y="260">post_attention_layernorm( cat[...] )</text>
+
+    <rect class="mlp" x="100" y="288" width="180" height="68" rx="6"/>
+    <text class="lblS" x="114" y="308">MLP (base)</text>
+    <text class="sub"  x="114" y="346">m_base &rarr; +residual</text>
+
+    <rect class="mlp" x="420" y="288" width="200" height="68" rx="6"/>
+    <text class="lblS" x="434" y="308">MLP (adapter)</text>
+    <text class="sub"  x="434" y="346">m_adapt &rarr; +residual</text>
+
+    <rect class="lbase"  x="100" y="368" width="180" height="28" rx="5"/>
+    <text class="lblS"   x="114" y="386">h_base += m_base * &mu;_res</text>
+    <rect class="ladapt" x="420" y="368" width="200" height="28" rx="5"/>
+    <text class="lblS"   x="434" y="386">h_adapt += m_adapt * &mu;_res</text>
+
+    <rect class="csite" x="280" y="408" width="340" height="36" rx="6"/>
+    <text class="lblS"  x="296" y="430">h_adapt += cross_stream(h_base) <tspan fill="#9a6700">[B&middot;A]</tspan></text>
+
+    <path class="eB" d="M190,228 H210 V88" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,228 V88"      marker-end="url(#arrIA)"/>
+    <path class="eB" d="M260,88  V104" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,88  V104" marker-end="url(#arrIA)"/>
+    <path class="eB" d="M190,188 V200" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,188 V200" marker-end="url(#arrIA)"/>
+    <path class="eB" d="M190,228 H210 V240" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,228 V240"      marker-end="url(#arrIA)"/>
+    <path class="eB" d="M260,272 V288" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,272 V288" marker-end="url(#arrIA)"/>
+    <path class="eB" d="M190,356 V368" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,356 V368" marker-end="url(#arrIA)"/>
+    <path class="eC" d="M190,396 V420 H280" marker-end="url(#arrIC)"/>
+    <path class="eA" d="M520,396 V408" marker-end="url(#arrIA)"/>
+  </g>
+
+  <!-- gap arrows out of layer 1 -->
+  <path class="eB" d="M190,1210 V1260" marker-end="url(#arrIB)"/>
+  <path class="eA" d="M520,1210 V1260" marker-end="url(#arrIA)"/>
+
+  <!-- ============= ELLIPSIS BAND (y = 1260 .. 1380) ============= -->
+  <g>
+    <rect class="layer" x="80" y="1260" width="560" height="120" rx="12"/>
+    <text class="ttlBig" x="100" y="1290">layers  2 .. N&minus;2  (same wiring repeats)</text>
+    <text class="sub"   x="100" y="1312">each layer: input LN &rarr; attn(base|adapter) &rarr; +res &rarr; post-attn LN &rarr; MLP(base|adapter) &rarr; +res &rarr; cross_stream(h_base) into h_adapt</text>
+    <text class="sub"   x="100" y="1330">each layer writes its own KV slot in BOTH caches: pkv_base[i] (frozen, adapter-free) and pkv_adapt[i]</text>
+    <text class="sub"   x="100" y="1348">streams stay parallel: layer i&apos;s h_base only feeds layer i+1&apos;s h_base; layer i&apos;s h_adapt only feeds layer i+1&apos;s h_adapt</text>
+    <text class="lbl"   x="190" y="1372" fill="#0a5ca8">&middot; &middot; &middot;</text>
+    <text class="lbl"   x="520" y="1372" fill="#cf222e">&middot; &middot; &middot;</text>
+  </g>
+
+  <!-- arrows exiting the ellipsis -->
+  <path class="eB" d="M190,1380 V1420" marker-end="url(#arrIB)"/>
+  <path class="eA" d="M520,1380 V1420" marker-end="url(#arrIA)"/>
+
+  <!-- ============= LAYER N-1 (y = 1420 .. 1900) ============= -->
+  <g transform="translate(0,1420)">
+    <rect class="layer" x="80" y="0" width="560" height="460" rx="12"/>
+    <text class="ttl"   x="100" y="20">layer N&minus;1  (last layer)</text>
+    <text class="sub"   x="100" y="36">writes pkv_base[N&minus;1] / pkv_adapt[N&minus;1]</text>
+
+    <rect class="ln" x="200" y="56" width="320" height="32" rx="6"/>
+    <text class="lblS" x="216" y="76">input_layernorm( cat[h_base, h_adapt] )</text>
+
+    <rect class="attn" x="100" y="104" width="180" height="84" rx="6"/>
+    <text class="lblS" x="114" y="124">attn (base)</text>
+    <text class="sub"  x="114" y="158">o_base &rarr; +residual</text>
+
+    <rect class="attn" x="420" y="104" width="200" height="84" rx="6"/>
+    <text class="lblS" x="434" y="124">attn (adapter)</text>
+    <text class="sub"  x="434" y="158">o_adapt &rarr; +residual</text>
+
+    <rect class="lbase"  x="100" y="200" width="180" height="28" rx="5"/>
+    <text class="lblS"   x="114" y="218">h_base += o_base * &mu;_res</text>
+    <rect class="ladapt" x="420" y="200" width="200" height="28" rx="5"/>
+    <text class="lblS"   x="434" y="218">h_adapt += o_adapt * &mu;_res</text>
+
+    <rect class="ln" x="200" y="240" width="320" height="32" rx="6"/>
+    <text class="lblS" x="216" y="260">post_attention_layernorm( cat[...] )</text>
+
+    <rect class="mlp" x="100" y="288" width="180" height="68" rx="6"/>
+    <text class="lblS" x="114" y="308">MLP (base)</text>
+
+    <rect class="mlp" x="420" y="288" width="200" height="68" rx="6"/>
+    <text class="lblS" x="434" y="308">MLP (adapter)</text>
+
+    <rect class="lbase"  x="100" y="368" width="180" height="28" rx="5"/>
+    <text class="lblS"   x="114" y="386">h_base += m_base * &mu;_res</text>
+    <rect class="ladapt" x="420" y="368" width="200" height="28" rx="5"/>
+    <text class="lblS"   x="434" y="386">h_adapt += m_adapt * &mu;_res</text>
+
+    <rect class="csite" x="280" y="408" width="340" height="36" rx="6"/>
+    <text class="lblS"  x="296" y="430">h_adapt += cross_stream(h_base)  <tspan fill="#9a6700">(last per-layer base&rarr;adapter merge)</tspan></text>
+
+    <path class="eB" d="M190,228 H210 V88" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,228 V88"      marker-end="url(#arrIA)"/>
+    <path class="eB" d="M260,88  V104" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,88  V104" marker-end="url(#arrIA)"/>
+    <path class="eB" d="M190,188 V200" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,188 V200" marker-end="url(#arrIA)"/>
+    <path class="eB" d="M190,228 H210 V240" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,228 V240"      marker-end="url(#arrIA)"/>
+    <path class="eB" d="M260,272 V288" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,272 V288" marker-end="url(#arrIA)"/>
+    <path class="eB" d="M190,356 V368" marker-end="url(#arrIB)"/>
+    <path class="eA" d="M520,356 V368" marker-end="url(#arrIA)"/>
+    <path class="eC" d="M190,396 V420 H280" marker-end="url(#arrIC)"/>
+    <path class="eA" d="M520,396 V408" marker-end="url(#arrIA)"/>
+  </g>
+
+  <!-- ============= TERMINATION (y = 1900 .. 2070) ============= -->
+  <!-- base lane terminates -->
+  <g>
+    <path class="eB" d="M190,1890 V1930"/>
+    <rect class="lbase" x="100" y="1930" width="180" height="44" rx="6" opacity="0.55"/>
+    <text class="lblS"  x="114" y="1950" fill="#656d76">h_base out (last layer)</text>
+    <text class="sub"   x="114" y="1966" fill="#656d76">DISCARDED &mdash; not used by lm_head</text>
+  </g>
+  <!-- adapter lane continues into head -->
+  <path class="eA" d="M520,1890 V1930" marker-end="url(#arrIA)"/>
+  <rect class="head" x="380" y="1930" width="240" height="100" rx="8"/>
+  <text class="ttl"   x="396" y="1952">lm_head path</text>
+  <text class="lblS"  x="396" y="1972">norm( h_adapt )</text>
+  <text class="lblS"  x="396" y="1990">lm_head( ... )</text>
+  <text class="sub"   x="396" y="2006">/ logits_scaling</text>
+  <text class="sub"   x="396" y="2022">&rarr; logits</text>
+
+  <!-- KV strip + legend along the right margin (vertical mini-summary) -->
+  <g transform="translate(660,100)">
+    <text class="ttl" x="-30" y="0" fill="#656d76" transform="rotate(90,-30,0)" style="text-anchor: start;">&nbsp;</text>
+  </g>
+
+  <!-- bottom legend -->
+  <g transform="translate(20,2056)">
+    <line class="eB" x1="0" y1="0" x2="22" y2="0"/>
+    <text class="sub" x="28" y="3">h_base (frozen lane)</text>
+    <line class="eA" x1="160" y1="0" x2="182" y2="0"/>
+    <text class="sub" x="188" y="3">h_adapt (trainable lane)</text>
+    <line class="eC" x1="340" y1="0" x2="362" y2="0"/>
+    <text class="sub" x="368" y="3">cross_stream(h_base) added to h_adapt</text>
+  </g>
+</svg>
+<div class="caption">Vertical inter-layer view. The two lanes run the full height of the figure; each layer
+is one tall card with all of its intermediates (input LN &rarr; per-stream attn &rarr; +residual &rarr;
+post-attn LN &rarr; per-stream MLP &rarr; +residual &rarr; cross-stream merge) stacked top-to-bottom.
+The only base&rarr;adapter coupling is the gold dashed arrow at the bottom of each layer; the lanes are
+otherwise parallel and never crossed across layers. After the last layer, <code>h_base</code> is dropped
+and only <code>norm(h_adapt)</code> reaches <code>lm_head</code>.</div>
+</div>
+
+<h3>1.5 Adapter-only early-exit</h3>
+
+<p>
+When <code>"cross_stream"</code> is <em>not</em> in <code>target_modules</code>, no
+<code>CrossStream</code> site has been wrapped &mdash; the model gate
+<code>_any_cross_stream_wrapped(self.layers)</code> in <code>modeling_hf.py</code> returns <code>False</code>
+and the decoder takes a <strong>single-stream path</strong>: only <code>h_adapt</code> is computed, with one
+Q/K/V/O pass per layer under the default <code>"adapter"</code> context. Compute is equivalent to plain
+LoRA on Granite (modulo unfused QKV / gate-up reduction order).
+</p>
+
+<div class="diagram">
+<svg viewBox="0 0 980 200" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .boxA { fill: #ffebe9; stroke: #f0a8ad; }
+    .boxC { fill: #fff8c5; stroke: #d9bf6b; }
+    .boxX { fill: #eef1f5; stroke: #d0d7de; }
+    .lbl  { font: 13px ui-monospace, monospace; fill: #1f2328; }
+    .sub  { font: 11px ui-monospace, monospace; fill: #656d76; }
+    .title{ font: 13px -apple-system, sans-serif; fill: #1f2328; }
+    .edgeA{ stroke: #cf222e; fill: none; stroke-width: 1.6; }
+  </style>
+  <defs>
+    <marker id="arrA2" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#cf222e"/>
+    </marker>
+  </defs>
+  <text class="title" x="20" y="20">adapter-only early-exit (no cross_stream wrapped)</text>
+
+  <rect class="boxA" x="20"  y="40" width="180" height="50" rx="6"/>
+  <text class="lbl" x="40" y="70">h_adapt (input)</text>
+
+  <rect class="boxA" x="220" y="40" width="220" height="50" rx="6"/>
+  <text class="lbl" x="240" y="60">attn (adapter ctx)</text>
+  <text class="sub" x="240" y="80">single Q/K/V/O, single KV cache</text>
+
+  <rect class="boxA" x="460" y="40" width="200" height="50" rx="6"/>
+  <text class="lbl" x="480" y="60">MLP (adapter ctx)</text>
+  <text class="sub" x="480" y="80">LoRA on gate/up/down (if listed)</text>
+
+  <rect class="boxA" x="680" y="40" width="200" height="50" rx="6"/>
+  <text class="lbl" x="700" y="70">h_adapt (output)</text>
+
+  <path class="edgeA" d="M200,65 H220" marker-end="url(#arrA2)"/>
+  <path class="edgeA" d="M440,65 H460" marker-end="url(#arrA2)"/>
+  <path class="edgeA" d="M660,65 H680" marker-end="url(#arrA2)"/>
+
+  <rect class="boxX" x="20" y="120" width="860" height="60" rx="6"/>
+  <text class="sub" x="36" y="142">No h_base maintained, no cross_stream call, no second attention pass.</text>
+  <text class="sub" x="36" y="162">cross_stream sites stay unwrapped CrossStream no-ops; the model gate skips dual-stream entirely.</text>
+</svg>
+</div>
+
+<h3>1.6 Shared base K/V (<code>shared_base_kv=True</code>)</h3>
+
+<p>
+The dual-stream graph in &sect;1.3 has each stream compute its <em>own</em> K and V (the
+<strong>disjoint-K/V</strong> default, <code>config.shared_base_kv=False</code>): two K/V projections per
+layer, two physically separate caches (<code>past_key_values</code> for the adapter,
+<code>past_key_values_base</code> for the base). Shared-base-K/V mode
+(<code>config.shared_base_kv=True</code>, set via <code>set_shadow_residual(..., shared_base_kv=True)</code>)
+collapses that to a <strong>single K/V, computed once from the base stream</strong>, that both streams
+attend against. It is selected at runtime in <code>attention_hf.py</code> (the
+<code>if self.shared_base_kv:</code> branch) and is the dominant production variant &mdash; every
+<code>sr-*-sharedkv.yaml</code> config trains it.
+</p>
+
+<p>What changes versus the disjoint default:</p>
+
+<ul>
+<li><strong>K and V are computed once, under <code>stream_context("base")</code></strong> &mdash;
+<code>k = k_proj(normed_base)</code>, <code>v = v_proj(normed_base)</code>. Because the call runs in the
+<code>"base"</code> context, any <code>ShadowResidualLora</code> wrapper short-circuits to
+<code>base_layer(x)</code>, so the cached K/V is <code>W_K&middot;normed_base</code> /
+<code>W_V&middot;normed_base</code> with <strong>frozen weights only</strong>. The cache carries
+<em>zero</em> adapter influence.</li>
+<li><strong>The adapter stream computes only Q</strong> &mdash; <code>q_adapt = q_proj(normed_adapt)</code>
+under <code>"adapter"</code> context (Q LoRA delta fires). It does <em>not</em> compute its own K/V;
+<code>_shape_qkv</code> is called with <code>k=None, v=None</code> for the adapter.</li>
+<li><strong>Both Qs attend against the same shared K/V.</strong> Per head, the adapter stream is
+<code>softmax(Q_adapt &middot; K_base&#7488; / &radic;d) &middot; V_base</code>, then <code>o_proj</code>
+under <code>"adapter"</code> context (O LoRA delta fires).</li>
+<li><strong>Only one cache is used.</strong> The shared K/V is written into <code>past_key_values</code>
+(the adapter cache); <code>past_key_values_base</code> is intentionally ignored in this mode.</li>
+<li><strong>K/V LoRA is structurally forbidden.</strong> <code>_reject_kv_lora_when_shared</code>
+(<code>peft_shadow_residual/factory.py</code>) raises at construction time if
+<code>k_proj</code>/<code>v_proj</code> appear in <code>target_modules</code> &mdash; there is no place for a
+K/V adapter delta to land, so the combination is rejected rather than silently dropped.</li>
+</ul>
+
+<div class="diagram">
+<pre>
+   shared base K/V (shared_base_kv=True, cross_stream active)
+
+   normed_base  &rarr;  q_proj (base ctx)   &#9508;
+                    k_proj (base ctx)    &#9474;   K/V = W_kv &middot; normed_base   (FROZEN, no delta)
+                    v_proj (base ctx)   &#9508;   written ONCE to past_key_values
+                                         &#9474;
+   normed_adapt &rarr;  q_proj (adapter ctx) &#9474;   Q_adapt = (W_Q + &Delta;W_Q) &middot; normed_adapt
+                    (Q LoRA &Delta; fires)    &#9474;
+                                         &#9660;
+        Q_base   &#9472;&rarr; softmax(Q_base &middot; K&#7488;)&middot;V  &#9472;&rarr; o_proj (base ctx)    &#9472;&rarr; o_base
+        Q_adapt  &#9472;&rarr; softmax(Q_adapt&middot; K&#7488;)&middot;V  &#9472;&rarr; o_proj (adapter ctx) &#9472;&rarr; o_adapt
+                                         &#9650;
+                       both Qs attend the SAME frozen K/V; one cache only.
+                       past_key_values_base unused. K/V LoRA forbidden.
+</pre>
+</div>
+
+<p>
+The adapter reshapes only the <em>query</em> and the <em>output projection</em>; it reads the same frozen
+K/V the unadapted base model would have written. The base stream's Q/K/V/O/MLP stay bit-identical to the
+unadapted base model, exactly as in the disjoint default. The architectural payoff: because the cache is
+adapter-independent, an SR adapter can attend over a KV cache populated by the frozen base &mdash; keys/values
+need not be recomputed when the adapter turns on.
+</p>
+
+<h3>1.7 The fused&rarr;unfused weight transfer</h3>
+
+<p>
+Upstream <code>GraniteMoeHybridForCausalLM</code> stores attention as a <em>fused</em>
+<code>self_attn.qkv_proj</code> and the MLP gate/up as a fused <code>shared_mlp.input_linear</code>. SR uses
+<em>unfused</em> per-projection tensors so PEFT can attach a separate LoRA per projection.
+<code>weight_transfer.transfer_base_weights(src, dst)</code> walks the source state-dict and slices each
+fused tensor into the corresponding unfused destination keys:
+</p>
+
+<pre>upstream                                                  SR (unfused)
+self_attn.qkv_proj.weight  [Q+K+V, H]   &rarr;               self_attn.q_proj.weight  [Q, H]
+                                                          self_attn.k_proj.weight  [K, H]
+                                                          self_attn.v_proj.weight  [V, H]
+shared_mlp.input_linear.weight  [2I, H]  &rarr;              gate_proj.weight  [I, H]
+                                                          up_proj.weight    [I, H]
+shared_mlp.output_linear.weight  &rarr;                      down_proj.weight</pre>
+
+<p class="small">
+The slicing is done with <code>torch.no_grad().copy_</code> into already-allocated destination tensors, so
+shapes must match exactly &mdash; mismatch is a hard fail. Numerics are not bit-exact with upstream because
+the reduction order changes (fused vs three separate matmuls); this is a documented divergence.
+</p>
+
+<!-- ============================================================ -->
+<h2 id="peft">2. Relation to PEFT &mdash; save / load / why standard PEFT is not enough</h2>
+
+<h3>2.1 The two custom-module wrappers</h3>
+
+<p>
+PEFT's <code>LoraModel</code> walks the model graph and, for each module whose attribute name matches
+<code>target_modules</code>, replaces it with a <em>LoRA wrapper</em>. Out of the box PEFT only knows how
+to wrap <code>nn.Linear</code> (and a handful of others). SR has two needs that vanilla PEFT cannot meet:
+</p>
+
+<ol>
+  <li>
+    The <strong>cross-stream site</strong> is not a linear &mdash; it is a no-op <code>nn.Module</code>
+    that has no weight at all. Standard PEFT cannot wrap it because there is no
+    <code>weight</code> to read shapes from.
+  </li>
+  <li>
+    The <strong>Q/K/V/O/gate/up/down projections</strong> need a per-call gate (the <em>stream gate</em>)
+    that toggles the LoRA delta on/off depending on which stream the decoder is computing right now.
+    Stock <code>peft.tuners.lora.layer.Linear</code> always applies the delta.
+  </li>
+</ol>
+
+<p>
+We solve both via PEFT's <code>LoraConfig._register_custom_module({type: wrapper_class})</code> mechanism.
+Two registrations, both done by <code>_register_cross_stream(lora_config)</code> in
+<span class="file">peft_shadow_residual/factory.py</span>:
+</p>
+
+<table>
+  <tr><th>Target type</th><th>Wrapper class</th><th>What it adds</th></tr>
+  <tr>
+    <td><code>CrossStream</code></td>
+    <td><code>CrossStreamLora</code></td>
+    <td>Implements <code>LoraLayer</code> manually. Owns rank-R <code>lora_A</code>/<code>lora_B</code>
+        ModuleDicts. <code>forward(x)</code> returns <code>0 + B(A(x))*scaling</code> &mdash; the base
+        layer contributes nothing.</td>
+  </tr>
+  <tr>
+    <td><code>_StreamGatedLinear</code></td>
+    <td><code>ShadowResidualLora</code></td>
+    <td>Subclasses stock <code>peft.tuners.lora.layer.Linear</code>. Adds one branch at the top of
+        <code>forward</code>: if <code>current_stream() == "base"</code> &rarr; call <code>base_layer(x)</code>
+        and return (delta gated off); otherwise delegate to <code>super().forward(x, ...)</code>.</td>
+  </tr>
+</table>
+
+<div class="note">
+<strong>Why a marker subclass?</strong> PEFT dispatches <code>custom_module_mapping</code> by exact
+<code>type(module)</code>. We want only the <em>SR decoder's</em> Q/K/V/O/gate/up/down to get the
+stream-gated wrapper, not every <code>nn.Linear</code> in the model (e.g. the <code>lm_head</code>, or
+linears in unrelated subpackages). The marker subclass <code>_StreamGatedLinear</code> &mdash;
+behaviourally identical to <code>nn.Linear</code> &mdash; is the cleanest selector PEFT supports.
+</div>
+
+<h3>2.2 The end-to-end picture</h3>
+
+<div class="diagram">
+<svg viewBox="0 0 980 460" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .b   { fill: #eef1f5; stroke: #d0d7de; }
+    .bA  { fill: #ffebe9; stroke: #f0a8ad; }
+    .bC  { fill: #fff8c5; stroke: #d9bf6b; }
+    .bB  { fill: #ddeefb; stroke: #7fb2df; }
+    .bG  { fill: #e6f3ea; stroke: #94cca4; }
+    .lbl { font: 13px ui-monospace, monospace; fill: #1f2328; }
+    .sub { font: 11px ui-monospace, monospace; fill: #656d76; }
+    .ttl { font: 13px -apple-system, sans-serif; fill: #1f2328; font-weight: 600;}
+    .ed  { stroke: #0969da; fill: none; stroke-width: 1.6; }
+    .edG { stroke: #1a7f37; fill: none; stroke-width: 1.6; }
+  </style>
+  <defs>
+    <marker id="arr3" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0969da"/>
+    </marker>
+    <marker id="arrG" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a7f37"/>
+    </marker>
+  </defs>
+
+  <!-- step 1: HF base -->
+  <rect class="b" x="20" y="40" width="220" height="60" rx="8"/>
+  <text class="ttl" x="34" y="62">1. AutoModelForCausalLM</text>
+  <text class="sub" x="34" y="80">GraniteMoeHybrid (fused QKV/gate-up)</text>
+  <text class="sub" x="34" y="94">.from_pretrained(base_id)</text>
+
+  <!-- step 2: SR shell -->
+  <rect class="b" x="280" y="40" width="240" height="60" rx="8"/>
+  <text class="ttl" x="294" y="62">2. ShadowResidualForCausalLM(cfg)</text>
+  <text class="sub" x="294" y="80">empty SR shell with unfused</text>
+  <text class="sub" x="294" y="94">_StreamGatedLinear projections</text>
+
+  <!-- step 3: weight transfer -->
+  <rect class="b" x="560" y="40" width="240" height="60" rx="8"/>
+  <text class="ttl" x="574" y="62">3. transfer_base_weights(src, dst)</text>
+  <text class="sub" x="574" y="80">slice fused QKV/gate-up &rarr; unfused</text>
+  <text class="sub" x="574" y="94">no_grad copy_, dtype-preserving</text>
+
+  <!-- step 4: register -->
+  <rect class="bC" x="20" y="160" width="240" height="80" rx="8"/>
+  <text class="ttl" x="34" y="184">4. _register_cross_stream(cfg)</text>
+  <text class="sub" x="34" y="204">CrossStream &rarr; CrossStreamLora</text>
+  <text class="sub" x="34" y="220">_StreamGatedLinear &rarr; ShadowResidualLora</text>
+  <text class="sub" x="34" y="236">via LoraConfig._register_custom_module</text>
+
+  <!-- step 5: get_peft_model -->
+  <rect class="bA" x="300" y="160" width="240" height="80" rx="8"/>
+  <text class="ttl" x="314" y="184">5. get_peft_model(base, cfg)</text>
+  <text class="sub" x="314" y="204">walks target_modules, swaps each</text>
+  <text class="sub" x="314" y="220">match to its registered wrapper class</text>
+  <text class="sub" x="314" y="236">freezes base, marks lora_A/B trainable</text>
+
+  <!-- step 6: disable merge -->
+  <rect class="b" x="580" y="160" width="240" height="80" rx="8"/>
+  <text class="ttl" x="594" y="184">6. _disable_merge_and_unload</text>
+  <text class="sub" x="594" y="204">merge_and_unload would silently fold</text>
+  <text class="sub" x="594" y="220">delta into the frozen-base path,</text>
+  <text class="sub" x="594" y="236">breaking the SR invariant.</text>
+
+  <!-- step 7: train + save -->
+  <rect class="bG" x="20" y="300" width="370" height="100" rx="8"/>
+  <text class="ttl" x="34" y="324">7a. Trainer.train() &rarr; backward only on lora_A/B</text>
+  <text class="sub" x="34" y="344">cross_stream_A, cross_stream_B</text>
+  <text class="sub" x="34" y="360">{q,k,v,o}_proj.lora_A/B (if attn_lora=True)</text>
+  <text class="sub" x="34" y="376">{gate,up,down}_proj.lora_A/B (if mlp_lora=True)</text>
+  <text class="sub" x="34" y="392">all base weights frozen via PEFT freeze pass</text>
+
+  <rect class="bG" x="430" y="300" width="390" height="100" rx="8"/>
+  <text class="ttl" x="444" y="324">7b. model.save_pretrained(out)</text>
+  <text class="sub" x="444" y="344">writes out/adapter_model.safetensors</text>
+  <text class="sub" x="444" y="360">writes out/adapter_config.json (LoraConfig dump)</text>
+  <text class="sub" x="444" y="376">keys e.g. base_model.model.model.layers.0</text>
+  <text class="sub" x="444" y="392">  .cross_stream.lora_A.default.weight</text>
+
+  <!-- arrows -->
+  <path class="ed" d="M240,70 H280" marker-end="url(#arr3)"/>
+  <path class="ed" d="M520,70 H560" marker-end="url(#arr3)"/>
+  <path class="ed" d="M680,100 V160" marker-end="url(#arr3)"/>
+  <path class="ed" d="M260,200 H300" marker-end="url(#arr3)"/>
+  <path class="ed" d="M540,200 H580" marker-end="url(#arr3)"/>
+  <path class="edG" d="M420,240 V300" marker-end="url(#arrG)"/>
+  <path class="edG" d="M390,350 H430" marker-end="url(#arrG)"/>
+</svg>
+<div class="caption">End-to-end build path of <code>get_shadow_residual_peft_model(base_id, lora_config)</code>.
+Steps 1&ndash;3 build the SR base; steps 4&ndash;6 set up PEFT; step 7 trains and saves.</div>
+</div>
+
+<h3>2.3 What happens on save</h3>
+
+<p>
+Saving is just <code>peft_model.save_pretrained(output_dir)</code>. PEFT's standard save logic walks every
+<code>LoraLayer</code> instance (which both wrappers ultimately are) and writes the
+<code>lora_A</code>/<code>lora_B</code> ModuleDicts to <span class="file">adapter_model.safetensors</span>.
+Because <code>CrossStreamLora</code> has the same <code>self.lora_A[adapter] : nn.Linear(H, r)</code> /
+<code>self.lora_B[adapter] : nn.Linear(r, H)</code> layout as stock PEFT, the state-dict keys look like
+ordinary LoRA keys:
+</p>
+
+<pre>base_model.model.model.layers.0.cross_stream.lora_A.default.weight   [r, H]
+base_model.model.model.layers.0.cross_stream.lora_B.default.weight   [H, r]
+base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight   [r, H]
+base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight   [Q, r]
+...</pre>
+
+<p>The <span class="file">adapter_config.json</span> is the standard <code>LoraConfig</code> dump &mdash;
+it records <code>target_modules</code> (including <code>"cross_stream"</code> if listed),
+<code>r</code>, <code>lora_alpha</code>, <code>rank_pattern</code>, and any
+<code>alora_invocation_tokens</code>. There is <strong>no SR-specific sidecar file</strong>; the
+checkpoint is identifiable as SR only by the presence of <code>"cross_stream"</code> in
+<code>target_modules</code>.</p>
+
+<h3>2.4 What happens on load</h3>
+
+<p>The custom-module mapping is <em>not</em> persisted in <span class="file">adapter_config.json</span>
+(PEFT does not serialize <code>_register_custom_module</code> entries). That is exactly why we cannot use
+<code>PeftModel.from_pretrained</code> directly &mdash; without the registration, PEFT would either fail
+to wrap the <code>CrossStream</code> site (no <code>weight</code> to read) or wrap our
+<code>_StreamGatedLinear</code> with stock <code>Linear</code>, losing the stream gate. The dedicated
+loader <code>load_shadow_residual_peft_model(base_id, ckpt)</code> exists for exactly this reason:</p>
+
+<ol>
+  <li>Read <code>LoraConfig.from_pretrained(ckpt)</code>.</li>
+  <li>Build a fresh SR base via <code>_build_sr_base(...)</code> &mdash; same fused&rarr;unfused slicing.</li>
+  <li>Re-register the custom-module mapping on the freshly-loaded <code>LoraConfig</code> &mdash;
+      <em>this step is the entire reason a custom loader exists</em>.</li>
+  <li>Call <code>PeftModel.from_pretrained(base, ckpt, config=lora_config)</code>, passing the
+      registered config explicitly so PEFT does not re-read <span class="file">adapter_config.json</span>
+      and lose our dispatch.</li>
+  <li>Call <code>_disable_merge_and_unload</code> again &mdash; the freshly constructed
+      <code>PeftModel</code> would re-enable it.</li>
+</ol>
+
+<h3>2.5 Why standard PEFT API does not work end-to-end</h3>
+
+<table>
+  <tr><th>You wanted to call</th><th>What breaks</th></tr>
+  <tr>
+    <td><code>get_peft_model(AutoModelForCausalLM.from_pretrained(...), LoraConfig(...))</code></td>
+    <td>The model has no <code>cross_stream</code> attribute, no <code>_StreamGatedLinear</code> projections,
+        and the upstream model uses <em>fused</em> <code>qkv_proj</code> / <code>shared_mlp.input_linear</code>
+        (so a single LoRA covers all of Q+K+V, not what we want). You'd train a different architecture.</td>
+  </tr>
+  <tr>
+    <td><code>PeftModel.from_pretrained(AutoModelFor..., "./out")</code></td>
+    <td>Same as above: there is no <code>cross_stream</code> module on the upstream model for PEFT to
+        attach the saved <code>lora_A</code>/<code>lora_B</code> tensors to &mdash; load fails with
+        "module not found".</td>
+  </tr>
+  <tr>
+    <td><code>get_peft_model(sr_base, LoraConfig(...))</code> (no registration)</td>
+    <td>PEFT cannot wrap <code>CrossStream</code> (no <code>weight</code>, would crash on
+        <code>StopIteration</code> in <code>_replace_module</code>'s parameter probe). Our
+        <code>_StreamGatedLinear</code>s would be wrapped with stock <code>Linear</code> &mdash; no stream
+        gate &mdash; and the base stream would no longer be frozen-equivalent.</td>
+  </tr>
+  <tr>
+    <td><code>peft_model.merge_and_unload()</code></td>
+    <td>Disabled in SR. Folding the LoRA delta into <code>base_layer.weight</code> would silently
+        contaminate the <em>frozen-base</em> path: every <code>stream_context("base")</code> call would
+        return <code>(W + &Delta;W)x</code> instead of <code>Wx</code>. The frozen-base invariant is the whole
+        reason the architecture exists. <code>_disable_merge_and_unload</code> patches it to raise
+        <code>NotImplementedError</code>.</td>
+  </tr>
+</table>
+
+<div class="note">
+<strong>Bottom line.</strong> The custom factory + custom loader are not architectural luxuries &mdash;
+they are the minimum glue to make PEFT work against a model whose graph contains a non-linear LoRA target
+(<code>CrossStream</code>) and whose linear LoRA targets need a per-call gate. Save and config dump are
+otherwise vanilla PEFT.
+</div>
+
+<!-- ============================================================ -->
+<h2 id="flows">3. Invocation flows &mdash; ALORA gating and the activation sequence</h2>
+
+<p>
+There are three orthogonal axes that determine <em>which</em> LoRA delta is applied to <em>which</em>
+positions in <em>which</em> stream:
+</p>
+
+<ol>
+  <li><strong>Stream</strong>: <code>"base"</code> vs <code>"adapter"</code>. Set by
+      <code>stream_context(...)</code> in the SR decoder.</li>
+  <li><strong>ALORA invocation</strong>: when <code>alora_invocation_tokens</code> is set on
+      <code>LoraConfig</code>, peft installs <code>ALoraLinearVariant</code> on every wrapped projection;
+      the LoRA delta is gated to positions <em>at and after</em> the rightmost match of the invocation
+      sequence. Pre-invocation positions get the bare base output.</li>
+  <li><strong>Active adapters</strong>: the current PEFT active adapter set. SR currently trains
+      one adapter at a time (<code>adapter_name="expert"</code> by default).</li>
+</ol>
+
+<h3>3.1 The activation sequence &mdash; two distinct uses</h3>
+
+<p>The phrase &ldquo;activation sequence&rdquo; means two related but separate things in this codebase:</p>
+
+<table>
+  <tr><th>Use site</th><th>What it is</th><th>Effect</th></tr>
+  <tr>
+    <td><code>add_labels.py</code> &mdash; preprocessing</td>
+    <td>Token IDs marking the <em>prompt&rarr;completion</em> boundary in a tokenized dataset
+        (e.g. <code>[100264, 78191, 100265]</code> for an assistant header).</td>
+    <td>Stamps the <code>labels</code> column: <code>-100</code> up to and including the rightmost
+        match, real token IDs after &mdash; loss is computed only on the completion.</td>
+  </tr>
+  <tr>
+    <td><code>LoraConfig(alora_invocation_tokens=[...])</code></td>
+    <td>Token IDs whose rightmost occurrence in <code>input_ids</code> marks where the adapter
+        <em>turns on</em> at runtime.</td>
+    <td>peft computes per-row <code>alora_offsets</code> (the trailing length after the match) via a
+        pre-forward hook on every <code>LoraLayer</code>; each LoRA delta is masked off for positions
+        before the match. <code>CrossStreamLora</code> consumes the same hook input.</td>
+  </tr>
+</table>
+
+<p>The two are usually <em>related</em> &mdash; you'd typically pick the same boundary token IDs &mdash;
+but they are independent settings: you can label-mask the dataset for SFT loss without using ALORA
+gating, and vice-versa.</p>
+
+<h3>3.1.1 Configuring the activation sequence &mdash; the load-bearing knobs</h3>
+
+<p>Three settings have to line up before ALORA gating actually fires. Missing any one of them is
+silent: peft falls back to unconditional LoRA and the model still trains, just with no gating.</p>
+
+<table>
+  <tr><th>Setting</th><th>Where</th><th>If missing</th></tr>
+  <tr>
+    <td><code>alora_invocation_tokens=[t1, t2, ...]</code></td>
+    <td><code>LoraConfig</code> &mdash; <code>train.py</code> encodes the YAML
+        <code>adapter.invocation_tokens</code> string to IDs and attaches them to the PEFT config.</td>
+    <td>peft never installs <code>ALoraLinearVariant</code>; every wrapped projection runs as plain
+        LoRA on every position.</td>
+  </tr>
+  <tr>
+    <td><code>task_type="CAUSAL_LM"</code></td>
+    <td><code>LoraConfig</code> &mdash; fixed by the config schema
+        (<code>AdapterConfig.task_type</code> is a <code>Literal["CAUSAL_LM"]</code>).</td>
+    <td><strong>Load-bearing.</strong> peft prints
+        <em>&ldquo;aLoRA is currently only supported for CAUSAL_LM task&rdquo;</em> as a warning and
+        skips the variant install. Caught in <span class="file">tests/shadow_residual/test_alora_invocation_invariant.py</span>
+        &mdash; without it, the pre-invocation logits-invariant test fails.</td>
+  </tr>
+  <tr>
+    <td><code>"cross_stream"</code> in <code>target_modules</code></td>
+    <td><code>LoraConfig</code> &mdash; present iff <code>adapter.target_modules</code> lists
+        <code>cross_stream</code> (the SR production default).</td>
+    <td>The dual-stream forward never engages; SR runs the single-stream early-exit path. ALORA
+        gating still works, but only in the LoRA-only sense.</td>
+  </tr>
+</table>
+
+<h3>3.1.2 Where the gating actually lives in code</h3>
+
+<p>End-to-end, when <code>peft_model(input_ids=...)</code> is called with
+<code>alora_invocation_tokens</code> set:</p>
+
+<ol>
+  <li>
+    <strong>Pre-forward hook</strong> on every <code>LoraLayer</code>:
+    <code>peft.tuners.lora.variants.get_alora_offsets_for_forward(...)</code>. Calls
+    <code>calculate_alora_offsets(peft_config, active_adapter, input_ids)</code>
+    (<span class="file">peft/tuners/lora/variants.py:615&ndash;684</span>).
+  </li>
+  <li>
+    <strong>Last-match search</strong> &mdash; <code>calculate_alora_offsets</code> scans each row for
+    every position whose token equals <code>alora_invocation_tokens[0]</code>, then full-tensor-equals
+    the suffix; it picks the largest such start index (<code>if idx &gt; best_match_start_idx</code>).
+    The returned <code>alora_offsets[i]</code> is <code>seq_len - best_match_start_idx</code> &mdash;
+    the count of trailing positions <em>at and after</em> the start of the last match. Returns
+    <code>None</code> for that row if no match is found.
+  </li>
+  <li>
+    <strong>Threading</strong> &mdash; the hook injects <code>alora_offsets</code> into
+    <code>kwargs</code> on every wrapped <code>forward(x, ...)</code>.
+  </li>
+  <li>
+    <strong>Q/K/V/O/MLP wrappers</strong> &mdash; <code>ShadowResidualLora.forward</code>
+    (<span class="file">peft_shadow_residual/stream_gated_lora.py:67&ndash;80</span>) inherits stock peft
+    <code>Linear.forward</code>. Stock peft dispatches to
+    <code>ALoraLinearVariant.forward</code>
+    (<span class="file">peft/tuners/lora/variants.py:567&ndash;612</span>). That variant builds
+    <code>mask = pos &gt;= (T - offsets)</code> and <em>only computes the LoRA matmul on rows where the
+    mask is True</em> (line 611:
+    <code>res_flat[mask_flat] += lora_B(lora_A(dropout(x_flat[mask_flat]))) * scaling</code>) &mdash;
+    so the delta arithmetic itself is gated, not just multiplied by zero afterwards.
+  </li>
+  <li>
+    <strong>Cross-stream wrapper</strong> &mdash; <code>CrossStreamLora.forward</code>
+    (<span class="file">peft_shadow_residual/cross_stream_lora.py:165&ndash;221</span>) re-implements
+    the same mask explicitly (lines 197&ndash;219). It still computes the matmul over the full sequence
+    but multiplies by the position mask before adding to the result &mdash; functionally identical to
+    <code>ALoraLinearVariant</code>, marginally less efficient. The duplication exists because
+    <code>CrossStreamLora</code> is not a stock peft <code>Linear</code> subclass; it inherits
+    <code>LoraLayer</code> directly so it picks up the pre-forward hook (and therefore
+    <code>alora_offsets</code>) but owns its own <code>forward</code>.
+  </li>
+  <li>
+    <strong>Stream-context interaction</strong> &mdash; if the active stream is <code>"base"</code>,
+    <code>ShadowResidualLora.forward</code> short-circuits to <code>base_layer(x)</code> <em>before</em>
+    delegating to peft, so <code>alora_offsets</code> is irrelevant on base-stream calls. The two
+    gates compose: base stream is always delta-free; adapter stream is delta-free only on
+    pre-invocation positions.
+  </li>
+</ol>
+
+<h3>3.2 Per-token activation timeline (ALORA + SR dual-stream)</h3>
+
+<div class="diagram">
+<svg viewBox="0 0 980 320" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .row  { stroke: #d0d7de; fill: #eef1f5; }
+    .preA { fill: #ddeefb; stroke: #7fb2df; }
+    .postA{ fill: #ffebe9; stroke: #f0a8ad; }
+    .ctl  { fill: #fff8c5; stroke: #d9bf6b; }
+    .lbl  { font: 12px ui-monospace, monospace; fill: #1f2328; }
+    .sub  { font: 11px ui-monospace, monospace; fill: #656d76; }
+    .ttl  { font: 13px -apple-system, sans-serif; fill: #1f2328; }
+    .mark { stroke: #9a6700; stroke-width: 2; stroke-dasharray: 3 3; }
+  </style>
+  <text class="ttl" x="20" y="22">A single training row, after collator inserts the canonical control token</text>
+
+  <!-- token strip -->
+  <g transform="translate(20,40)">
+    <rect class="preA"  x="0"   y="0" width="380" height="38"/>
+    <rect class="ctl"   x="380" y="0" width="36"  height="38"/>
+    <rect class="postA" x="416" y="0" width="500" height="38"/>
+    <text class="lbl" x="120" y="24">prompt tokens (user / system)</text>
+    <text class="lbl" x="386" y="24" fill="#9a6700">CTL</text>
+    <text class="lbl" x="560" y="24">completion tokens (assistant)</text>
+
+    <!-- labels strip -->
+    <rect class="row" x="0"   y="46" width="380" height="22"/>
+    <rect class="row" x="380" y="46" width="36"  height="22"/>
+    <rect class="row" x="416" y="46" width="500" height="22"/>
+    <text class="sub" x="160" y="62">labels = -100  (masked)</text>
+    <text class="sub" x="385" y="62">-100</text>
+    <text class="sub" x="540" y="62">labels = real token IDs (loss here)</text>
+
+    <!-- alora gate strip -->
+    <rect class="row" x="0"   y="76" width="416" height="22"/>
+    <rect class="row" x="416" y="76" width="500" height="22"/>
+    <text class="sub" x="120" y="92">alora gate OFF: bare base output</text>
+    <text class="sub" x="540" y="92">alora gate ON: LoRA delta + cross_stream applied</text>
+  </g>
+
+  <!-- arrow markers -->
+  <line class="mark" x1="436" y1="32" x2="436" y2="160"/>
+  <text class="sub" x="442" y="160" fill="#9a6700">activation_sequence rightmost match
+    &rarr; alora_offset = trailing_len</text>
+
+  <!-- streams -->
+  <g transform="translate(20,200)">
+    <text class="ttl" x="0" y="0">What each stream sees inside the SR decoder</text>
+    <rect class="preA"  x="0"   y="14" width="416" height="36"/>
+    <text class="lbl" x="14" y="38" fill="#0a5ca8">base stream:  always frozen Wx (delta gated off by stream_context)</text>
+    <rect class="postA" x="0"   y="56" width="416" height="36"/>
+    <text class="lbl" x="14" y="80" fill="#cf222e">adapter stream:  Wx only here (alora_offsets gates delta off pre-CTL)</text>
+    <rect class="postA" x="416" y="56" width="500" height="36"/>
+    <text class="lbl" x="430" y="80" fill="#cf222e">adapter stream:  Wx + LoRA &Delta; + cross_stream(h_base)</text>
+  </g>
+</svg>
+<div class="caption">Per-token timeline. The collator inserts a single canonical control token at the
+prompt&rarr;completion boundary derived from the labels. ALORA gating uses the same boundary at runtime
+(via peft's pre-forward hook) to mask the LoRA delta off pre-invocation &mdash; so the adapter stream
+mimics the base stream up to the control token, and only diverges after.</div>
+</div>
+
+<h3>3.3 What the stream gate does to each call site</h3>
+
+<table>
+  <tr>
+    <th>Projection</th>
+    <th>Called with stream_context</th>
+    <th>Wrapper class</th>
+    <th>Behavior</th>
+  </tr>
+  <tr>
+    <td><code>q_proj, o_proj</code></td>
+    <td><code>"base"</code> (dual-stream base path)</td>
+    <td><code>ShadowResidualLora</code></td>
+    <td>Returns <code>base_layer(x)</code> only &mdash; <strong>delta gated off</strong>.</td>
+  </tr>
+  <tr>
+    <td><code>q_proj, o_proj</code></td>
+    <td><code>"adapter"</code> (dual-stream adapter, or early-exit)</td>
+    <td><code>ShadowResidualLora</code></td>
+    <td>Stock peft path: base + LoRA &Delta;, with ALORA mask if configured.</td>
+  </tr>
+  <tr>
+    <td><code>k_proj, v_proj</code> (disjoint K/V)</td>
+    <td>both stream calls happen (one each), separate KV caches</td>
+    <td><code>ShadowResidualLora</code></td>
+    <td>Same as above; base call's K/V written to <code>past_key_values_base</code>, adapter call's
+        K/V written to <code>past_key_values</code>. Two independent K/V tensors per layer.</td>
+  </tr>
+  <tr>
+    <td><code>k_proj, v_proj</code> (shared base K/V)</td>
+    <td>called <strong>once</strong>, under <code>"base"</code> only</td>
+    <td><code>ShadowResidualLora</code></td>
+    <td>K/V computed from <code>normed_base</code> with delta gated off; written once to the single
+        (adapter) cache. The adapter stream never calls K/V. K/V LoRA is forbidden in this mode
+        (<code>_reject_kv_lora_when_shared</code>).</td>
+  </tr>
+  <tr>
+    <td><code>gate_proj, up_proj, down_proj</code></td>
+    <td><code>"base"</code> / <code>"adapter"</code> blocks</td>
+    <td><code>ShadowResidualLora</code></td>
+    <td>Same gating rule: base call &rarr; no delta; adapter call &rarr; delta + ALORA mask.</td>
+  </tr>
+  <tr>
+    <td><code>cross_stream</code></td>
+    <td>not in any stream context (called once per layer on h_base)</td>
+    <td><code>CrossStreamLora</code></td>
+    <td>Base layer returns zeros, so output is purely <code>B(A(h_base))*scaling</code>, optionally
+        masked by <code>alora_offsets</code>.</td>
+  </tr>
+</table>
+
+<div class="warn">
+<strong>Documented K/V exception (disjoint-K/V default).</strong> The base stream's K/V cache is filled
+by a call <em>under</em> <code>stream_context("base")</code>, so the K/V LoRA delta (if you trained one)
+is <em>not</em> applied to the base K/V &mdash; the cache stays adapter-free. The adapter K/V cache fills
+under <code>"adapter"</code>, so it does pick up the delta. Two independent caches, never interleaved.
+</div>
+
+<div class="warn">
+<strong>Shared-base-K/V mode (&sect;1.6).</strong> When <code>shared_base_kv=True</code>, there is no
+adapter-side K/V at all: K and V are computed once from <code>normed_base</code> under <code>"base"</code>
+context and written to the single cache, so the cache is <strong>adapter-independent regardless of what you
+trained</strong> &mdash; and K/V LoRA is rejected at construction time. The adapter touches attention only
+through Q and O.
+</div>
+
+<h3>3.4 The three-mode contract (cross_stream active)</h3>
+
+<p>
+With cross_stream wrapped (the production path), the SR forward behaves as one of three modes for
+each token position, depending on whether <code>alora_invocation_tokens</code> is set and whether the
+position sits before or after the last invocation match:
+</p>
+
+<table>
+  <tr>
+    <th>Mode</th>
+    <th>Adapter Q/K/V/O/MLP</th>
+    <th>cross_stream(h_base) into h_adapt</th>
+    <th>Adapter K/V cache write</th>
+    <th>Base K/V cache write</th>
+  </tr>
+  <tr>
+    <td><strong>A.</strong> <code>alora_invocation_tokens</code> unset</td>
+    <td>delta fires on all positions: <code>(W + &Delta;W)x</code></td>
+    <td>full delta on all positions</td>
+    <td>filled with adapter-side values (delta included)</td>
+    <td>filled with base-side values (delta-free)</td>
+  </tr>
+  <tr>
+    <td><strong>B-pre.</strong> ALORA on, <code>pos &lt; p</code></td>
+    <td>delta gated off: just <code>Wx</code></td>
+    <td>zero (mask)</td>
+    <td>filled with <em>base-equivalent</em> values
+        (<code>k_adapt[pos&lt;p] == k_base[pos&lt;p]</code>)</td>
+    <td>filled with base-side values</td>
+  </tr>
+  <tr>
+    <td><strong>B-post.</strong> ALORA on, <code>pos &ge; p</code></td>
+    <td>delta fires: <code>(W + &Delta;W)x</code></td>
+    <td>full delta</td>
+    <td>filled with adapter-side values (delta included)</td>
+    <td>filled with base-side values</td>
+  </tr>
+</table>
+
+<div class="warn">
+<strong>The K/V-cache columns above describe the disjoint-K/V default (&sect;1.3).</strong> Under
+<code>shared_base_kv=True</code> (&sect;1.6), the "Adapter K/V cache write" and "Base K/V cache write"
+columns collapse: there is a single cache, filled once from the frozen base stream, identical across all
+three modes &mdash; the adapter never writes K/V. ALORA gating and cross-stream still apply to Q/O/MLP
+exactly as tabulated; only the K/V columns change.
+</div>
+
+<p>The defining invariants of Mode B-pre (the &ldquo;adapters not yet active&rdquo; regime):</p>
+
+<ol>
+  <li>
+    <strong>Stream equality.</strong>
+    <code>h_adapt[pos&lt;p] == h_base[pos&lt;p]</code> at every layer's input and output
+    (inductive across layers; base case is <code>h_adapt = inputs_embeds.clone() == h_base = inputs_embeds</code>
+    in <span class="file">modeling_hf.py:250&ndash;251</span>).
+  </li>
+  <li>
+    <strong>K/V cache equality.</strong> Adapter K/V cache values agree with base K/V cache values on
+    pre-invocation positions, layer by layer. They live in <em>separate physical tensors</em>
+    (<code>past_key_values</code> vs <code>past_key_values_base</code>) so reads on one don't affect
+    the other &mdash; only the values match.
+  </li>
+  <li>
+    <strong>No cross-stream contribution.</strong>
+    <code>cross_stream(h_base)</code> contributes zero to <code>h_adapt</code> on pre-invocation
+    positions (mask in <span class="file">cross_stream_lora.py:218&ndash;219</span>), so the
+    base&rarr;adapter merge is genuinely off pre-invocation &mdash; nothing from W_cross propagates
+    into the next layer's adapter input.
+  </li>
+  <li>
+    <strong>Logits equality.</strong> The pre-invocation logits emitted by the model with
+    ALORA gating + non-zero <code>lora_B</code> equal the logits of the same model with
+    <code>lora_B = 0</code> (i.e. base-equivalent), to fp tolerance.
+  </li>
+</ol>
+
+<div class="note">
+<strong>Compute is <em>not</em> skipped pre-invocation.</strong> The adapter path still runs every
+projection, layernorm, and attention call; it just runs them as <code>Wx</code> rather than
+<code>(W + &Delta;W)x</code>. This is required, not wasteful: the adapter K/V cache must be populated
+on pre-invocation positions so that post-invocation attention can read coherent keys/values for the
+whole sequence. The only thing that <em>is</em> skipped pre-invocation is the LoRA matmul itself
+(<code>ALoraLinearVariant</code> gathers post-invocation rows before doing the matmul, see &sect;3.1.2).
+</div>
+
+<h3>3.5 What pins the contract &mdash; the invariant tests</h3>
+
+<p>The Mode B-pre invariants are by-construction consequences of the
+<code>stream_context</code> + <code>ALoraLinearVariant</code> + <code>CrossStreamLora</code> masking,
+but failure modes (someone moves a <code>stream_context</code>, peft changes variant dispatch, K/V
+LoRA gets retargeted, <code>task_type</code> gets dropped) would be silent.
+<span class="file">tests/shadow_residual/test_alora_invocation_invariant.py</span>
+pins them with two CPU-only tests using a tiny randomly-initialized <code>ShadowResidualConfig</code>:</p>
+
+<table>
+  <tr><th>Test</th><th>Asserts</th></tr>
+  <tr>
+    <td><code>test_pre_invocation_logits_match_base_dual_stream</code></td>
+    <td>Pre-invocation logits with ALORA + perturbed <code>lora_B</code> match the logits of the same
+        model with <code>lora_B = 0</code> (base-equivalent control). Post-invocation logits must
+        differ &mdash; otherwise the gating is vacuous.</td>
+  </tr>
+  <tr>
+    <td><code>test_pre_invocation_kv_cache_matches_base_dual_stream</code></td>
+    <td>For every layer, <code>past_key_values</code> and <code>past_key_values_base</code> agree on
+        K and V slices over <code>[0, p)</code>. At least one layer must <em>disagree</em> over
+        <code>[p, T)</code> &mdash; otherwise the adapter is a no-op.</td>
+  </tr>
+</table>
+
+<p>Both tests run in &lt;5s on CPU with no HF download, no GPU. The
+<code>task_type="CAUSAL_LM"</code> requirement (&sect;3.1.1) was discovered by these tests:
+without it, peft refuses to install <code>ALoraLinearVariant</code> and the logits-invariant assertion
+fails.</p>
+
+<!-- ============================================================ -->
+<h2 id="training">4. What gets trained &mdash; frozen vs active</h2>
+
+<h3>4.1 Selection knobs</h3>
+
+<p>The unified entry point (<span class="file">training/train.py</span>, invoked as <code>sr-train</code>)
+is YAML-driven &mdash; there are no <code>--cross_stream</code>/<code>--attn_lora</code>/<code>--mlp_lora</code>
+flags. Selection lives entirely in the config's <code>adapter.target_modules</code> field, which carries
+<em>both</em> the module names and their ranks. <code>adapters.to_peft_config(cfg)</code> projects it into
+PEFT's <code>target_modules</code> / <code>r</code> / <code>rank_pattern</code> surface. Two shapes:</p>
+
+<table>
+  <tr><th>target_modules entry</th><th>Adds to PEFT target_modules</th><th>Trainable parameters added</th></tr>
+  <tr>
+    <td><code>cross_stream: 32</code> (SR production default)</td>
+    <td><code>"cross_stream"</code></td>
+    <td><code>cross_stream.lora_A</code> + <code>cross_stream.lora_B</code> per layer
+        (rank from the dict value, e.g. 32; earlier configs used 96)</td>
+  </tr>
+  <tr>
+    <td><code>q_proj: 32, o_proj: 32</code> (+ <code>k_proj</code>/<code>v_proj</code> only when
+        <em>not</em> shared-base-K/V)</td>
+    <td><code>q_proj, o_proj</code> (&plusmn; <code>k_proj, v_proj</code>)</td>
+    <td><code>lora_A</code>+<code>lora_B</code> on each, per-module rank from the dict value</td>
+  </tr>
+  <tr>
+    <td><code>gate_proj: 32, up_proj: 32, down_proj: 32</code></td>
+    <td><code>gate_proj, up_proj, down_proj</code></td>
+    <td><code>lora_A</code>+<code>lora_B</code> on each, per-module rank</td>
+  </tr>
+  <tr>
+    <td>scalar int, e.g. <code>target_modules: 32</code></td>
+    <td><code>"all-linear"</code> at uniform rank</td>
+    <td>uniform-rank LoRA on every linear (plain LoRA/aLoRA style)</td>
+  </tr>
+</table>
+
+<p>Whether SR's dual-stream forward actually runs is determined at runtime by the model gate
+(see &sect;1.4): only the presence of <code>"cross_stream"</code> in <code>target_modules</code> turns
+it on. Gated (aLoRA) activation is a separate axis, switched on by setting
+<code>adapter.invocation_tokens</code> (see &sect;3.1.1). <code>model.shared_base_kv</code> defaults to
+<em>auto</em>: <code>true</code> when <code>cross_stream</code> is present (which then forbids
+<code>k_proj</code>/<code>v_proj</code> LoRA), <code>false</code> otherwise.</p>
+
+<h3>4.2 Frozen vs trainable (after PEFT freeze pass)</h3>
+
+<div class="diagram">
+<svg viewBox="0 0 980 410" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .frozen { fill: #e7eaef; stroke: #c4ccd6; }
+    .train  { fill: #e6f3ea; stroke: #94cca4; }
+    .lbl    { font: 13px ui-monospace, monospace; fill: #1f2328; }
+    .sub    { font: 11px ui-monospace, monospace; fill: #656d76; }
+    .ttl    { font: 13px -apple-system, sans-serif; fill: #1f2328; font-weight: 600; }
+    .grad   { stroke: #1a7f37; stroke-width: 1.6; fill: none; stroke-dasharray: 4 3; }
+  </style>
+  <defs>
+    <marker id="arrG2" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a7f37"/>
+    </marker>
+  </defs>
+
+  <text class="ttl" x="20" y="24">Per-decoder-layer parameter inventory (cross_stream + attn_lora selected)</text>
+
+  <!-- frozen weights -->
+  <rect class="frozen" x="20" y="40" width="440" height="320" rx="10"/>
+  <text class="ttl" x="36" y="62" fill="#656d76">FROZEN</text>
+  <text class="sub" x="36" y="84">embed_tokens.weight</text>
+  <text class="sub" x="36" y="100">lm_head.weight (tied)</text>
+  <text class="sub" x="36" y="124">model.layers[i].input_layernorm.weight</text>
+  <text class="sub" x="36" y="140">model.layers[i].post_attention_layernorm.weight</text>
+  <text class="sub" x="36" y="158">model.norm.weight</text>
+  <text class="sub" x="36" y="186">self_attn.q_proj.base_layer.weight   <tspan fill="#0a5ca8">[Q, H]</tspan></text>
+  <text class="sub" x="36" y="202">self_attn.k_proj.base_layer.weight   <tspan fill="#0a5ca8">[K, H]</tspan></text>
+  <text class="sub" x="36" y="218">self_attn.v_proj.base_layer.weight   <tspan fill="#0a5ca8">[V, H]</tspan></text>
+  <text class="sub" x="36" y="234">self_attn.o_proj.base_layer.weight   <tspan fill="#0a5ca8">[H, Q]</tspan></text>
+  <text class="sub" x="36" y="262">gate_proj.base_layer.weight  <tspan fill="#0a5ca8">[I, H]</tspan></text>
+  <text class="sub" x="36" y="278">up_proj.base_layer.weight    <tspan fill="#0a5ca8">[I, H]</tspan></text>
+  <text class="sub" x="36" y="294">down_proj.base_layer.weight  <tspan fill="#0a5ca8">[H, I]</tspan></text>
+  <text class="sub" x="36" y="322">cross_stream.base_layer (zero-output, no params)</text>
+  <text class="sub" x="36" y="346">requires_grad = False (set by PEFT's freeze pass)</text>
+
+  <!-- trainable -->
+  <rect class="train" x="500" y="40" width="460" height="320" rx="10"/>
+  <text class="ttl" x="516" y="62" fill="#1a7f37">TRAINABLE  (LoRA / CrossStreamLora deltas)</text>
+
+  <text class="sub" x="516" y="92">cross_stream.lora_A.default.weight  <tspan fill="#9a6700">[R, H]</tspan></text>
+  <text class="sub" x="516" y="108">cross_stream.lora_B.default.weight  <tspan fill="#9a6700">[H, R]</tspan></text>
+  <text class="sub" x="516" y="126">         &mdash; output added to h_adapt at end of layer</text>
+
+  <text class="sub" x="516" y="156">self_attn.q_proj.lora_A.default.weight  <tspan fill="#cf222e">[r, H]</tspan></text>
+  <text class="sub" x="516" y="172">self_attn.q_proj.lora_B.default.weight  <tspan fill="#cf222e">[Q, r]</tspan></text>
+  <text class="sub" x="516" y="188">self_attn.k_proj.lora_A/B.default.weight</text>
+  <text class="sub" x="516" y="204">self_attn.v_proj.lora_A/B.default.weight</text>
+  <text class="sub" x="516" y="220">self_attn.o_proj.lora_A/B.default.weight</text>
+  <text class="sub" x="516" y="240">         &mdash; gated OFF on stream_context("base") calls</text>
+
+  <text class="sub" x="516" y="270">  (only added when gate/up/down_proj listed in target_modules:)</text>
+  <text class="sub" x="516" y="286">gate_proj.lora_A/B   up_proj.lora_A/B   down_proj.lora_A/B</text>
+
+  <text class="sub" x="516" y="318">requires_grad = True; backward writes only here.</text>
+  <text class="sub" x="516" y="338">All initialized as: A &lt;- Kaiming, B &lt;- 0 (delta starts at 0)</text>
+
+  <!-- gradient arrows -->
+  <path class="grad" d="M460,200 H500" marker-end="url(#arrG2)"/>
+  <text class="sub" x="436" y="194" fill="#1a7f37">no grad</text>
+  <path class="grad" d="M500,310 H460" marker-end="url(#arrG2)"/>
+  <text class="sub" x="450" y="305" fill="#1a7f37">grad flow</text>
+
+  <text class="sub" x="20" y="396">Approximate parameter count: ~(R + r&middot;k_attn) &times; H per layer &nbsp; (R&approx;96, r&approx;32 typical)</text>
+</svg>
+</div>
+
+<h3>4.3 Concrete training step</h3>
+
+<div class="panel">
+<pre>1. forward
+   embed_tokens(input_ids) &rarr; inputs_embeds &times; embedding_multiplier
+   for each layer:
+       if cross_stream wrapped (any layer):
+           dual-stream:
+               h_base, h_adapt = layer(h_base, h_adapt, ...)
+               h_adapt += cross_stream(h_base)        # B&middot;A delta only here
+       else:
+           single-stream:
+               h_adapt = layer(None, h_adapt, ...)    # only adapter ctx
+   logits = lm_head(norm(h_adapt)) / logits_scaling
+   loss = cross_entropy(logits, labels)               # labels mask out prompt
+
+2. backward
+   d(loss)/d(h_adapt) propagates through the adapter stream only.
+   Reaches: q/o/k/v/gate/up/down LoRA A/B (if listed) + cross_stream A/B.
+   Everything else has requires_grad=False; grads stop there.
+   Base K/V caches and h_base path carry no grads (frozen Linear ops).
+
+3. optimizer step
+   AdamW updates only the parameters with requires_grad=True
+   &mdash; the LoRA / CrossStreamLora ModuleDicts.
+</pre>
+</div>
+
+<h3>4.4 Optional: cross_stream off (LoRA-only mode)</h3>
+
+<p>
+With a config whose <code>adapter.target_modules</code> omits <code>cross_stream</code> (e.g. lists only
+<code>q_proj</code>/<code>o_proj</code>, or a scalar <code>all-linear</code> rank), only stock LoRA wrappers
+are installed (on <code>_StreamGatedLinear</code> projections), no <code>CrossStreamLora</code> exists, the model gate
+returns <code>False</code>, and SR runs the <strong>single-stream early-exit</strong> &mdash; one Q/K/V/O
+pass per layer, one MLP pass, no per-layer cross-stream injection. This is functionally LoRA on the
+upstream Granite model (with the documented unfused-projection numerical drift). The save format is
+indistinguishable from a stock PEFT LoRA checkpoint &mdash; <code>load_shadow_residual_peft_model</code>
+will still load it onto the SR base; <code>PeftModel.from_pretrained(stock_base, ...)</code> can also
+load it (but won't bit-match because of the unfused projections; loaded onto the SR base reproduces
+training exactly).
+</p>
+
+<h3>4.5 What the activation sequence does at training time</h3>
+
+<p>
+Three separate consumers, in order:
+</p>
+
+<ol>
+  <li>
+    <strong>Offline</strong> &mdash; <code>add_labels.py</code> uses the activation sequence to stamp
+    the <code>labels</code> column. Tokens up to and including the rightmost match get
+    <code>-100</code>; everything after gets the real token ID. The cross-entropy loss therefore only
+    reaches positions strictly after the boundary.
+  </li>
+  <li>
+    <strong>Per-batch</strong> &mdash; the collator
+    (<code>DataCollatorForSingleExpert{,Packed}</code>,
+    <span class="file">training/collator.py</span>) finds the last
+    <code>-100&rarr;non-(-100)</code> transition in <code>labels</code> and inserts the
+    <em>canonical control token</em> at that position in <code>input_ids</code> (with <code>-100</code>
+    in <code>labels</code> at the same index, so the inserted token never contributes to loss).
+  </li>
+  <li>
+    <strong>Per-forward (only if ALORA is configured)</strong> &mdash; if
+    <code>LoraConfig(alora_invocation_tokens=[...], task_type="CAUSAL_LM")</code> was set
+    (<span class="file">training/train.py</span> encodes the YAML <code>adapter.invocation_tokens</code>
+    string to IDs and attaches them; <code>task_type="CAUSAL_LM"</code> is fixed by the config schema and is
+    load-bearing &mdash; see &sect;3.1.1), peft installs <code>ALoraLinearVariant</code> on every
+    wrapped projection plus a pre-forward hook on every <code>LoraLayer</code>. The hook
+    (<code>get_alora_offsets_for_forward</code>,
+    <span class="file">peft/tuners/lora/variants.py:706</span>) scans <code>input_ids</code> at
+    runtime, calls <code>calculate_alora_offsets</code>
+    (<span class="file">variants.py:615&ndash;684</span>) which returns per-row
+    <code>alora_offsets[i]</code> = (length at and after rightmost match start, or <code>None</code>
+    if no match), and threads it into every wrapper's <code>forward(...)</code>. The variant's
+    <code>forward</code> (<span class="file">variants.py:567&ndash;612</span>) gathers the
+    post-invocation rows and only runs the LoRA matmul on those.
+    <code>CrossStreamLora.forward</code>
+    (<span class="file">peft_shadow_residual/cross_stream_lora.py:165&ndash;221</span>) reproduces the
+    same masking explicitly &mdash; it inherits the hook via <code>LoraLayer</code> but owns its own
+    delta math.
+  </li>
+</ol>
+
+<p>The fully-wired training-time <code>LoraConfig</code> for SR + ALORA (shared-base-K/V production
+default &mdash; note <strong>no</strong> <code>k_proj</code>/<code>v_proj</code>, which shared-base-K/V
+forbids) looks like:</p>
+
+<pre>LoraConfig(
+    r=32, lora_alpha=64.0, lora_dropout=0.05,
+    target_modules=["q_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "cross_stream"],
+    rank_pattern={"q_proj": 32, "o_proj": 32, "gate_proj": 32,
+                  "up_proj": 32, "down_proj": 32, "cross_stream": 32},
+    bias="none",
+    task_type="CAUSAL_LM",                       # required for ALORA dispatch (fixed by schema)
+    alora_invocation_tokens=[...],               # from adapter.invocation_tokens, e.g. the assistant marker
+)
+</pre>
+<p class="small">Older SR configs used a larger cross-stream rank (e.g. 96) via
+<code>rank_pattern={"cross_stream": 96}</code>; the current reference <code>sr-*-sharedkv.yaml</code>
+configs use rank 32 across the board. The exact ranks come straight from the YAML dict values.</p>
+
+<div class="note">
+The collator's inserted control token and the ALORA invocation match are <em>not</em> the same thing,
+but they typically align: the activation sequence used to label the dataset can also be used as the
+ALORA invocation sequence, so the runtime gate flips on at the same boundary the loss computes against.
+</div>
+
+<div class="warn">
+<strong>Three knobs, all required.</strong> Drop any of <code>alora_invocation_tokens</code>,
+<code>task_type="CAUSAL_LM"</code>, or <code>"cross_stream"</code> in <code>target_modules</code>, and
+the result is a <em>silently different</em> training run: peft falls back to unconditional LoRA, or
+the dual-stream forward never engages, with no error message. The
+<span class="file">test_alora_invocation_invariant.py</span> tests catch the first two; absence of
+<code>cross_stream</code> just means SR was never wanted in that run.
+</div>
+
+<h3>4.6 Reading off the wire</h3>
+
+<p>To inspect a trained checkpoint:</p>
+
+<pre>$ ls ./checkpoints
+adapter_config.json   adapter_model.safetensors   training_args.bin
+
+$ python - &lt;&lt;'PY'
+from safetensors import safe_open
+with safe_open("./checkpoints/adapter_model.safetensors", framework="pt") as f:
+    for k in list(f.keys())[:8]:
+        print(k, tuple(f.get_tensor(k).shape))
+PY
+base_model.model.model.layers.0.cross_stream.lora_A.default.weight (96, 1024)
+base_model.model.model.layers.0.cross_stream.lora_B.default.weight (1024, 96)
+base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight (32, 1024)
+base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight (1024, 32)
+...
+</pre>
+
+<p>The shapes confirm: <code>cross_stream</code> uses the rank-pattern override (R=96, square H&times;H);
+attention LoRAs use the global rank (r=32). All other base parameters live on disk in the upstream
+model checkpoint &mdash; they are not duplicated in <span class="file">adapter_model.safetensors</span>.</p>
+
+<hr style="margin: 60px 0 20px; border: 0; border-top: 1px solid var(--border);">
+<p class="small">Sources: <span class="file">src/shadow_residual/shadow_residual/{modeling_hf,decoder_hf,attention_hf,cross_stream,model_config,_stream_context,_stream_gated_linear,weight_transfer}.py</span>,
+<span class="file">src/shadow_residual/peft_shadow_residual/{factory,load,cross_stream_lora,stream_gated_lora}.py</span>,
+<span class="file">src/shadow_residual/config/{training_config,adapters}.py</span>,
+<span class="file">src/shadow_residual/training/{train,generate,data,chat_render,collator,add_labels}.py</span>,
+<span class="file">tests/shadow_residual/{test_alora_invocation_invariant,test_dual_kv_cache_invariant,test_shadow_residual}.py</span>,
+<span class="file">peft/tuners/lora/variants.py</span> (ALoraLinearVariant, calculate_alora_offsets, get_alora_offsets_for_forward),
+<span class="file">docs/sr_architecture_explainer.md</span>.</p>
+
+</div>
+</body>
+</html>

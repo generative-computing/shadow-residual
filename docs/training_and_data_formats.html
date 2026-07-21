@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Shadow Residual — Training &amp; Data Formats (Granite 4.1 / 4.2)</title>
 <style>
-  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
-          --accent:#58a6ff; --g41:#3fb950; --g42:#d29922; --raw:#a371f7; }
+  :root { --bg:#ffffff; --panel:#f6f8fa; --border:#d0d7de; --fg:#1f2328; --muted:#656d76;
+          --accent:#0969da; --g41:#1a7f37; --g42:#9a6700; --raw:#8250df; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
          font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
@@ -16,27 +16,28 @@
   h3 { font-size: 16px; margin: 24px 0 8px; color: var(--accent); }
   p, li { color: var(--fg); }
   .sub { color: var(--muted); margin-top: 0; }
-  code { background:#1f2530; padding:1px 5px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  code { background:#eff1f3; padding:1px 5px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
   pre { background:var(--panel); border:1px solid var(--border); border-radius:8px;
         padding:14px 16px; overflow-x:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
         font-size:12.5px; line-height:1.5; }
+  pre code { background:none; padding:0; }
   pre.raw   { border-left:4px solid var(--raw); }
   pre.g41   { border-left:4px solid var(--g41); }
   pre.g42   { border-left:4px solid var(--g42); }
   .tag { display:inline-block; font-size:11px; font-weight:600; padding:2px 8px; border-radius:12px;
          vertical-align:middle; margin-left:8px; }
-  .tag.raw { background:rgba(163,113,247,.18); color:#c9a6ff; }
-  .tag.g41 { background:rgba(63,185,80,.16); color:#69d67e; }
-  .tag.g42 { background:rgba(210,153,34,.16); color:#e3b341; }
+  .tag.raw { background:rgba(130,80,223,.12); color:#8250df; }
+  .tag.g41 { background:rgba(26,127,55,.12); color:#1a7f37; }
+  .tag.g42 { background:rgba(154,103,0,.12); color:#9a6700; }
   table { border-collapse:collapse; width:100%; margin:14px 0; font-size:13.5px; }
   th, td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
-  th { background:#1f2530; }
-  .note { background:#1c2333; border:1px solid #2d3650; border-left:4px solid var(--accent);
+  th { background:var(--panel); }
+  .note { background:#ddf4ff; border:1px solid #b6e3ff; border-left:4px solid var(--accent);
           border-radius:6px; padding:10px 14px; margin:14px 0; font-size:13.5px; }
   .muted { color:var(--muted); }
-  .hl-role { color:#79c0ff; }   /* role markers */
-  .hl-doc  { color:#e3b341; }   /* document block */
-  .hl-lbl  { color:#7ee787; }   /* supervised label */
+  .hl-role { color:#0969da; }   /* role markers */
+  .hl-doc  { color:#9a6700; }   /* document block */
+  .hl-lbl  { color:#1a7f37; }   /* supervised label */
   ul { margin:8px 0; }
 </style>
 </head>
@@ -232,6 +233,101 @@ reading the label. The rendering logic lives in
 <code>src/shadow_residual/training/chat_render.py</code> and is shared by training
 (<code>data.py</code>) and evaluation (<code>answerability_eval.py</code>) so they
 stay identical.
+</div>
+
+<!-- ============================================================= -->
+<h2>3. Handling the thinking / reasoning content</h2>
+
+<p>Granite 4.2 (ChatML) can emit a <code>&lt;think&gt;…&lt;/think&gt;</code> reasoning
+block before its answer; Granite 4.1 has no such block. A single boolean —
+<code>enable_thinking</code> — controls whether that block is requested, and it flows
+through the <b>same</b> <code>render_chat()</code> helper on both the training and eval
+paths, so the two never drift. Below is the full lifecycle of thinking content.</p>
+
+<h3>3.1 The <code>enable_thinking</code> flag and the <code>reasoning_content</code> key</h3>
+
+<p>Two distinct things control thinking, and it helps to keep them apart:</p>
+
+<ul>
+  <li><b><code>enable_thinking</code></b> carries <u>no</u> reasoning text. On Granite 4.2 it only
+      shapes the <b>trailing generation prompt</b> (appended when <code>add_generation_prompt=True</code>):
+      <code>&lt;think&gt;\n</code> when true (model generates its own reasoning) vs empty
+      <code>&lt;think&gt;&lt;/think&gt;</code> when false. It does not affect how an already-present
+      assistant message is laid out, and Granite 4.1 ignores it entirely.</li>
+  <li><b><code>reasoning_content</code></b> (a field on the assistant message) is the <b>only supported
+      way to supply reasoning text</b> on 4.2. If non-empty, the template wraps it as
+      <code>&lt;think&gt;\n{reasoning_content}\n&lt;/think&gt;\n{content}</code> — you provide plain text,
+      the template adds the tags. Inlining <code>&lt;think&gt;…&lt;/think&gt;</code> in <code>content</code>
+      does <u>not</u> work: the generation prompt appends its own <code>&lt;think&gt;</code> opener, so a
+      model trained that way emits a second block — you get <b>two <code>&lt;think&gt;</code> sections</b>.</li>
+</ul>
+
+<p>The flag's value is forwarded through the shared <code>render_chat()</code> helper on both paths:</p>
+
+<table>
+  <tr><th>Path</th><th>Source of <code>enable_thinking</code> (default <code>False</code>)</th></tr>
+  <tr>
+    <td><b>Training</b></td>
+    <td><code>data.enable_thinking</code> in the YAML, overridable by <code>--thinking</code> on
+        <code>sr-train</code> (CLI wins).</td>
+  </tr>
+  <tr>
+    <td><b>Evaluation</b></td>
+    <td><code>--enable-thinking</code> flag on <code>answerability_eval</code>.</td>
+  </tr>
+</table>
+
+<div class="note">
+SR's loader passes <code>messages</code> through verbatim — it does <b>not</b> populate
+<code>reasoning_content</code>, so that key only takes effect if your JSONL rows already carry it.
+And keep training and eval in agreement: thinking is a prompt-rendering choice, so flip
+<code>enable_thinking</code> on for both sides or neither. The reference answerability adapters are
+trained <b>thinking-off</b> and evaluated <b>without</b> <code>--enable-thinking</code>.
+</div>
+
+<h3>3.2 Thinking in the training target</h3>
+
+<p>When thinking is <b>off</b> (the default), Granite 4.2's assistant turn still carries an
+<b>empty</b> reasoning block — the template emits <code>&lt;think&gt;&lt;/think&gt;</code>
+immediately before the label:</p>
+
+<pre class="g42">&lt;|im_start|&gt;assistant
+&lt;think&gt;&lt;/think&gt;"answerable"&lt;|im_end|&gt;</pre>
+
+<p>The supervised label is the bare <code>"answerable"</code> that follows the empty tags
+(the <code>&lt;think&gt;&lt;/think&gt;</code> pair is part of the unmasked assistant turn the
+model is trained to reproduce). Granite 4.1 has no reasoning block, so its target is just
+<code>"answerable"</code>. Response-only masking is unaffected either way: loss is computed
+on the final assistant turn regardless of whether it opens with an empty think block.</p>
+
+<h3>3.3 Thinking in generated output — the eval parser</h3>
+
+<p>At generation time a 4.2 model produces whatever the template shaped it for. If a
+non-empty reasoning block appears, the classifier must not mistake the reasoning prose for
+the label. <code>process_predictions()</code> in <code>answerability_eval.py</code> handles
+this by <b>reading only the text after the last <code>&lt;/think&gt;</code></b>:</p>
+
+<pre class="g42">pred = pred.strip()
+# 4.2: the verdict is whatever follows the last &lt;/think&gt;.
+if "&lt;/think&gt;" in pred:
+    pred = pred.rsplit("&lt;/think&gt;", 1)[1].strip()
+# ... then take the first token / quoted word as the label</pre>
+
+<ul>
+  <li><b>With a think block</b> (e.g. <code>&lt;think&gt;Okay, the user is asking…&lt;/think&gt;"unanswerable"</code>)
+      → everything up to and including <code>&lt;/think&gt;</code> is discarded; the label is
+      parsed from the remainder.</li>
+  <li><b>With an empty block</b> (<code>&lt;think&gt;&lt;/think&gt;"answerable"</code>) → the split
+      leaves <code>"answerable"</code>, parsed as normal.</li>
+  <li><b>No block at all</b> (Granite 4.1) → the <code>&lt;/think&gt;</code> branch is skipped;
+      parsing is unchanged.</li>
+</ul>
+
+<div class="note">
+Set <code>--max-new-tokens</code> large enough to cover the reasoning block plus the label
+when thinking is on. The default (30) is sized for the thinking-off
+<code>&lt;think&gt;&lt;/think&gt;"label"</code> target; a real reasoning trace needs more room
+or it will be truncated before the label is emitted.
 </div>
 
 </div>
