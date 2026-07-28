@@ -47,6 +47,24 @@ The core train/serve path is fully self-contained. The optional
 `granite-switch` package: `uv pip install -e ".[eval-switch]"` (or
 `.[eval-vllm]`).
 
+### Install directly from git
+
+To use SR as a dependency without cloning, `pip install` it straight from the
+repo (deps resolve from PyPI):
+
+```bash
+pip install "git+https://github.ibm.com/generative-computing/shadow-residual.git"
+```
+
+- **Private repo over SSH:** `pip install "git+ssh://git@<github.ibm.com/generative-computing/shadow-residual.git"`
+- **Pin a tag or commit** for reproducibility (append `@<tag-or-sha>`):
+  `pip install "git+https://github.ibm.com/generative-computing/shadow-residual.git@v0.1.0"`
+- **With extras:**
+  `pip install "shadow-residual[train] @ git+https://github.ibm.com/generative-computing/shadow-residual.git"`
+
+This installs `torch>=2.4` (whatever the latest wheel is), which may differ from
+the Vela image's torch 2.6 — pin torch yourself if you need to match.
+
 ## Serving an SR adapter
 
 An SR checkpoint is a standard PEFT adapter (`adapter_config.json` +
