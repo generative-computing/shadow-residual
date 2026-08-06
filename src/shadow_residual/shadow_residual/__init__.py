@@ -21,7 +21,7 @@ Public API:
 from .attention_hf import ShadowResidualAttention
 from .config_helpers import set_shadow_residual, validate_shadow_residual_config
 from .cross_stream import CrossStream
-from .decoder_hf import ShadowResidualDecoderLayer
+from .decoder_hf import ShadowResidualDecoderLayer, ShadowResidualMLP
 from .modeling_hf import (
     ShadowResidualForCausalLM,
     ShadowResidualModel,
@@ -33,6 +33,7 @@ __all__ = [
     "CrossStream",
     "ShadowResidualAttention",
     "ShadowResidualDecoderLayer",
+    "ShadowResidualMLP",
     "ShadowResidualPreTrainedModel",
     "ShadowResidualModel",
     "ShadowResidualForCausalLM",

@@ -165,7 +165,7 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
                     n_skipped += 1
             return
 
-        # shared_mlp.input_linear (gate ⨁ up) → gate_proj / up_proj
+        # shared_mlp.input_linear (gate ⨁ up) → mlp.gate_proj / mlp.up_proj
         if src_key.endswith("shared_mlp.input_linear.weight") or src_key.endswith(
             "shared_mlp.input_linear.base_layer.weight"
         ):
@@ -173,7 +173,7 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
             inter = src_val.shape[0] // 2
             gate_w = src_val[:inter, :]
             up_w = src_val[inter:, :]
-            for name, tensor in [("gate_proj.weight", gate_w), ("up_proj.weight", up_w)]:
+            for name, tensor in [("mlp.gate_proj.weight", gate_w), ("mlp.up_proj.weight", up_w)]:
                 dst_key = layer_prefix + name
                 if dst_key in dst_keys and dst_state[dst_key].shape == tensor.shape:
                     with torch.no_grad():
@@ -183,12 +183,12 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
                     n_skipped += 1
             return
 
-        # shared_mlp.output_linear → down_proj
+        # shared_mlp.output_linear → mlp.down_proj
         if src_key.endswith("shared_mlp.output_linear.weight") or src_key.endswith(
             "shared_mlp.output_linear.base_layer.weight"
         ):
             layer_prefix = src_key[: src_key.index("shared_mlp.")]
-            dst_key = layer_prefix + "down_proj.weight"
+            dst_key = layer_prefix + "mlp.down_proj.weight"
             if dst_key in dst_keys and dst_state[dst_key].shape == src_val.shape:
                 with torch.no_grad():
                     dst_state[dst_key].copy_(src_val)
@@ -198,14 +198,11 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
             return
 
         # Already-unfused MLP on the upstream — keys live nested under .mlp.
-        # (granite, llama, qwen, … all do this). The SR decoder layer carries
-        # gate_proj / up_proj / down_proj as direct attributes (no .mlp.
-        # parent), so we must strip the .mlp. segment when looking up the
-        # destination. Without this branch, every MLP weight goes to the
-        # default fallback below, which fails the dst_keys membership check
-        # silently and leaves SR's MLP at random initialization — verified
-        # via scripts/diagnose_sr_weight_transfer.py: 120 MLP weights were
-        # being skipped.
+        # (granite, llama, qwen, … all do this). The SR decoder layer also
+        # nests gate_proj / up_proj / down_proj under self.mlp, so the key
+        # structure matches directly (layers.{i}.mlp.gate_proj.weight on both
+        # sides). This branch handles the base_layer indirection that PEFT
+        # adds when the destination is already PEFT-wrapped.
         for mlp_proj in ("gate_proj", "up_proj", "down_proj"):
             for tail in (
                 f"mlp.{mlp_proj}.weight",
@@ -217,7 +214,7 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
                     continue
                 layer_prefix = src_key[: src_key.index("mlp.")]
                 dst_suffix = "weight" if tail.endswith("weight") else "bias"
-                dst_key = f"{layer_prefix}{mlp_proj}.{dst_suffix}"
+                dst_key = f"{layer_prefix}mlp.{mlp_proj}.{dst_suffix}"
                 if dst_key in dst_keys and dst_state[dst_key].shape == src_val.shape:
                     with torch.no_grad():
                         dst_state[dst_key].copy_(src_val)

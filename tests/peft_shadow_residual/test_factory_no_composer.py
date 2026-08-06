@@ -175,9 +175,9 @@ def test_weight_transfer_mlp_slicing(tiny_base_model):
         down_w = src_sd[down_key]
 
         sr_layer = sr.model.layers[layer_idx]
-        torch.testing.assert_close(sr_layer.gate_proj.weight, gate_w)
-        torch.testing.assert_close(sr_layer.up_proj.weight, up_w)
-        torch.testing.assert_close(sr_layer.down_proj.weight, down_w)
+        torch.testing.assert_close(sr_layer.mlp.gate_proj.weight, gate_w)
+        torch.testing.assert_close(sr_layer.mlp.up_proj.weight, up_w)
+        torch.testing.assert_close(sr_layer.mlp.down_proj.weight, down_w)
 
 
 def test_get_peft_model_non_rank0_stays_on_meta(tiny_base_model, monkeypatch):
@@ -664,9 +664,9 @@ def test_weight_transfer_drains_src_when_requested(tiny_base_model):
     sr_attn0 = sr.model.layers[0].self_attn
     torch.testing.assert_close(sr_attn0.q_proj.weight, q_pre)
     inter = gate_up_pre.shape[0] // 2
-    torch.testing.assert_close(sr.model.layers[0].gate_proj.weight, gate_up_pre[:inter, :])
-    torch.testing.assert_close(sr.model.layers[0].up_proj.weight, gate_up_pre[inter:, :])
-    torch.testing.assert_close(sr.model.layers[0].down_proj.weight, down_pre)
+    torch.testing.assert_close(sr.model.layers[0].mlp.gate_proj.weight, gate_up_pre[:inter, :])
+    torch.testing.assert_close(sr.model.layers[0].mlp.up_proj.weight, gate_up_pre[inter:, :])
+    torch.testing.assert_close(sr.model.layers[0].mlp.down_proj.weight, down_pre)
 
     # (2) Source leaf params have been unbound. Reach into _parameters because
     # regular attribute access on a Parameter set to None can raise.
@@ -745,7 +745,7 @@ def test_build_sr_base_from_unfused_granite(tiny_granite_base_model, monkeypatch
     for layer_idx in range(src_cfg.num_hidden_layers):
         for proj in ("gate_proj", "up_proj", "down_proj"):
             src_w = src_sd[f"model.layers.{layer_idx}.mlp.{proj}.weight"]
-            sr_w = getattr(sr.model.layers[layer_idx], proj).weight
+            sr_w = getattr(sr.model.layers[layer_idx].mlp, proj).weight
             torch.testing.assert_close(
                 sr_w, src_w,
                 msg=lambda m, p=proj, l=layer_idx: (

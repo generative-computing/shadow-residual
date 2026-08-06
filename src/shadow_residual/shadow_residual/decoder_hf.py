@@ -6,10 +6,12 @@ Maintains two parallel hidden state streams (base and adapter):
 - Attention: see :class:`ShadowResidualAttention`. Q and O are stream-
   gated (``"base"`` context skips LoRA delta); K/V is single-shared and
   picks up its LoRA delta (documented exception).
-- MLP: ``gate_proj`` / ``up_proj`` / ``down_proj`` are
-  :class:`_StreamGatedLinear` instances, called once per stream inside
-  the appropriate :func:`stream_context`. Base call → no delta; adapter
-  call → delta fires.
+- MLP: ``mlp.gate_proj`` / ``mlp.up_proj`` / ``mlp.down_proj`` are
+  :class:`_StreamGatedLinear` instances nested under ``self.mlp``,
+  called once per stream inside the appropriate :func:`stream_context`.
+  Base call → no delta; adapter call → delta fires. The ``mlp.``
+  namespace ensures PEFT saves adapter keys with the same structure as
+  upstream HF Granite (``layers.{i}.mlp.gate_proj.lora_A.weight``).
 
 Frozen-base invariant
 ---------------------
@@ -51,6 +53,29 @@ from .attention_hf import ShadowResidualAttention
 from .cross_stream import CrossStream
 
 
+class ShadowResidualMLP(nn.Module):
+    """Stream-gated SwiGLU MLP for Shadow Residual.
+
+    Mirrors :class:`GraniteMLP` structure (gate/up/down projections + act_fn)
+    but uses :class:`_StreamGatedLinear` so that the LoRA delta is suppressed
+    in the base stream context and active in the adapter stream context.
+    """
+
+    def __init__(self, config: GraniteSwitchConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.shared_intermediate_size
+        self.gate_proj = _StreamGatedLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = _StreamGatedLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = _StreamGatedLinear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+
 class ShadowResidualDecoderLayer(nn.Module):
     """Decoder layer with shadow residual streams (base + adapter).
 
@@ -74,13 +99,7 @@ class ShadowResidualDecoderLayer(nn.Module):
 
         self.self_attn = ShadowResidualAttention(config, layer_idx)
 
-        intermediate_size = config.shared_intermediate_size
-
-        # Stream-gated linears — PEFT will dispatch any of these the
-        # user lists in target_modules to ShadowResidualLora.
-        self.gate_proj = _StreamGatedLinear(self.hidden_size, intermediate_size, bias=False)
-        self.up_proj = _StreamGatedLinear(self.hidden_size, intermediate_size, bias=False)
-        self.down_proj = _StreamGatedLinear(intermediate_size, self.hidden_size, bias=False)
+        self.mlp = ShadowResidualMLP(config)
 
         self.input_layernorm = GraniteMoeHybridRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps,
@@ -89,23 +108,12 @@ class ShadowResidualDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps,
         )
 
-        self.activation = ACT2FN[config.hidden_act]
-
         # Cross-stream site — the per-layer base→adapter merge point.
         # Bare CrossStream is a no-op (returns zeros); PEFT installs a
         # :class:`CrossStreamLora` wrapper here at training time when
         # ``"cross_stream"`` is in ``target_modules``. Without an adapter,
         # contributes zero to ``h_adapt``.
         self.cross_stream = CrossStream(config.hidden_size)
-
-    def _mlp_one_stream(self, normed: torch.Tensor) -> torch.Tensor:
-        """SwiGLU MLP for one stream — caller is responsible for the
-        stream context.  Inside this body the same wrapper gets called
-        three times; whichever delta-gating the wrapper applies depends
-        on the active context tag."""
-        gate = self.gate_proj(normed)
-        up = self.up_proj(normed)
-        return self.down_proj(self.activation(gate) * up)
 
     def forward(
         self,
@@ -193,7 +201,7 @@ class ShadowResidualDecoderLayer(nn.Module):
 
             normed = self.post_attention_layernorm(h_adapt)
             with stream_context("adapter"):
-                mlp_adapt = self._mlp_one_stream(normed)
+                mlp_adapt = self.mlp(normed)
             h_adapt = h_adapt + mlp_adapt * self.residual_multiplier
 
             outputs = ((None, h_adapt),)
@@ -233,9 +241,9 @@ class ShadowResidualDecoderLayer(nn.Module):
         normed_base, normed_adapt = normed[:bsz], normed[bsz:]
 
         with stream_context("base"):
-            mlp_base = self._mlp_one_stream(normed_base)
+            mlp_base = self.mlp(normed_base)
         with stream_context("adapter"):
-            mlp_adapt = self._mlp_one_stream(normed_adapt)
+            mlp_adapt = self.mlp(normed_adapt)
 
         h_base = h_base + mlp_base * self.residual_multiplier
         h_adapt = h_adapt + mlp_adapt * self.residual_multiplier
