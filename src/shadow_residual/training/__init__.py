@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Training utilities for GraniteSwitch experts (experimental).
+"""Training utilities for shadow-residual training.
 
 Public API:
 

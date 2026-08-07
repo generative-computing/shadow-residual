@@ -30,7 +30,7 @@ import pytest
 import torch
 from peft import LoraConfig, get_peft_model
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
@@ -54,8 +54,8 @@ INPUT_IDS = torch.tensor([[1, 2, 3, INVOCATION_TOKEN_ID, 7, 8]], dtype=torch.lon
 P_INVOCATION = 3  # first post-invocation position
 
 
-def _build_tiny_sr_config() -> GraniteSwitchConfig:
-    cfg = GraniteSwitchConfig(
+def _build_tiny_sr_config() -> ShadowResidualConfig:
+    cfg = ShadowResidualConfig(
         vocab_size=300,
         hidden_size=64,
         intermediate_size=128,
@@ -72,7 +72,7 @@ def _build_tiny_sr_config() -> GraniteSwitchConfig:
 
 def _build_sr_peft(
     *,
-    cfg: GraniteSwitchConfig,
+    cfg: ShadowResidualConfig,
     seed: int,
     alora_invocation_tokens: list[int] | None,
     perturb_lora_b: bool,

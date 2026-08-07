@@ -15,9 +15,11 @@ attributes, and :func:`shadow_residual.shadow_residual.config_helpers.set_shadow
 sets them dynamically after construction (then validates). Declaring them would
 duplicate that path without benefit.
 
-``model_type`` is kept as ``"granite_switch"`` so existing SR checkpoints
-(whose ``config.json`` / ``adapter_config.json`` record that ``model_type``)
-round-trip through ``AutoConfig`` unchanged.
+Note: this is a clean break from the previous ``granite_switch`` model type.
+Old full-model checkpoints with ``model_type: "granite_switch"`` in their
+``config.json`` will no longer auto-resolve via ``AutoConfig``. The adapter
+workflow (``load_shadow_residual_peft_model``) is unaffected — it builds from
+the upstream Granite base model.
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ class ShadowResidualConfig(GraniteMoeHybridConfig):
     attention-only architecture (no SSM / mamba layers).
     """
 
-    model_type = "granite_switch"
+    model_type = "shadow_residual"
 
     def __init__(
         self,
@@ -90,7 +92,4 @@ class ShadowResidualConfig(GraniteMoeHybridConfig):
         )
 
 
-# Back-compat alias: SR code historically imported ``GraniteSwitchConfig``.
-GraniteSwitchConfig = ShadowResidualConfig
-
-__all__ = ["ShadowResidualConfig", "GraniteSwitchConfig"]
+__all__ = ["ShadowResidualConfig"]

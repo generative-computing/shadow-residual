@@ -28,7 +28,7 @@ import pytest
 import torch
 from peft import LoraConfig, get_peft_model
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import ShadowResidualForCausalLM
 from shadow_residual.shadow_residual._stream_gated_linear import (
     _StreamGatedLinear,
@@ -52,7 +52,7 @@ _TARGET_MODULES = ["q_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "cro
 def _build_sr_peft_model(lora_dropout: float = 0.0):
     """Tiny SR + PEFT model. Mirrors the fixture in
     tests/experimental/peft_shadow_residual/test_peft_wrapper.py."""
-    cfg = GraniteSwitchConfig(
+    cfg = ShadowResidualConfig(
         vocab_size=300,
         hidden_size=64,
         intermediate_size=128,
@@ -117,7 +117,7 @@ def _build_gated_sr_peft_model(lora_dropout: float = 0.0):
     exercised at all.
     """
     from peft import TaskType
-    cfg = GraniteSwitchConfig(
+    cfg = ShadowResidualConfig(
         vocab_size=300, hidden_size=64, intermediate_size=128,
         num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
         num_adapters=0, max_lora_rank=8, switch_head_dim=16,

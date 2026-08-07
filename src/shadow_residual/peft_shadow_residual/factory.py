@@ -33,7 +33,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
@@ -158,7 +158,7 @@ def _build_sr_config(
     torch_dtype: Optional[torch.dtype] = None,
     attn_implementation: Optional[str] = None,
     shared_base_kv: bool = False,
-) -> GraniteSwitchConfig:
+) -> ShadowResidualConfig:
     """Build the SR config by reading the upstream HF config (no weights).
 
     Pulled out so every rank can call it cheaply (config-only download,
@@ -186,7 +186,7 @@ def _build_sr_config(
         config_dict["layer_types"] = ["attention" for _ in config_dict["layer_types"]]
     # Force shared_intermediate_size to the upstream's intermediate_size
     # whenever the upstream's MLP is already unfused. Without this, the
-    # GraniteMoeHybridConfig parent of GraniteSwitchConfig defaults
+    # GraniteMoeHybridConfig parent of ShadowResidualConfig defaults
     # shared_intermediate_size to its own value (1024 for some bases),
     # leaving SR's MLP a fraction the size of the upstream's. Verified
     # against ibm-granite/granite-4.1-3b: upstream intermediate_size=8192,
@@ -196,7 +196,7 @@ def _build_sr_config(
     # scripts/diagnose_sr_vs_upstream.py output).
     if "intermediate_size" in config_dict and config_dict.get("shared_intermediate_size") is None:
         config_dict["shared_intermediate_size"] = config_dict["intermediate_size"]
-    sr_config = GraniteSwitchConfig(**config_dict)
+    sr_config = ShadowResidualConfig(**config_dict)
     set_shadow_residual(sr_config, enabled=True, shared_base_kv=shared_base_kv)
     if torch_dtype is not None:
         sr_config.torch_dtype = torch_dtype
@@ -371,7 +371,7 @@ def _diagnose_materialized(peft_model) -> None:
 
 
 def _build_sr_peft_model_meta(
-    sr_config: GraniteSwitchConfig,
+    sr_config: ShadowResidualConfig,
     lora_config: LoraConfig,
     *,
     torch_dtype: Optional[torch.dtype],

@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Config-side helpers for shadow-residual.
 
-The open-source ``GraniteSwitchConfig`` (in the submodule) does not declare
-``shadow_residual`` or ``cross_stream_rank``.  ``PretrainedConfig`` accepts
-unknown ``**kwargs`` and stores them as attributes, so passing them through
-the composer / config constructor works at runtime — but we lose the
-declarative validation the dual-residual branch had.
+``ShadowResidualConfig`` does not declare ``shadow_residual`` or
+``cross_stream_rank`` as class attributes. ``PretrainedConfig`` accepts
+unknown ``**kwargs`` and stores them as plain attributes, so passing them
+through the config constructor works at runtime — but we lose declarative
+validation.
 
-This module reproduces that validation as a free function.  Call
+This module reproduces that validation as a free function. Call
 :func:`validate_shadow_residual_config` immediately after constructing a
-``GraniteSwitchConfig`` whenever the SR fields are set.
+``ShadowResidualConfig`` whenever the SR fields are set.
 """
 
 from typing import Iterable
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
 
-def validate_shadow_residual_config(config: GraniteSwitchConfig) -> None:
+def validate_shadow_residual_config(config: ShadowResidualConfig) -> None:
     """Validate shadow-residual related config fields.
 
     Mirrors the constructor-time checks from the dual-residual branch:
@@ -34,10 +34,8 @@ def validate_shadow_residual_config(config: GraniteSwitchConfig) -> None:
       is an SR-internal knob (it picks between disjoint per-stream K/V
       and a single base-only K/V shared with the adapter stream).
 
-    The previous check ``num_adapters > 0`` was dropped in Phase 2 of
-    the SR refactor: SR no longer inherits from GraniteSwitch and no
-    longer needs the SwitchedLoRA / SingleSwitch scaffolding that the
-    ``num_adapters > 0`` branch was satisfying.
+    The previous check ``num_adapters > 0`` was dropped — SR does not
+    use adapter routing or switching scaffolding.
 
     Raises:
         ValueError: if any of the above is violated.
@@ -64,12 +62,12 @@ def validate_shadow_residual_config(config: GraniteSwitchConfig) -> None:
 
 
 def set_shadow_residual(
-    config: GraniteSwitchConfig,
+    config: ShadowResidualConfig,
     *,
     enabled: bool = True,
     cross_stream_rank: "int | None" = None,
     shared_base_kv: bool = False,
-) -> GraniteSwitchConfig:
+) -> ShadowResidualConfig:
     """Mutate ``config`` to enable shadow-residual and validate the result.
 
     ``shared_base_kv`` selects between disjoint per-stream K/V (the

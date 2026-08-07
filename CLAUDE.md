@@ -36,7 +36,7 @@ src/shadow_residual/
 │   ├── adapters.py             to_peft_config / to_training_arguments / build_callbacks
 │   └── *.yaml                  lora / alora / sr reference configs (+ schema/, accelerate/)
 ├── training/               # train.py, generate.py, data.py, collator.py, add_labels.py, pack_stats.py
-└── eval/answerability_eval.py  # peft mode = standalone; switch/vllm need granite-switch
+└── eval/answerability_eval.py  # standalone peft-based answerability evaluation
 tests/                      # mirrors src; run with pytest (CPU-only cases pass without a GPU)
 examples/vela/              # Vela job YAMLs (fill placeholders before submitting)
 ```
@@ -45,10 +45,10 @@ examples/vela/              # Vela job YAMLs (fill placeholders before submittin
 
 ```bash
 uv venv --python 3.12
-uv pip install -e ".[train]"      # add [dev] for pytest; [eval-switch]/[eval-vllm] for optional eval modes
+uv pip install -e ".[train]"      # add [dev] for pytest
 ```
 
-Fully self-contained — no `granite-switch` dependency on the train/serve path.
+Fully self-contained — no external model-serving dependency on the train/serve path.
 
 ## Training
 
@@ -112,9 +112,7 @@ auto-default. A checkpoint trained with a **non-default** value must pass the sa
 value explicitly at load time.
 
 Answerability eval: `python -m shadow_residual.eval.answerability_eval --mode peft
---base-model <id> --adapter <path> …`. `--mode peft` is standalone; `--mode
-switch` / `--mode vllm` raise a clear ImportError unless `granite-switch` is
-installed (`[eval-switch]` / `[eval-vllm]`).
+--base-model <id> --adapter <path> …`.
 
 ## Invariants — do not break these
 
@@ -144,10 +142,8 @@ catch silent breakage of the frozen-base / KV / ALORA guarantees.
 
 ## Version notes
 
-- Vendored `ShadowResidualConfig` keeps `model_type = "granite_switch"` for
-  checkpoint round-trips.
-- **transformers is pinned `>=5.5.1,<5.10.0`** to match the granite-switch-internal
-  environment. On this range, `GraniteMoeHybridConfig` keeps attention
+- Vendored `ShadowResidualConfig` uses `model_type = "shadow_residual"`.
+- **transformers is pinned `>=5.5.1,<5.10.0`**. On this range, `GraniteMoeHybridConfig` keeps attention
   `layer_types` as `"attention"` — which `validate_shadow_residual_config` and the
   test fixtures rely on. transformers ≥5.10 renames it to `"full_attention"` and
   strict-validates, which breaks the config and tests. Do not bump the upper

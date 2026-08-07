@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Phase 3 verification: factory builds SR without the GraniteSwitch composer.
+"""Phase 3 verification: factory builds SR model from base Granite weights.
 
 The new ``_build_sr_base`` loads via :class:`AutoModelForCausalLM`,
 constructs an :class:`ShadowResidualForCausalLM` with the same config,
@@ -25,7 +25,7 @@ from transformers import (
 from shadow_residual.peft_shadow_residual.factory import _build_sr_base
 from shadow_residual.shadow_residual import ShadowResidualForCausalLM
 from shadow_residual.shadow_residual.model_config import (
-    ShadowResidualConfig as GraniteSwitchConfig,
+    ShadowResidualConfig as ShadowResidualConfig,
 )
 from shadow_residual.shadow_residual._stream_gated_linear import (
     _StreamGatedLinear,
@@ -106,7 +106,7 @@ def test_build_sr_base_via_monkeypatch(tiny_base_model, monkeypatch):
     sr = _build_sr_base("ignored-path")
 
     assert isinstance(sr, ShadowResidualForCausalLM)
-    # No GraniteSwitch routing baggage on the new model.
+    # No adapter routing on the new model.
     assert not hasattr(sr.model, "switch")
     assert not hasattr(sr.model, "adapter_token_ids")
     assert getattr(sr.config, "num_adapters", 0) == 0
@@ -123,19 +123,19 @@ def test_build_sr_base_via_monkeypatch(tiny_base_model, monkeypatch):
 def test_weight_transfer_attention_unfused(tiny_base_model):
     """Upstream HF Granite already exposes q/k/v_proj unfused; transfer is by name.
 
-    (When the source is the open-source GraniteSwitch model, projections
+    (When the source is a fused-projection Granite model, projections
     are fused as ``qkv_proj`` and the same helper slices them — that path
     is exercised indirectly via the existing SR composer tests.)
     """
     src = tiny_base_model
     src_cfg = src.config
 
-    from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+    from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
     from shadow_residual.shadow_residual.config_helpers import (
         set_shadow_residual,
     )
 
-    sr_cfg = GraniteSwitchConfig(**src_cfg.to_dict())
+    sr_cfg = ShadowResidualConfig(**src_cfg.to_dict())
     set_shadow_residual(sr_cfg, enabled=True)
     sr = ShadowResidualForCausalLM(sr_cfg)
     transfer_base_weights(src, sr)
@@ -153,12 +153,12 @@ def test_weight_transfer_mlp_slicing(tiny_base_model):
     src = tiny_base_model
     src_cfg = src.config
 
-    from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+    from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
     from shadow_residual.shadow_residual.config_helpers import (
         set_shadow_residual,
     )
 
-    sr_cfg = GraniteSwitchConfig(**src_cfg.to_dict())
+    sr_cfg = ShadowResidualConfig(**src_cfg.to_dict())
     set_shadow_residual(sr_cfg, enabled=True)
     sr = ShadowResidualForCausalLM(sr_cfg)
     transfer_base_weights(src, sr)
@@ -384,7 +384,7 @@ def tiny_untied_base_model():
 def test_tied_config_ties_lm_head():
     """tie_word_embeddings=True → lm_head aliases embed_tokens (granite-4.1)."""
     cfg = _make_tiny_hybrid_config()  # tie_word_embeddings=True
-    sr_cfg = GraniteSwitchConfig(**cfg.to_dict())
+    sr_cfg = ShadowResidualConfig(**cfg.to_dict())
     torch.manual_seed(0)
     m = ShadowResidualForCausalLM(sr_cfg)
     assert m._tied_weights_keys == {"lm_head.weight": "model.embed_tokens.weight"}
@@ -396,7 +396,7 @@ def test_tied_config_ties_lm_head():
 def test_untied_config_keeps_separate_lm_head():
     """tie_word_embeddings=False → lm_head is a distinct Parameter (granite-4.2)."""
     cfg = _make_tiny_untied_config()
-    sr_cfg = GraniteSwitchConfig(**cfg.to_dict())
+    sr_cfg = ShadowResidualConfig(**cfg.to_dict())
     torch.manual_seed(0)
     m = ShadowResidualForCausalLM(sr_cfg)
     assert m._tied_weights_keys == {}, (
@@ -640,12 +640,12 @@ def test_weight_transfer_drains_src_when_requested(tiny_base_model):
     src = tiny_base_model
     src_cfg = src.config
 
-    from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+    from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
     from shadow_residual.shadow_residual.config_helpers import (
         set_shadow_residual,
     )
 
-    sr_cfg = GraniteSwitchConfig(**src_cfg.to_dict())
+    sr_cfg = ShadowResidualConfig(**src_cfg.to_dict())
     set_shadow_residual(sr_cfg, enabled=True)
     sr = ShadowResidualForCausalLM(sr_cfg)
 

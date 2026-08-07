@@ -2,7 +2,7 @@
 """Tests for shadow-residual architecture (HF backend, experimental).
 
 After Phase 1+2 of the SR refactor, SR no longer inherits from
-``GraniteSwitchModel``: there is no ``adapter_token_ids`` buffer, no
+the upstream Granite model: there is no ``adapter_token_ids`` buffer, no
 ``SingleSwitch``, no per-projection ``q_lora_B``/``o_lora_B`` attributes,
 and no final-step merge gate. LoRA divergence is driven through PEFT;
 divergence between the streams is exercised in
@@ -19,7 +19,7 @@ import pytest
 import torch
 from peft import LoraConfig, get_peft_model
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import (
     ShadowResidualDecoderLayer,
     ShadowResidualForCausalLM,
@@ -43,8 +43,8 @@ from shadow_residual.peft_shadow_residual.stream_gated_lora import (
 
 @pytest.fixture
 def tiny_config():
-    """Minimal SR config for CPU tests — no GraniteSwitch routing fields."""
-    config = GraniteSwitchConfig(
+    """Minimal SR config for CPU tests."""
+    config = ShadowResidualConfig(
         vocab_size=300,
         hidden_size=64,
         intermediate_size=128,
@@ -135,13 +135,13 @@ class TestConfigValidation:
 
     def test_shadow_residual_with_zero_adapters_is_valid(self):
         """Phase 2 dropped the ``num_adapters > 0`` requirement."""
-        config = GraniteSwitchConfig(num_adapters=0)
+        config = ShadowResidualConfig(num_adapters=0)
         set_shadow_residual(config, enabled=True)
         # Must not raise.
         validate_shadow_residual_config(config)
 
     def test_shadow_residual_requires_attention_only(self):
-        config = GraniteSwitchConfig(
+        config = ShadowResidualConfig(
             num_adapters=0,
             max_lora_rank=4,
             layer_types=["attention", "mamba", "attention"],
@@ -152,12 +152,12 @@ class TestConfigValidation:
             validate_shadow_residual_config(config)
 
     def test_cross_stream_rank_requires_shadow_residual(self):
-        config = GraniteSwitchConfig(num_adapters=0)
+        config = ShadowResidualConfig(num_adapters=0)
         config.shadow_residual = False
         config.cross_stream_rank = 8
         with pytest.raises(ValueError, match="cross_stream_rank"):
             validate_shadow_residual_config(config)
 
     def test_shadow_residual_false_by_default(self):
-        config = GraniteSwitchConfig()
+        config = ShadowResidualConfig()
         assert getattr(config, "shadow_residual", False) is False

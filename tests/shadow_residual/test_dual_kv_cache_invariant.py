@@ -26,7 +26,7 @@ import pytest
 import torch
 from peft import LoraConfig, get_peft_model
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
@@ -46,7 +46,7 @@ from shadow_residual.peft_shadow_residual.stream_gated_lora import (
 
 @pytest.fixture
 def tiny_sr_peft_model():
-    cfg = GraniteSwitchConfig(
+    cfg = ShadowResidualConfig(
         vocab_size=300,
         hidden_size=64,
         intermediate_size=128,
@@ -212,7 +212,7 @@ def test_three_backward_steps_produce_nonzero_lora_grads(tiny_sr_peft_model):
     """Regression for the with-cross grad_norm=0 bug.
 
     Before the gate fix, the final-step ``torch.where(adapter_indices > 0, ...)``
-    routed every token to ``h_base`` (since no GraniteSwitch control
+    routed every token to ``h_base`` (since no control
     tokens fire in unconditional adapter training), severing autograd
     from every LoRA parameter — observed as ``grad_norm = 0`` on the
     Vela ``antonp-answerability-with-cross`` job.

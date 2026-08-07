@@ -29,7 +29,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from peft.tuners.lora.variants import ALoraLinearVariant
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import ShadowResidualForCausalLM
 from shadow_residual.shadow_residual._stream_gated_linear import (
     _StreamGatedLinear,
@@ -71,7 +71,7 @@ def _count_saved(fn, module, x, result, offsets):
 
 
 def _build_alora_sr_model():
-    cfg = GraniteSwitchConfig(
+    cfg = ShadowResidualConfig(
         vocab_size=300, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
         num_attention_heads=4, num_key_value_heads=2, num_adapters=0,
         max_lora_rank=8, switch_head_dim=16,

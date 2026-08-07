@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused→unfused weight transfer for shadow-residual.
 
-The upstream :class:`GraniteMoeHybridForCausalLM` (and the open-source
-GraniteSwitch models built on top of it) keep attention projections fused
-as ``self_attn.qkv_proj`` and the MLP gate/up fused as
+The upstream :class:`GraniteMoeHybridForCausalLM` keeps attention projections
+fused as ``self_attn.qkv_proj`` and the MLP gate/up fused as
 ``shared_mlp.input_linear``. The shadow-residual decoder uses unfused
 ``q_proj`` / ``k_proj`` / ``v_proj`` and ``gate_proj`` / ``up_proj`` so
 that PEFT can install LoRA on each one independently.

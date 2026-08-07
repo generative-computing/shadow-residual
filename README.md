@@ -42,10 +42,8 @@ uv venv --python 3.12
 uv pip install -e ".[train]"     # core + wandb; add [dev] for pytest
 ```
 
-The core train/serve path is fully self-contained. The optional
-`answerability_eval --mode switch/vllm` paths need the open-source
-`granite-switch` package: `uv pip install -e ".[eval-switch]"` (or
-`.[eval-vllm]`).
+The core train/serve path is fully self-contained. No external
+dependencies beyond transformers/peft/trl.
 
 ### Install directly from git
 
@@ -222,8 +220,8 @@ padding-free packing. A 50-row synthetic sample lives at
   fused kernels, so SR is *equivalent* but not bit-identical to a stock
   base+LoRA — a documented, negligible drift for greedy decoding.
 - **Self-contained packaging.** The model's config is vendored as
-  `ShadowResidualConfig` (a thin `GraniteMoeHybridConfig` subclass), so the core
-  train/serve path has no dependency on the granite-switch submodule.
+  `ShadowResidualConfig` (a thin `GraniteMoeHybridConfig` subclass), so the
+  package is fully self-contained.
 
 ## Tests
 

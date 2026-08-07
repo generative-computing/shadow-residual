@@ -23,12 +23,12 @@ An internal walkthrough of the SR module layout, on-disk files, PEFT integration
 
 Shadow-residual (SR) is a per-layer compute graph that maintains **two parallel hidden-state streams** through every attention/MLP block: a frozen *base stream* bit-identical to the unadapted base model (modulo a documented K/V exception), and a trainable *adapter stream* that carries LoRA deltas plus a per-layer rank-R cross-stream injection from the base. There is no final-step merge: after the last layer the adapter stream is normed and projected directly through `lm_head`.
 
-SR lives entirely under `src/granite_switch/experimental/` — nothing in the open-source `granite-switch/` submodule changes. There are two top-level subpackages: `shadow_residual/` (the model) and `peft_shadow_residual/` (the PEFT integration). Training drivers live under `training/`.
+SR lives entirely under `src/shadow_residual/`. There are two top-level subpackages: `shadow_residual/` (the model) and `peft_shadow_residual/` (the PEFT integration). Training drivers live under `training/`.
 
 ### 1.1 Module ↔ file map
 
 ```
-src/granite_switch/experimental/
+src/shadow_residual/
 ├── shadow_residual/                       - the SR model itself (HF backend)
 │   ├── modeling_hf.py                    ShadowResidualModel, ShadowResidualForCausalLM
 │   ├── decoder_hf.py                     ShadowResidualDecoderLayer (dual-stream + early-exit)
@@ -60,7 +60,7 @@ GraniteMoeHybridPreTrainedModel (transformers, upstream)
             │ (inheritance)
             ▼
 ShadowResidualPreTrainedModel
-   config_class = GraniteSwitchConfig
+   config_class = ShadowResidualConfig
             │
             ▼
 ShadowResidualModel ────────────────► ShadowResidualDecoderLayer
@@ -77,7 +77,7 @@ ShadowResidualForCausalLM                          │       q_proj k_proj v_pro
                                                             marker subclass of nn.Linear
 ```
 
-Inheritance (vertical) and containment (horizontal). SR inherits directly from `GraniteMoeHybridPreTrainedModel` — no GraniteSwitch detour. The decoder layer holds attention, MLP projections (all `_StreamGatedLinear`), and a no-op `CrossStream` site that PEFT will later wrap.
+Inheritance (vertical) and containment (horizontal). SR inherits directly from `GraniteMoeHybridPreTrainedModel` — no intermediate routing layers. The decoder layer holds attention, MLP projections (all `_StreamGatedLinear`), and a no-op `CrossStream` site that PEFT will later wrap.
 
 ### 1.3 Per-layer compute graph (dual-stream, cross-stream active)
 
@@ -426,7 +426,7 @@ The defining invariants of Mode B-pre (the "adapters not yet active" regime):
 
 ### 3.5 What pins the contract — the invariant tests
 
-The Mode B-pre invariants are by-construction consequences of the `stream_context` + `ALoraLinearVariant` + `CrossStreamLora` masking, but failure modes (someone moves a `stream_context`, peft changes variant dispatch, K/V LoRA gets retargeted, `task_type` gets dropped) would be silent. `tests/experimental/shadow_residual/test_alora_invocation_invariant.py` pins them with two CPU-only tests using a tiny randomly-initialized `GraniteSwitchConfig`:
+The Mode B-pre invariants are by-construction consequences of the `stream_context` + `ALoraLinearVariant` + `CrossStreamLora` masking, but failure modes (someone moves a `stream_context`, peft changes variant dispatch, K/V LoRA gets retargeted, `task_type` gets dropped) would be silent. `tests/experimental/shadow_residual/test_alora_invocation_invariant.py` pins them with two CPU-only tests using a tiny randomly-initialized `ShadowResidualConfig`:
 
 | Test                                                          | Asserts                                                                                                                                                                                                                                       |
 | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -441,7 +441,7 @@ Both tests run in <5s on CPU with no HF download, no GPU. The `task_type="CAUSAL
 
 ### 4.1 Selection knobs
 
-The trainer (`training/sr_train.py` → `GraniteSwitchTrainingArguments`) takes three boolean flags that map directly to PEFT `target_modules`:
+The trainer (`training/sr_train.py` → `ShadowResidualTrainingArguments`) takes three boolean flags that map directly to PEFT `target_modules`:
 
 | Flag                                          | Adds to target_modules                  | Trainable parameters added                                                                                              |
 | --------------------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -568,4 +568,4 @@ The shapes confirm: `cross_stream` uses the rank-pattern override (R=96, square 
 
 ---
 
-Sources: `src/granite_switch/experimental/shadow_residual/{modeling_hf,decoder_hf,attention_hf,cross_stream,_stream_context,_stream_gated_linear,weight_transfer}.py`, `peft_shadow_residual/{factory,load,cross_stream_lora,stream_gated_lora}.py`, `training/{sr_train,collator,add_labels}.py`, `tests/experimental/shadow_residual/{test_alora_invocation_invariant,test_dual_kv_cache_invariant,test_shadow_residual}.py`, `peft/tuners/lora/variants.py` (ALoraLinearVariant, calculate_alora_offsets, get_alora_offsets_for_forward), `docs/SHADOW_RESIDUAL.md`.
+Sources: `src/shadow_residual/shadow_residual/{modeling_hf,decoder_hf,attention_hf,cross_stream,_stream_context,_stream_gated_linear,weight_transfer}.py`, `peft_shadow_residual/{factory,load,cross_stream_lora,stream_gated_lora}.py`, `training/{sr_train,collator,add_labels}.py`, `tests/experimental/shadow_residual/{test_alora_invocation_invariant,test_dual_kv_cache_invariant,test_shadow_residual}.py`, `peft/tuners/lora/variants.py` (ALoraLinearVariant, calculate_alora_offsets, get_alora_offsets_for_forward), `docs/SHADOW_RESIDUAL.md`.

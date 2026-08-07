@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shadow-residual architecture for Granite Switch (experimental).
+"""Shadow-residual architecture (HF backend).
 
 Two parallel hidden-state streams (base + adapter) routed through a single
 GQA call with doubled query heads.  See

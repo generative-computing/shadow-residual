@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Data collators for GraniteSwitch single-expert training (experimental).
+"""Data collators for shadow-residual single-expert training.
 
 Both collators require a ``labels`` column in the dataset.  The insertion
 point for the control token is derived from the labels: the last

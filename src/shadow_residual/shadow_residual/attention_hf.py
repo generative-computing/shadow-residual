@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shadow-residual attention for Granite Switch (HF backend).
+"""Shadow-residual attention (HF backend).
 
 Maintains two parallel hidden state streams (base and adapter).  The
 projections (``q_proj`` / ``k_proj`` / ``v_proj`` / ``o_proj``) are
@@ -48,7 +48,7 @@ When the model-level gate determines no :class:`CrossStream` site has
 been wrapped (i.e. ``"cross_stream"`` is not in ``target_modules``), the
 SR forward runs the **adapter path only** — base compute is skipped
 entirely.  This is the "LoRA on the SR architecture without
-cross-stream" path: equivalent to plain LoRA on Granite Switch. Only
+cross-stream" path: equivalent to plain LoRA on the SR architecture. Only
 one cache is used in this mode. The ``shared_base_kv`` flag is
 irrelevant here — there is no second stream to share with.
 """
@@ -64,7 +64,7 @@ from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
     eager_attention_forward,
 )
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
 from ._stream_context import stream_context
 from ._stream_gated_linear import _StreamGatedLinear
@@ -78,7 +78,7 @@ class ShadowResidualAttention(nn.Module):
     identical to the unadapted base model.
     """
 
-    def __init__(self, config: GraniteSwitchConfig, layer_idx: int):
+    def __init__(self, config: ShadowResidualConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx

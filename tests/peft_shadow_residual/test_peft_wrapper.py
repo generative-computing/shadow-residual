@@ -24,7 +24,7 @@ import pytest
 import torch
 from peft import LoraConfig, get_peft_model
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
@@ -43,7 +43,7 @@ from shadow_residual.peft_shadow_residual.stream_gated_lora import (
 
 @pytest.fixture
 def tiny_sr_model():
-    cfg = GraniteSwitchConfig(
+    cfg = ShadowResidualConfig(
         vocab_size=300,
         hidden_size=64,
         intermediate_size=128,

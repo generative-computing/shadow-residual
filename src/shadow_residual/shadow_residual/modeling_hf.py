@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shadow-residual modeling classes (HF backend).
 
-Inherits from :class:`GraniteMoeHybridPreTrainedModel` directly. The
-historical inheritance chain went through ``GraniteSwitchModel`` to pick
-up SwitchedLoRA / SingleSwitch scaffolding, but the SR + PEFT training
-path never used any of that — it carried the merge gate
-``torch.where(adapter_indices > 0, h_adapt, h_base)`` purely as
-GraniteSwitch routing baggage, and the gate severed autograd from the
-LoRA delta when no control tokens were in the data. Phase 1 of the
-refactor dropped the gate; this is Phase 2, severing the GraniteSwitch
-inheritance entirely and building the SR model directly on top of the
-upstream HF parent.
+Inherits from :class:`GraniteMoeHybridPreTrainedModel` directly. The SR
+model builds on top of the upstream HF parent with no intermediate
+routing or adapter-switching layers.
 
 Two streams still live inside the decoder layers (``h_base`` frozen,
 ``h_adapt`` trainable, with per-layer cross-stream injection); see
@@ -45,13 +38,13 @@ from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
 # unused `cache_position` kwarg in `create_causal_mask`.
 _TRANSFORMERS_GE_5_9 = _parse_version(transformers.__version__) >= _parse_version("5.9.0")
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
 from .cross_stream import CrossStream
 from .decoder_hf import ShadowResidualDecoderLayer
 
 
-def _is_shadow_residual_enabled(config: GraniteSwitchConfig) -> bool:
+def _is_shadow_residual_enabled(config: ShadowResidualConfig) -> bool:
     return bool(getattr(config, "shadow_residual", False))
 
 
@@ -78,14 +71,9 @@ def _any_cross_stream_wrapped(layers) -> bool:
 
 
 class ShadowResidualPreTrainedModel(GraniteMoeHybridPreTrainedModel):
-    """``PreTrainedModel`` base class for shadow-residual models.
+    """``PreTrainedModel`` base class for shadow-residual models."""
 
-    We keep ``GraniteSwitchConfig`` as the config class for now (its
-    extra fields are harmless when unused, and existing checkpoints
-    round-trip). A dedicated minimal config can come later.
-    """
-
-    config_class = GraniteSwitchConfig
+    config_class = ShadowResidualConfig
     base_model_prefix = "model"
     _no_split_modules = ["ShadowResidualDecoderLayer"]
     _is_stateful = True
@@ -96,12 +84,11 @@ class ShadowResidualModel(ShadowResidualPreTrainedModel):
 
     Constructs ``embed_tokens`` / ``layers`` / ``norm`` / ``rotary_emb``
     directly on top of :class:`GraniteMoeHybridPreTrainedModel`. There
-    is no :class:`SingleSwitch`, no ``adapter_token_ids`` buffer, and
-    no SwitchedLoRA wrappers — those were GraniteSwitch scaffolding the
-    SR + PEFT path never used.
+    is no adapter routing or switching layer — SR uses standard PEFT
+    LoRA with a frozen base stream and cross-stream injection.
     """
 
-    def __init__(self, config: GraniteSwitchConfig):
+    def __init__(self, config: ShadowResidualConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -309,10 +296,7 @@ class ShadowResidualModel(ShadowResidualPreTrainedModel):
             # The base→adapter coupling already happened per-layer via
             # cross_stream(h_base) injection inside each decoder layer
             # (see decoder_hf.py). After the last layer we norm + project
-            # the adapter stream directly. The previous final-step gate
-            # `torch.where(adapter_indices > 0, h_adapt, h_base)` was
-            # vestigial GraniteSwitch routing — see Phase 1 of the SR
-            # refactor.
+            # the adapter stream directly.
             hidden_states = self.norm(h_adapt)
         else:
             # Adapter-only early-exit: no h_base maintained.
@@ -382,9 +366,9 @@ class ShadowResidualModel(ShadowResidualPreTrainedModel):
 class ShadowResidualForCausalLM(ShadowResidualPreTrainedModel, GenerationMixin):
     """Causal-LM head for the shadow-residual model."""
 
-    config_class = GraniteSwitchConfig
+    config_class = ShadowResidualConfig
 
-    def __init__(self, config: GraniteSwitchConfig):
+    def __init__(self, config: ShadowResidualConfig):
         super().__init__(config)
         self.model = ShadowResidualModel(config)
         self.vocab_size = config.vocab_size

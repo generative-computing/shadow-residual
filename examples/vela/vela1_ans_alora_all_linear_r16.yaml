@@ -50,11 +50,11 @@ environmentVariables:
   - name: VARIANT
     value: alora-all-linear-r16-answerability
   - name: DATA_ROOT
-    value: /danieloh_cos/granite-switch/granite-intrinsics-training-data/output/unified_compare/data_v4
+    value: <YOUR_DATA_ROOT>
   - name: EVAL_DATA
-    value: /danieloh_cos/granite-switch/granite-intrinsics-training-data/output/unified_compare/eval_data_v4/evaluation.jsonl
+    value: <YOUR_EVAL_DATA>
   - name: OUTPUT_BASE
-    value: /danieloh_cos/granite-switch/granite-intrinsics-training-data/output/answerability_debug/v4
+    value: <YOUR_OUTPUT_BASE>
 
 imagePullSecrets:
   - name: image-pull-secret-us

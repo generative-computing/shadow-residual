@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Answerability adapter evaluation for Granite models.
 
-Supports four modes:
+Supports two modes:
   --mode base       : Load base model only, no adapter (CPU/MPS/GPU) — baseline comparison
   --mode peft       : Load base model + PEFT LoRA adapter from HuggingFace (CPU/MPS/GPU)
-  --mode switch     : Load granite-switch model via HF backend (CPU/MPS/GPU)
-  --mode switch-vllm: Load granite-switch model via vLLM (GPU only)
 
 The dataset_path directory should contain:
     - collection.txt    (Python list of collection names, one per sample)
@@ -36,15 +34,6 @@ Example usage (PEFT mode — HF adapter from hub):
         --adapter-sub-path answerability/granite-4.0-micro/alora \\
         --dataset-path ./scratch/answerability
 
-Example usage (Granite Switch HF mode — built model, works on CPU/MPS):
-    python eval/answerability/answerability_eval.py --mode switch \\
-        --model-path ./granite-with-all-aloras \\
-        --dataset-path ./scratch/answerability
-
-Example usage (Granite Switch vLLM mode — requires GPU):
-    python eval/answerability/answerability_eval.py --mode switch-vllm \\
-        --model-path ./granite-with-all-aloras \\
-        --dataset-path ./scratch/answerability
 """
 
 import argparse
@@ -405,185 +394,6 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
     return predictions
 
 
-# ---------------------------------------------------------------------------
-# Inference — Granite Switch HF mode (no vLLM, works on CPU/MPS)
-# ---------------------------------------------------------------------------
-
-def run_inference_switch_hf(model_path, all_messages, all_documents,
-                            batch_size, device_str, intrinsic_name="answerability",
-                            max_new_tokens=30):
-    """Run HuggingFace inference with a granite-switch model (baked adapters).
-
-    Loads the model built by granite-switch composer and activates the
-    answerability adapter via intrinsic_name in the chat template.
-    Works on CPU/MPS/CUDA — no vLLM required.
-    """
-    from transformers import AutoTokenizer
-    try:
-        from granite_switch.hf import GraniteSwitchForCausalLM
-    except ImportError as e:
-        raise ImportError(
-            "--mode switch requires the open-source `granite-switch` package "
-            "(GraniteSwitchForCausalLM). Install it with: "
-            "pip install 'shadow-residual[eval-switch]'. The default --mode peft "
-            "path is fully standalone and does not need granite-switch."
-        ) from e
-
-    # Resolve device
-    if device_str == "auto":
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-    else:
-        device = device_str
-    dtype = torch.float32 if device == "cpu" else torch.float16
-    print(f"\nDevice: {device}, dtype: {dtype}")
-
-    print(f"Loading tokenizer from: {model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    print(f"Loading granite-switch model from: {model_path}")
-    model = GraniteSwitchForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=dtype,
-        device_map=device if device == "cuda" else None,
-    )
-    if device in ("cpu", "mps"):
-        model = model.to(device)
-    model.eval()
-
-    # Build prompts — chat template has intrinsic_name support baked in
-    print(f"Formatting {len(all_messages)} prompts...")
-    prompts = []
-    for messages, documents in zip(all_messages, all_documents):
-        doc_dicts = [{"text": d} for d in documents] if documents else []
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            adapter_name=intrinsic_name,
-            documents=doc_dicts,
-        )
-        prompts.append(prompt)
-
-    # Generate in batches
-    print(f"Running inference ({len(prompts)} samples, batch_size={batch_size})...")
-    predictions = []
-    start = time.time()
-
-    for batch_start in range(0, len(prompts), batch_size):
-        batch_end = min(batch_start + batch_size, len(prompts))
-        batch_prompts = prompts[batch_start:batch_end]
-
-        inputs = tokenizer(
-            batch_prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=4096,
-        ).to(model.device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                eos_token_id=_eos_token_ids(tokenizer),
-                pad_token_id=tokenizer.pad_token_id,
-            )
-
-        for i, output in enumerate(outputs):
-            input_len = inputs["input_ids"][i].shape[0]
-            generated = output[input_len:]
-            text = tokenizer.decode(generated, skip_special_tokens=True).strip()
-            predictions.append(text)
-
-        done = batch_end
-        elapsed = time.time() - start
-        rate = done / elapsed if elapsed > 0 else 0
-        print(f"  [{done}/{len(prompts)}] {rate:.1f} samples/s", end="\r")
-
-    elapsed = time.time() - start
-    print(f"\nInference complete in {elapsed:.1f}s ({len(prompts) / elapsed:.1f} samples/s)")
-    return predictions
-
-
-# ---------------------------------------------------------------------------
-# Inference — Granite Switch vLLM mode (requires GPU)
-# ---------------------------------------------------------------------------
-
-def run_inference_switch_vllm(model_path, all_messages, all_documents, gpu_mem, tp_size,
-                              intrinsic_name="answerability", batch_size=0):
-    """Run vLLM inference on all samples using the answerability adapter."""
-    from vllm import LLM, SamplingParams
-    try:
-        from granite_switch.vllm import register
-    except ImportError as e:
-        raise ImportError(
-            "--mode vllm requires the open-source `granite-switch` package and vLLM. "
-            "Install with: pip install 'shadow-residual[eval-vllm]'. The default "
-            "--mode peft path is fully standalone and does not need granite-switch."
-        ) from e
-
-    register()
-
-    print(f"\nLoading model from: {model_path}")
-    max_model_len = int(os.environ.get("MAX_MODEL_LEN", "0")) or None
-    llm = LLM(
-        model=model_path,
-        dtype="auto",
-        gpu_memory_utilization=gpu_mem,
-        tensor_parallel_size=tp_size,
-        trust_remote_code=True,
-        enforce_eager=True,
-        max_model_len=max_model_len,
-    )
-    tokenizer = llm.get_tokenizer()
-
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=6, top_p=1.0)
-
-    print(f"Formatting {len(all_messages)} prompts...")
-    prompts = []
-    for messages, documents in zip(all_messages, all_documents):
-        doc_dicts = [{"text": d} for d in documents] if documents else []
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            adapter_name=intrinsic_name,
-            documents=doc_dicts,
-        )
-        prompts.append(prompt)
-
-    print(f"Running inference on {len(prompts)} prompts...")
-    start = time.time()
-
-    if batch_size > 0:
-        # Process in explicit batches to control vLLM's internal batching
-        predictions = []
-        for batch_start in range(0, len(prompts), batch_size):
-            batch_end = min(batch_start + batch_size, len(prompts))
-            batch_outputs = llm.generate(prompts[batch_start:batch_end], sampling_params)
-            predictions.extend([o.outputs[0].text.strip() for o in batch_outputs])
-            done = batch_end
-            elapsed = time.time() - start
-            rate = done / elapsed if elapsed > 0 else 0
-            print(f"  [{done}/{len(prompts)}] {rate:.1f} samples/s", end="\r")
-        elapsed = time.time() - start
-        print(f"\nInference complete in {elapsed:.1f}s ({len(prompts) / elapsed:.1f} samples/s)")
-        return predictions
-    else:
-        # Default: send all prompts at once, let vLLM batch internally
-        outputs = llm.generate(prompts, sampling_params)
-        elapsed = time.time() - start
-        print(f"Inference complete in {elapsed:.1f}s ({len(prompts) / elapsed:.1f} samples/s)")
-        return [output.outputs[0].text.strip() for output in outputs]
-
 
 # ---------------------------------------------------------------------------
 # Evaluation metrics
@@ -801,16 +611,14 @@ def save_results(metrics, result_df, output_path, model_display):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Answerability evaluation for Granite models (PEFT, Switch-HF, or Switch-vLLM)"
+        description="Answerability evaluation for Granite models (base or PEFT)"
     )
     parser.add_argument(
-        "--mode", type=str, choices=["base", "peft", "switch", "switch-vllm"],
-        default="switch",
+        "--mode", type=str, choices=["base", "peft"],
+        default="peft",
         help="Inference mode: "
              "'base' = base model only (no adapter, baseline), "
-             "'peft' = base model + HF PEFT LoRA adapter, "
-             "'switch' = granite-switch model via HF (CPU/MPS/CUDA), "
-             "'switch-vllm' = granite-switch model via vLLM (CUDA only)",
+             "'peft' = base model + HF PEFT LoRA adapter",
     )
 
     # Base / PEFT mode arguments
@@ -830,34 +638,14 @@ def main():
         help="[peft] Sub-directory within --adapter-path for the specific adapter",
     )
 
-    # Shared HF arguments (peft + switch modes)
+    # Shared HF arguments
     parser.add_argument(
         "--batch-size", type=int, default=4,
-        help="[peft/switch] Batch size for HF inference",
+        help="[base/peft] Batch size for HF inference",
     )
     parser.add_argument(
         "--device", type=str, default="auto",
-        help="[peft/switch] Device: 'auto', 'cpu', 'mps', or 'cuda'",
-    )
-
-    # Model path (switch + switch-vllm modes)
-    parser.add_argument(
-        "--model-path", type=str, default="./granite-with-all-aloras",
-        help="[switch/switch-vllm] Path to the granite-switch model directory",
-    )
-    parser.add_argument(
-        "--intrinsic-name", type=str, default="answerability",
-        help="[switch/switch-vllm] Intrinsic name to activate in the chat template",
-    )
-
-    # vLLM-only arguments
-    parser.add_argument(
-        "--gpu-memory-utilization", type=float, default=0.9,
-        help="[switch-vllm] vLLM GPU memory utilization fraction",
-    )
-    parser.add_argument(
-        "--tensor-parallel-size", type=int, default=1,
-        help="[switch-vllm] vLLM tensor parallel size",
+        help="[base/peft] Device: 'auto', 'cpu', 'mps', or 'cuda'",
     )
 
     parser.add_argument(
@@ -902,7 +690,7 @@ def main():
     if args.mode == "base":
         print(f"Base model: {args.base_model}")
         model_display = args.base_model.split("/")[-1] + " (base, no adapter)"
-    elif args.mode == "peft":
+    else:  # peft
         # Resolve adapter path (handle HF repo with sub-path)
         from huggingface_hub import snapshot_download
         if os.path.isdir(args.adapter_path):
@@ -917,9 +705,6 @@ def main():
         print(f"Base model:  {args.base_model}")
         print(f"Adapter:     {adapter_local}")
         model_display = args.base_model.split("/")[-1] + " + aLoRA"
-    else:
-        print(f"Model: {args.model_path}")
-        model_display = os.path.basename(args.model_path.rstrip("/")) + " (Granite Switch)"
 
     # Load data
     print("\n" + "=" * 80)
@@ -945,24 +730,13 @@ def main():
             enable_thinking=args.enable_thinking,
             max_new_tokens=args.max_new_tokens,
         )
-    elif args.mode == "peft":
+    else:  # peft
         raw_predictions = run_inference_peft(
             args.base_model, adapter_local,
             all_messages, all_documents,
             args.batch_size, args.device,
             enable_thinking=args.enable_thinking,
             max_new_tokens=args.max_new_tokens,
-        )
-    elif args.mode == "switch":
-        raw_predictions = run_inference_switch_hf(
-            args.model_path, all_messages, all_documents,
-            args.batch_size, args.device, args.intrinsic_name,
-        )
-    else:  # switch-vllm
-        raw_predictions = run_inference_switch_vllm(
-            args.model_path, all_messages, all_documents,
-            args.gpu_memory_utilization, args.tensor_parallel_size,
-            args.intrinsic_name, args.batch_size,
         )
 
     # Process predictions

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shadow-residual decoder layer for Granite Switch (HF backend).
+"""Shadow-residual decoder layer (HF backend).
 
 Maintains two parallel hidden state streams (base and adapter):
 
@@ -32,7 +32,7 @@ Adapter-only early-exit
 When the model-level gate determines no :class:`CrossStream` site has
 been wrapped, the SR forward runs the **adapter path only** — no base
 stream is computed. This is the "LoRA-on-SR-architecture without
-cross-stream" mode and reduces to plain LoRA on Granite Switch.
+cross-stream" mode and reduces to plain LoRA on the SR architecture.
 """
 
 from typing import Optional, Tuple
@@ -45,7 +45,7 @@ from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
     GraniteMoeHybridRMSNorm,
 )
 
-from shadow_residual.shadow_residual.model_config import ShadowResidualConfig as GraniteSwitchConfig
+from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
 from ._stream_context import offset_recovery_enabled, stream_context
 from ._stream_gated_linear import _StreamGatedLinear
@@ -61,7 +61,7 @@ class ShadowResidualMLP(nn.Module):
     in the base stream context and active in the adapter stream context.
     """
 
-    def __init__(self, config: GraniteSwitchConfig):
+    def __init__(self, config: ShadowResidualConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -91,7 +91,7 @@ class ShadowResidualDecoderLayer(nn.Module):
     active on the recompute pass too). That avoids PEFT's hook/guard entirely.
     """
 
-    def __init__(self, config: GraniteSwitchConfig, layer_idx: int):
+    def __init__(self, config: ShadowResidualConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.residual_multiplier = config.residual_multiplier
