@@ -109,7 +109,18 @@ class _FakeFsdpModel:
 
 
 class _FakePlainModel:
-    """A plain model — should not be detected as FSDP-wrapped."""
+    """A plain model — should not be detected as FSDP-wrapped.
+
+    Provides the no-op inference-prep methods the post-training generation path
+    calls (``eval`` / ``gradient_checkpointing_disable``) so the dispatch test
+    exercises the real code path; real PreTrainedModels have both.
+    """
+
+    def eval(self):
+        return self
+
+    def gradient_checkpointing_disable(self):
+        return None
 
 
 def test_dispatch_calls_run_generation_under_fsdp_when_wrapped(

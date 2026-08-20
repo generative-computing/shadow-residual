@@ -5,9 +5,11 @@ Usage:
     python -m shadow_residual.training.train --config path/to/config.yaml [overrides]
 
 The YAML is required. Named CLI flags override matching YAML fields. The
-training behavior is determined by which YAML fields are set rather than
-by an explicit architecture name — notably `adapter.invocation_tokens`
-gates the adapter on a token sequence (aLoRA-style) when set.
+adapter is always active (plain LoRA, no gated activation). Two optional
+adapter fields shape the training data/labels and are recorded into the saved
+adapter_config.json: `adapter.last_context_token` (the final context token;
+the supervised region must start right after it — validated) and
+`adapter.last_token` (end-of-completion marker; appended to rows that lack it).
 """
 
 from __future__ import annotations
@@ -210,6 +212,13 @@ def _run_post_training_generation(
         "Running post-training generation: input=%s out=%s",
         cfg.generation.input_path, gen_out,
     )
+    # Disable gradient checkpointing before generation. Checkpointing is a
+    # training-only memory optimization; leaving it on for generate() is
+    # wasteful (forward-without-backward gains nothing from recompute). Also
+    # switch to eval mode so no checkpointing path is taken regardless.
+    if hasattr(trainer.model, "gradient_checkpointing_disable"):
+        trainer.model.gradient_checkpointing_disable()
+    trainer.model.eval()
     generate_mod.run_generation(
         model=trainer.model,
         tokenizer=tokenizer,
@@ -261,8 +270,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_training_config(args.config)
     apply_cli_overrides(cfg, args)
 
-    activation_mode = "gated" if cfg.adapter.invocation_tokens else "unconditional"
-    logger.info("Adapter activation: %s", activation_mode)
+    logger.info("Adapter activation: unconditional (always active)")
     logger.info("Base model:   %s", cfg.model.base)
     logger.info("Train data:   %s", cfg.data.train_path)
     logger.info("Val data:     %s", cfg.data.val_path)
@@ -273,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
     from transformers import AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
-    from shadow_residual.peft_shadow_residual import (
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
@@ -281,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         DebugPrintingCollator,
         ResponseOnlyCollator,
         load_jsonl_dataset,
-        validate_invocation_tokens_present,
+        validate_last_context_token_boundary,
     )
 
     # 1. Tokenizer
@@ -290,16 +298,28 @@ def main(argv: list[str] | None = None) -> int:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
 
-    # 2. Adapter invocation token IDs (if gated activation is requested)
-    invocation_ids = None
-    if cfg.adapter.invocation_tokens is not None:
-        invocation_ids = tok.encode(cfg.adapter.invocation_tokens, add_special_tokens=False)
-        logger.info("Invocation tokens: %s -> %s", cfg.adapter.invocation_tokens, invocation_ids)
+    # 2. Resolve the two optional single-token markers (each must encode to
+    # exactly one token id). They shape the data/labels and are recorded into
+    # the saved adapter_config.json; they do NOT gate the (always-active) adapter.
+    def _resolve_single_token(field_value: str | None, field_name: str) -> int | None:
+        if field_value is None:
+            return None
+        ids = tok.encode(field_value, add_special_tokens=False)
+        if len(ids) != 1:
+            raise ValueError(
+                f"adapter.{field_name} {field_value!r} must encode to exactly one "
+                f"token id for this tokenizer, got {ids}."
+            )
+        logger.info("%s: %r -> %d", field_name, field_value, ids[0])
+        return ids[0]
 
-    # 3. PEFT config (+ invocation tokens if gated activation)
+    last_context_token_id = _resolve_single_token(
+        cfg.adapter.last_context_token, "last_context_token"
+    )
+    last_token_id = _resolve_single_token(cfg.adapter.last_token, "last_token")
+
+    # 3. PEFT config (stock LoRA — no gated/aLoRA activation).
     peft_config = to_peft_config(cfg)
-    if invocation_ids is not None:
-        peft_config.alora_invocation_tokens = invocation_ids
 
     # 4. Model — built via the shadow-residual PEFT factory.
     # param_dtype selects how the model is materialized. "bf16" (legacy
@@ -319,53 +339,61 @@ def main(argv: list[str] | None = None) -> int:
         lora_config=peft_config,
         torch_dtype=model_dtype,
         attn_implementation=cfg.model.attn_implementation,
-        shared_base_kv=cfg.model.shared_base_kv,
     )
     model.print_trainable_parameters()
 
-    # 4a. Activation checkpointing for gated SR models.
-    # Gated adapters (invocation_tokens set) force HF gradient_checkpointing
-    # off in the config to dodge PEFT #2826 — but that incompatibility is
-    # specific to the REENTRANT checkpoint path. The non-reentrant path runs
-    # clean through ShadowResidualModel._gradient_checkpointing_func, so we
-    # enable it explicitly here. Without this, a 30B SR/aLoRA forward keeps
+    # 4a. Activation checkpointing.
+    # The SR decoder is a GradientCheckpointingLayer; HF non-reentrant gradient
+    # checkpointing drives it via __call__. Without this, a large SR forward keeps
     # all unsharded activations (FSDP shards params/grads/optimizer, NOT
-    # activations) and OOMs in backward at 4096 tokens. enable_input_require_grads
-    # is required so the checkpointed inputs carry grad (else "element 0 does
-    # not require grad"). This is the single source of activation checkpointing;
-    # the accelerate fsdp_activation_checkpointing flag is left off to avoid
-    # double-wrapping with the broken reentrant external wrap.
-    if cfg.adapter.invocation_tokens is not None and not getattr(args, "no_grad_checkpoint", False):
+    # activations) and OOMs in backward. enable_input_require_grads is required so
+    # the checkpointed inputs carry grad. cfg.batch.gradient_checkpointing is the
+    # single source of truth (default True); --no-grad-checkpoint is a diagnostic
+    # override. The adapter is plain LoRA (no aLoRA offset hooks), so gradient
+    # checkpointing is compatible with mid-training eval — no eval force-off.
+    gradient_checkpointing_on = (
+        cfg.batch.gradient_checkpointing
+        and not getattr(args, "no_grad_checkpoint", False)
+    )
+    if gradient_checkpointing_on:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
         model.enable_input_require_grads()
         logger.info(
             "Activation checkpointing: enabled non-reentrant gradient "
-            "checkpointing for gated SR model (use_reentrant=False)."
+            "checkpointing (use_reentrant=False)."
         )
-    elif getattr(args, "no_grad_checkpoint", False):
+    else:
         logger.info(
-            "Activation checkpointing DISABLED via --no-grad-checkpoint "
-            "(diagnostic; only safe when activations fit memory, e.g. 3B/DDP)."
+            "Activation checkpointing DISABLED (cfg.batch.gradient_checkpointing=%s, "
+            "--no-grad-checkpoint=%s). Only safe when activations fit memory.",
+            cfg.batch.gradient_checkpointing, getattr(args, "no_grad_checkpoint", False),
         )
 
-    # 5. Datasets
-    train_ds = load_jsonl_dataset(cfg.data.train_path, tok, enable_thinking=cfg.data.enable_thinking)
-    val_ds = load_jsonl_dataset(cfg.data.val_path, tok, enable_thinking=cfg.data.enable_thinking)
+    # 5. Datasets. last_token (when set) is appended to rows that don't already
+    # end with it — done at the text level so both masking paths inherit it.
+    train_ds = load_jsonl_dataset(
+        cfg.data.train_path, tok,
+        enable_thinking=cfg.data.enable_thinking,
+        last_token=cfg.adapter.last_token,
+    )
+    val_ds = load_jsonl_dataset(
+        cfg.data.val_path, tok,
+        enable_thinking=cfg.data.enable_thinking,
+        last_token=cfg.adapter.last_token,
+    )
     logger.info("Train rows: %d, Val rows: %d", len(train_ds), len(val_ds))
-
-    # 5a. Gated-activation sanity check — fail loudly if invocation tokens
-    # aren't in the data. Without this the adapter never activates and
-    # training silently learns nothing useful.
-    if invocation_ids is not None:
-        validate_invocation_tokens_present(train_ds, tok, invocation_ids)
 
     # 6. SFTConfig — start from to_training_arguments, add SFT-specific keys
     ta = to_training_arguments(cfg)
     sft_kwargs = {k: v for k, v in vars(ta).items() if not k.startswith("_")}
     sft_kwargs["max_length"] = cfg.data.max_length
     sft_kwargs["packing"] = cfg.trainer.packing
+    # Checkpointing is managed manually above (model.gradient_checkpointing_enable
+    # with use_reentrant=False + enable_input_require_grads). Keep the Trainer's
+    # own flag OFF so it doesn't re-enable it with default kwargs / double-wrap.
+    sft_kwargs["gradient_checkpointing"] = False
 
     # 6a. Response-only label masking strategy.
     # Preferred: TRL's `assistant_only_loss=True` (driven by `{% generation %}`
@@ -406,6 +434,16 @@ def main(argv: list[str] | None = None) -> int:
         callbacks=build_callbacks(cfg),
     )
 
+    # 7a. last_context_token boundary check — fail loudly unless the supervised
+    # region (labels != -100) starts immediately after last_context_token. Run
+    # against trainer.data_collator (the REAL collator TRL settled on), so it
+    # covers both masking paths uniformly: the assistant_only_loss path (where
+    # TRL owns masking — we can only validate) and our ResponseOnlyCollator.
+    if cfg.adapter.last_context_token is not None:
+        validate_last_context_token_boundary(
+            train_ds, tok, trainer.data_collator, cfg.adapter.last_context_token,
+        )
+
     # Optional: wrap whatever collator SFTTrainer ended up with so we
     # periodically log a decoded example + its labels. Covers both the
     # assistant_only_loss path (TRL-internal collator) and the
@@ -444,6 +482,33 @@ def main(argv: list[str] | None = None) -> int:
                 "non-consolidated save. A fresh generate process can't load this. "
                 "Set fsdp_state_dict_type: FULL_STATE_DICT in the accelerate config "
                 "(src/shadow_residual/config/accelerate/fsdp_4gpu.yaml) so the FSDP save consolidates."
+            )
+
+        # Record the two SR markers into the saved adapter_config.json as extra
+        # keys (stock LoraConfig doesn't serialize them). They're metadata for
+        # downstream tooling/serving — the string form (portable across
+        # tokenizers) plus the resolved id for the training tokenizer. Stock
+        # PeftConfig.from_pretrained tolerates unknown keys, so this doesn't
+        # break reload.
+        adapter_cfg_path = out / "adapter_config.json"
+        if adapter_cfg_path.exists() and (
+            cfg.adapter.last_context_token is not None
+            or cfg.adapter.last_token is not None
+        ):
+            import json as _json
+            with adapter_cfg_path.open("r") as f:
+                adapter_cfg = _json.load(f)
+            if cfg.adapter.last_context_token is not None:
+                adapter_cfg["last_context_token"] = cfg.adapter.last_context_token
+                adapter_cfg["last_context_token_id"] = last_context_token_id
+            if cfg.adapter.last_token is not None:
+                adapter_cfg["last_token"] = cfg.adapter.last_token
+                adapter_cfg["last_token_id"] = last_token_id
+            with adapter_cfg_path.open("w") as f:
+                _json.dump(adapter_cfg, f, indent=2)
+            logger.info(
+                "Patched adapter_config.json with last_context_token=%r last_token=%r.",
+                cfg.adapter.last_context_token, cfg.adapter.last_token,
             )
 
     # 9. Post-training generation, gated on the generation block being present.

@@ -9,15 +9,16 @@ the LM head.
 
 Subpackages:
 
-- :mod:`shadow_residual.peft_shadow_residual` — PEFT-based SR factory
-  (:func:`~shadow_residual.peft_shadow_residual.get_shadow_residual_peft_model`)
-  and loader
-  (:func:`~shadow_residual.peft_shadow_residual.load_shadow_residual_peft_model`).
-  Canonical entry points for training and serving.
 - :mod:`shadow_residual.shadow_residual` — the SR HF model
-  (:class:`ShadowResidualForCausalLM`) the PEFT factory builds on.
+  (:class:`ShadowResidualForCausalLM`). Runs standalone as a causal LM and is
+  adaptable with 100% stock ``peft`` (plain ``LoraConfig`` + ``get_peft_model``).
+  For serving, build a base with
+  :func:`~shadow_residual.shadow_residual.build.build_sr_base` and attach a
+  saved adapter with stock :func:`peft.PeftModel.from_pretrained`.
 - :mod:`shadow_residual.training` — the unified YAML-driven training driver
-  (HF ``Trainer`` + collators + adapter export).
+  (HF ``Trainer`` + collators + adapter export). Includes
+  :func:`~shadow_residual.training.factory.get_shadow_residual_peft_model`, the
+  FSDP-aware training factory that meta-inits + PEFT-wraps the SR model.
 - :mod:`shadow_residual.config` — the unified training-config schema
   (:class:`TrainingConfig`, :func:`load_training_config`).
 """

@@ -1,44 +1,48 @@
 # CLAUDE.md — working with Shadow Residual
 
-Guidance for Claude agents operating in this repo. It covers what SR is, how the
-code is laid out, and the exact flows for **training** and **serving** SR
-adapters. Read [`docs/sr_architecture_explainer.md`](docs/sr_architecture_explainer.md)
-for the deep dive; this file is the operational summary.
+Operational guide for Claude agents in this repo. Read
+[`docs/sr_architecture_explainer.md`](docs/sr_architecture_explainer.md) for the
+deep dive.
 
-## What SR is (in one paragraph)
+## What SR is
 
 Shadow Residual runs two parallel streams per decoder layer: a **frozen base
-stream** (bit-exact with the unadapted base — Q/K/V/O/MLP are the base weights,
-no delta) and a **trainable adapter stream** (LoRA deltas + a per-layer rank-R
-`cross_stream` injection from the base). Only `norm(h_adapt)` reaches the LM
-head. It's a PEFT adapter under the hood; SR just needs two custom PEFT module
-types and a dedicated loader.
+stream** (bit-exact with the unadapted base) and a **trainable adapter stream**
+(LoRA deltas + a per-layer rank-R `cross_stream` injection from the base). Only
+`norm(h_adapt)` reaches the LM head. It's a PEFT adapter using **100% stock**
+`peft` LoRA — no custom LoRA classes and no `_register_custom_module`. The
+`cross_stream` site is a real frozen zero-init `nn.Linear` that stock
+`lora.Linear` wraps like any other target. The adapter is plain LoRA and
+**always active** — the delta fires on every position (no gated/aLoRA activation).
+
+**Single topology: shared base-only K/V.** K and V are computed once from the
+base stream and shared with both streams' Q; there is one KV cache. LoRA on
+`k_proj` / `v_proj` is forbidden (rejected at build time — no place for a K/V
+delta to land). There is no disjoint-K/V mode and no plain-LoRA-on-SR mode.
 
 ## Repo layout
 
 ```
 src/shadow_residual/
 ├── shadow_residual/        # the HF model
-│   ├── modeling_hf.py          ShadowResidualModel / ShadowResidualForCausalLM
-│   ├── decoder_hf.py           dual-stream + single-stream early-exit
-│   ├── attention_hf.py         disjoint vs shared-base K/V
-│   ├── cross_stream.py         no-op site PEFT wraps into CrossStreamLora
-│   ├── model_config.py         VENDORED ShadowResidualConfig (GraniteMoeHybridConfig subclass)
-│   ├── config_helpers.py       validate_shadow_residual_config / set_shadow_residual
-│   └── weight_transfer.py      fused→unfused QKV / gate-up slicing
-├── peft_shadow_residual/   # PEFT integration
-│   ├── factory.py              get_shadow_residual_peft_model + _build_sr_base (TRAINING)
-│   ├── load.py                 load_shadow_residual_peft_model (SERVING)
-│   ├── cross_stream_lora.py    CrossStreamLora (rank-R B·A, no base contribution)
-│   └── stream_gated_lora.py    ShadowResidualLora (LoRA gated off in base stream)
-├── config/                 # unified training-config schema + reference YAMLs
-│   ├── training_config.py      Pydantic schema; DataConfig.enable_thinking lives here
-│   ├── adapters.py             to_peft_config / to_training_arguments / build_callbacks
-│   └── *.yaml                  lora / alora / sr reference configs (+ schema/, accelerate/)
-├── training/               # train.py, generate.py, data.py, collator.py, add_labels.py, pack_stats.py
-└── eval/answerability_eval.py  # standalone peft-based answerability evaluation
-tests/                      # mirrors src; run with pytest (CPU-only cases pass without a GPU)
-examples/vela/              # Vela job YAMLs (fill placeholders before submitting)
+│   ├── modeling_hf.py          ShadowResidualModel / ForCausalLM; dual-stream vs bare gate
+│   ├── decoder_hf.py           GradientCheckpointingLayer; dual-stream forward + forward_bare
+│   ├── attention_hf.py         shared-base-K/V attention (+ forward_bare)
+│   ├── cross_stream.py         frozen zero-init nn.Linear cross-stream site
+│   ├── model_config.py         vendored ShadowResidualConfig
+│   ├── config_helpers.py       validate / set_shadow_residual
+│   ├── build.py                SR config/model construction + RoPE reinit (no PEFT)
+│   ├── weight_transfer.py      fused→unfused QKV / gate-up slicing
+│   └── _stream_gated_linear.py   _StreamGatedLinear marker + _base_only helper
+│                           #   (100% stock PEFT-adaptable — no custom LoRA classes; the
+│                           #    publishable HF model, needs nothing from training/)
+├── config/                 # training_config.py schema, adapters.py, reference *.yaml
+├── training/               # train.py, generate.py, data.py, collator.py, add_labels.py,
+│   │                       #   pack_stats.py, chat_render.py, README.md
+│   └── factory.py          get_shadow_residual_peft_model: FSDP meta-init/materialize + PEFT-wrap
+└── eval/                   # answerability_eval.py (standalone --mode peft eval)
+tests/                      # run with pytest (CPU-only cases pass without a GPU)
+examples/vela/              # Vela job YAMLs
 ```
 
 ## Install
@@ -48,116 +52,85 @@ uv venv --python 3.12
 uv pip install -e ".[train]"      # add [dev] for pytest
 ```
 
-Fully self-contained — no external model-serving dependency on the train/serve path.
-
 ## Training
 
 Entry point: `sr-train` (== `python -m shadow_residual.training.train`), YAML-driven.
 
 ```bash
-# local, single GPU
+# single GPU
 sr-train --config src/shadow_residual/config/sr-qo-mlp-r32-c32-sharedkv.yaml \
          --train-data /data/train.jsonl --val-data /data/eval.jsonl --output-dir ./ckpt
 
-# multi-GPU (DDP)
-accelerate launch --num_processes 4 --multi_gpu --mixed_precision bf16 \
-  -m shadow_residual.training.train --config <cfg>.yaml \
+# multi-GPU (FSDP)
+accelerate launch --config_file src/shadow_residual/config/accelerate/fsdp_4gpu.yaml \
+  --num_processes 8 -m shadow_residual.training.train --config <cfg>.yaml \
   --train-data … --val-data … --output-dir ./ckpt
 ```
 
-What determines behavior (no architecture name — it's all fields):
-- **`"cross_stream"` in `adapter.target_modules`** → dual-stream SR forward
-  engages. Omit it → single-stream early-exit (≈ plain LoRA on Granite).
-- **`adapter.invocation_tokens` set** → aLoRA-style gated activation (delta off
-  until the token sequence appears). Requires `task_type="CAUSAL_LM"` (the schema
-  sets it). Gated runs force HF gradient_checkpointing off (PEFT #2826); train.py
-  re-enables non-reentrant checkpointing explicitly for gated SR.
-- **`model.shared_base_kv`** → one base-only K/V cache shared with the adapter's
-  Q (`true`); **forbids LoRA on k_proj/v_proj** (rejected at build time).
-  **Default is auto** (leave the key unset / `None`): resolved at build time by
-  `resolve_shared_base_kv` from `adapter.target_modules` — `true` when
-  `"cross_stream"` is present (the SR production default), `false` otherwise
-  (plain LoRA/aLoRA → K/V computed on the adapter stream; a **warning is
-  logged**). An explicit `true`/`false` always wins. The flag is **not
-  serialized** into `adapter_config.json`, so an SR checkpoint trained with a
-  non-default value must be loaded by passing the same value explicitly to
-  `load_shadow_residual_peft_model`. Note the "weak SR" ablation (shared K/V with
-  `cross_stream` absent) is still reachable, but only by explicitly setting
-  `shared_base_kv: true` on a no-cross_stream config.
+Config essentials:
+- **`"cross_stream"` in `adapter.target_modules`** engages the dual-stream SR
+  forward. Do NOT list `k_proj` / `v_proj` (K/V LoRA is rejected).
+- **`adapter.last_context_token`** (optional, single token) → train.py validates
+  that the supervised region (`labels != -100`) starts immediately after it, and
+  records it into the saved `adapter_config.json`. Does NOT gate the adapter.
+- **`adapter.last_token`** (optional, single token) → end-of-completion marker;
+  train.py appends it to any row that doesn't already end with it, and records it
+  into `adapter_config.json`.
 - **`data.enable_thinking` / `--thinking`** → forwarded to
   `apply_chat_template(enable_thinking=...)`. CLI wins over YAML. Default False.
 
-Vela: use the YAMLs in `examples/vela/`. They clone this repo in-pod, `pip install -e
-".[train]"`, then `accelerate launch` the trainer against COS-mounted data.
-**Pin `trl<1.7`** (already in pyproject) — TRL 1.7 crashes on Granite configs
-(`config.num_experts`). The Vela image ships torch 2.6 + CUDA 12.4. `eval_loss:
-nan` per epoch is expected for prompt-only eval rows. Placeholders (`<changeme>`,
-`<YOUR_GIT_HOST>`) MUST be filled (or use a k8s Secret) before submitting.
+**How checkpointing works.** The decoder layer is a `GradientCheckpointingLayer`
+with a single stacked-tensor (`[2,B,S,H]`) dual-stream forward and a pure
+`base_layer(x)` base-stream gate. Under HF gradient checkpointing the dual-stream
+forward is pure, so recompute is exact — no manual checkpointing or custom
+recompute-stable variant. The adapter is plain LoRA (no aLoRA offset hooks), so
+**mid-training eval is compatible** with gradient checkpointing.
+
+Vela: use the YAMLs in `examples/vela/`. Pin `trl<1.7` (already in pyproject).
+`eval_loss: nan` per epoch is expected for prompt-only eval rows.
 
 ## Serving / evaluation
 
-Load through the SR loader — **not** `PeftModel.from_pretrained` directly, which
-can't re-register SR's custom modules:
+No custom loader — build an SR base, then attach the adapter with stock PEFT:
 
 ```python
-from shadow_residual.peft_shadow_residual import load_shadow_residual_peft_model
-model = load_shadow_residual_peft_model(base_id, adapter_path,
-                                        torch_dtype=..., shared_base_kv=<same as training>)
+from shadow_residual.shadow_residual.build import build_sr_base
+from peft import PeftModel
+base = build_sr_base(base_id, torch_dtype=...)
+model = PeftModel.from_pretrained(base, adapter_path)
 ```
-
-`shared_base_kv` is not serialized in `adapter_config.json`. Leaving it unset
-auto-resolves from the checkpoint's `target_modules` (shared when `cross_stream`
-is present, else disjoint), which is correct for any checkpoint trained with the
-auto-default. A checkpoint trained with a **non-default** value must pass the same
-value explicitly at load time.
 
 Answerability eval: `python -m shadow_residual.eval.answerability_eval --mode peft
 --base-model <id> --adapter <path> …`.
 
 ## Invariants — do not break these
 
-1. **Frozen base stream.** Never let a LoRA delta reach a `stream_context("base")`
-   call. `merge_and_unload` is disabled on purpose (it would fold the delta into
-   the base linear).
-2. **Disjoint vs shared K/V.** Disjoint = two caches; shared = one base-only
-   cache, no K/V LoRA. Shared is the auto-default when `"cross_stream"` is in
-   `target_modules`; disjoint/adapter-K/V is the auto-default (with a warning)
-   for plain LoRA/aLoRA — see `resolve_shared_base_kv`. The
-   `test_dual_kv_cache_invariant.py` tests pin the disjoint behavior.
-3. **ALORA three-knob rule.** `alora_invocation_tokens` + `task_type="CAUSAL_LM"`
-   + `"cross_stream"` must all be set for gated SR; missing any one silently
-   degrades to unconditional LoRA. `test_alora_invocation_invariant.py` pins the
-   pre-invocation logits/KV equality.
+1. **Frozen base stream.** The base stream runs on `base_layer` (raw frozen
+   weights, no LoRA delta), so it is bit-identical to the unadapted base. Never
+   let a delta reach it. `merge_and_unload` is disabled on purpose.
+2. **Shared base-only K/V.** One cache, K/V computed once from the base stream;
+   K/V LoRA rejected at build time.
+3. **Bare model == unadapted base.** With no adapter attached (or under a
+   top-level `disable_adapter()`), the model runs the single-stream `forward_bare`
+   path and produces base-identical logits.
 
 ## Testing
 
 ```bash
-pytest                    # 134 tests; CPU-only invariant/config/data cases run without a GPU
-pytest -m deep            # expensive code-theory tests (opt-in)
+pytest                    # CPU-only invariant/config/data cases run without a GPU
 ```
 
 If you touch the model or PEFT wiring, run the invariant tests
-(`tests/shadow_residual/`, `tests/peft_shadow_residual/`) — they're fast and
-catch silent breakage of the frozen-base / KV / ALORA guarantees.
+(`tests/shadow_residual/`, `tests/peft_shadow_residual/`).
 
 ## Version notes
 
 - Vendored `ShadowResidualConfig` uses `model_type = "shadow_residual"`.
-- **transformers is pinned `>=5.5.1,<5.10.0`**. On this range, `GraniteMoeHybridConfig` keeps attention
-  `layer_types` as `"attention"` — which `validate_shadow_residual_config` and the
-  test fixtures rely on. transformers ≥5.10 renames it to `"full_attention"` and
-  strict-validates, which breaks the config and tests. Do not bump the upper
-  bound without re-running the invariant tests and adapting the `layer_types`
-  handling.
+- **transformers pinned `>=5.5.1,<5.10.0`** (≥5.10 renames GraniteMoeHybrid
+  attention `layer_types` and strict-validates, breaking the config/tests).
 
-## Git protocol in this repo
+## Git protocol
 
-**Never commit and never push.** Stage only (`git add`) — the maintainer reviews
-staged changes, then commits and pushes themselves. Do not run `git commit` or
-`git push` under any circumstances, even if asked in passing; if a commit seems
-warranted, stage the files and say so instead.
-
-**Never sign commits as Claude.** Do not add `Co-Authored-By: Claude`,
-`Generated with Claude Code`, or any similar attribution/trailer. Since you must
-not commit at all, this also means never preparing commit messages that carry
-such a signature.
+**Never commit and never push.** Stage only (`git add`); the maintainer reviews,
+commits, and pushes. **Never sign commits as Claude** (no `Co-Authored-By`,
+`Generated with Claude Code`, or similar).

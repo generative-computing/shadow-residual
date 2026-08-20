@@ -1,56 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shadow-residual attention (HF backend).
+"""Shadow-residual attention (HF backend) — shared-base-K/V only.
 
-Maintains two parallel hidden state streams (base and adapter).  The
-projections (``q_proj`` / ``k_proj`` / ``v_proj`` / ``o_proj``) are
-:class:`_StreamGatedLinear` instances; PEFT replaces each one the user
-lists in ``target_modules`` with a :class:`ShadowResidualLora` wrapper.
-The wrapper checks a per-call contextvar (``current_stream()``):
+Two forward paths:
 
-- ``"base"`` → wrapper returns ``base_layer(x)`` only (delta gated off).
-- ``"adapter"`` (default) → wrapper applies the LoRA delta normally
-  (with ALORA gating if configured).
+Shared base K/V dual-stream (the adapter path)
+----------------------------------------------
+K and V are computed exactly once, from ``normed_base`` (base weights, no LoRA
+delta). The adapter stream skips the K/V projections entirely — it only computes
+Q (with optional Q LoRA on ``normed_adapt``). Both Q_base and Q_adapt attend
+against the same shared K/V; only one KV cache is used. Per-attention-head this
+is ``softmax((x_adapt · W_Q)(x_base · W_K)ᵀ / √d)(x_base · W_V)`` for the adapter
+stream. K/V LoRA is structurally meaningless here (no place for a K/V delta to
+land) and is rejected at build time. The base stream's Q/K/V/O all remain
+bit-identical to the unadapted base model.
 
-Three forward modes (selected at runtime):
+The base stream is gated by calling each projection's ``base_layer`` directly
+(``_base_only``) — a pure, adapter-state-free call. The adapter stream calls the
+wrapped module so the LoRA delta fires (always active — plain LoRA, no gating).
+This is checkpoint-pure, so the same :meth:`forward` serves both training (under
+gradient checkpointing) and inference.
 
-Disjoint K/V (default — ``config.shared_base_kv=False``)
---------------------------------------------------------
-In dual-stream mode every wrapped projection is called twice — once
-under ``stream_context("base")`` (LoRA delta gated off — base stream
-is bit-identical to the unadapted base model) and once under
-``stream_context("adapter")`` (delta fires). This applies to **all**
-projections including ``k_proj`` and ``v_proj``: each stream computes
-its own K and V from its own normed input and writes into its own KV
-cache slot. There is no shared K/V tensor and no shared cache; the
-``past_key_values_base`` cache holds ``W_kv · normed_base`` (frozen,
-adapter-free), and ``past_key_values`` holds whatever the adapter
-computes from ``normed_adapt`` — including any K/V LoRA delta the user
-configured. The two attention calls each read their own K/V.
-
-Shared base K/V (``config.shared_base_kv=True``)
-------------------------------------------------
-K and V are computed exactly once, from ``normed_base``, under
-``stream_context("base")``. The adapter stream skips the K/V
-projections entirely — it only computes Q (with optional Q LoRA on
-``normed_adapt``). Both Q_base and Q_adapt then attend against the
-same shared K/V; only one KV cache is used (the adapter cache;
-``past_key_values_base`` is unused). Per-attention-head this is
-``softmax((x_adapt · W_Q)(x_base · W_K)ᵀ / √d)(x_base · W_V)`` for the
-adapter stream. K/V LoRA is structurally meaningless in this mode and
-must not be configured (no place for a K/V adapter delta to land).
-The base stream's Q, K, V, O, MLP all remain bit-identical to the
-unadapted base model; the adapter stream attends to the same K/V the
-frozen base would have written.
-
-Single-stream early-exit (adapter-only)
----------------------------------------
-When the model-level gate determines no :class:`CrossStream` site has
-been wrapped (i.e. ``"cross_stream"`` is not in ``target_modules``), the
-SR forward runs the **adapter path only** — base compute is skipped
-entirely.  This is the "LoRA on the SR architecture without
-cross-stream" path: equivalent to plain LoRA on the SR architecture. Only
-one cache is used in this mode. The ``shared_base_kv`` flag is
-irrelevant here — there is no second stream to share with.
+Bare single-stream (no adapter attached)
+----------------------------------------
+When the model runs without a PEFT adapter, :meth:`forward_bare` computes one
+plain Q/K/V/O pass — the projections are ordinary ``nn.Linear`` (nothing to gate),
+so the output is exactly the unadapted base model. Used only by the model-level
+"no adapter active" branch (see modeling_hf.py).
 """
 
 from typing import Optional, Tuple
@@ -66,16 +41,14 @@ from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
 
 from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
-from ._stream_context import stream_context
-from ._stream_gated_linear import _StreamGatedLinear
+from ._stream_gated_linear import _StreamGatedLinear, _base_only
 
 
 class ShadowResidualAttention(nn.Module):
-    """Attention with shadow residual streams (base + adapter).
+    """Attention with shadow residual streams (base + adapter), shared K/V.
 
-    Two attention calls (one per stream's Q against the shared K/V),
-    with stream-gated wrappers around Q/O so the base contribution is
-    identical to the unadapted base model.
+    Two attention calls (one per stream's Q against the shared, base-only K/V).
+    The base contribution is bit-identical to the unadapted base model.
     """
 
     def __init__(self, config: ShadowResidualConfig, layer_idx: int):
@@ -95,11 +68,6 @@ class ShadowResidualAttention(nn.Module):
         self.is_causal = True  # Required by HF attention backends.
         self.attention_dropout = config.attention_dropout
 
-        # Shared-base-K/V mode: K/V is computed once from normed_base and
-        # both streams' Qs attend against the same K/V (single cache).
-        # See module docstring for full description.
-        self.shared_base_kv = bool(getattr(config, "shared_base_kv", False))
-
         # Optional QK-norm (Qwen3) — gated by config.qk_norm.
         self.qk_norm = getattr(config, "qk_norm", False)
         if self.qk_norm:
@@ -111,9 +79,9 @@ class ShadowResidualAttention(nn.Module):
         self.q_size = q_size
         self.kv_size = kv_size
 
-        # Stream-gated linears — PEFT will dispatch these to
-        # ShadowResidualLora when the user lists their attribute names
-        # in target_modules.
+        # Stream-gated linears — PEFT wraps q_proj / o_proj (and MLP) with stock
+        # LoRA when listed in target_modules; k_proj / v_proj are never adapted
+        # (shared base-only K/V — K/V LoRA is rejected at build time).
         self.q_proj = _StreamGatedLinear(
             self.hidden_size, q_size, bias=config.attention_bias,
         )
@@ -194,142 +162,74 @@ class ShadowResidualAttention(nn.Module):
     def forward(
         self,
         normed_base: torch.Tensor,
-        normed_adapt: Optional[torch.Tensor],
+        normed_adapt: torch.Tensor,
         *,
-        cross_stream_active: bool,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
-        past_key_values_base: Optional[Cache] = None,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
-        """Forward with shadow-residual streams.
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Cache]]:
+        """Shared-base-K/V dual-stream attention.
 
-        Args:
-            normed_base: pre-normed base stream ``[B, S, H]``.
-            normed_adapt: pre-normed adapter stream ``[B, S, H]``, or
-                ``None`` in adapter-only early-exit mode (then
-                ``cross_stream_active`` must be ``False``).
-            cross_stream_active: when ``False`` only the adapter stream
-                is computed (single Q/K/V/O call inside an ``"adapter"``
-                context); the returned ``o_base`` is ``None``.
-                When ``True`` both streams are computed with disjoint
-                K/V projections and disjoint caches.
-            past_key_values: KV cache for the **adapter** stream (and
-                the only cache used in early-exit mode).
-            past_key_values_base: KV cache for the **base** stream
-                (dual-stream only). Holds frozen, adapter-free K/V.
+        K/V are computed once from ``normed_base`` via ``base_layer`` (no delta).
+        Q_base likewise via ``base_layer``; Q_adapt via the wrapped q_proj so the
+        LoRA delta fires. Both Qs attend against the shared K/V; a single KV cache
+        (``past_key_values``) is used. The base-stream calls are pure (no adapter
+        state mutation), so this is checkpoint-safe and serves both training and
+        inference.
 
-        Returns:
-            ``(o_base, o_adapt, present_kv)``. ``o_base`` is ``None`` in
-            the adapter-only early-exit path. ``present_kv`` is the
-            adapter cache (the base cache is updated in-place).
+        Returns ``(o_base, o_adapt, present_kv)``.
         """
-        if not cross_stream_active:
-            # ---- Adapter-only early-exit ----
-            # Single Q/K/V/O pass under "adapter" context. K/V LoRA, if
-            # configured, fires here. There is no base stream to protect.
-            with stream_context("adapter"):
-                q_adapt = self.q_proj(normed_base)
-                k = self.k_proj(normed_base)
-                v = self.v_proj(normed_base)
-                q_adapt, k_shaped, v_shaped, cos, sin = self._shape_qkv(
-                    q_adapt, k, v, position_embeddings,
-                )
-                if use_cache and past_key_values is not None:
-                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                    k_shaped, v_shaped = past_key_values.update(
-                        k_shaped, v_shaped, self.layer_idx, cache_kwargs,
-                    )
-                attn_adapt = self._run_attention(q_adapt, k_shaped, v_shaped, attention_mask)
-                o_adapt = self.o_proj(attn_adapt)
-            return None, o_adapt, past_key_values if use_cache else None
+        q_base = _base_only(self.q_proj, normed_base)
+        k = _base_only(self.k_proj, normed_base)
+        v = _base_only(self.v_proj, normed_base)
+        q_adapt = self.q_proj(normed_adapt)
 
-        if self.shared_base_kv:
-            # ---- Shared base K/V forward ----
-            # K and V are computed once from normed_base under "base"
-            # context (LoRA on K/V is forbidden in this mode — see
-            # config_helpers). Q_base from normed_base ("base" context),
-            # Q_adapt from normed_adapt ("adapter" context, Q LoRA delta
-            # fires). Both Qs attend against the same K/V; only the
-            # adapter cache (past_key_values) is used — past_key_values_base
-            # is intentionally ignored.
-            with stream_context("base"):
-                q_base = self.q_proj(normed_base)
-                k = self.k_proj(normed_base)
-                v = self.v_proj(normed_base)
-            with stream_context("adapter"):
-                q_adapt = self.q_proj(normed_adapt)
+        q_base, k_shaped, v_shaped, cos, sin = self._shape_qkv(
+            q_base, k, v, position_embeddings,
+        )
+        # Q-only RoPE for the adapter stream (same positions as base).
+        q_adapt, _, _, _, _ = self._shape_qkv(q_adapt, None, None, position_embeddings)
 
-            q_base, k_shaped, v_shaped, cos, sin = self._shape_qkv(
-                q_base, k, v, position_embeddings,
-            )
-            # Q-only RoPE for the adapter stream (same positions as base).
-            q_adapt, _, _, _, _ = self._shape_qkv(
-                q_adapt, None, None, position_embeddings,
+        if use_cache and past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            k_shaped, v_shaped = past_key_values.update(
+                k_shaped, v_shaped, self.layer_idx, cache_kwargs,
             )
 
-            if use_cache and past_key_values is not None:
-                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                k_shaped, v_shaped = past_key_values.update(
-                    k_shaped, v_shaped, self.layer_idx, cache_kwargs,
-                )
+        attn_base = self._run_attention(q_base, k_shaped, v_shaped, attention_mask)
+        attn_adapt = self._run_attention(q_adapt, k_shaped, v_shaped, attention_mask)
 
-            attn_base = self._run_attention(q_base, k_shaped, v_shaped, attention_mask)
-            attn_adapt = self._run_attention(q_adapt, k_shaped, v_shaped, attention_mask)
-
-            with stream_context("base"):
-                o_base = self.o_proj(attn_base)
-            with stream_context("adapter"):
-                o_adapt = self.o_proj(attn_adapt)
-
-            return o_base, o_adapt, past_key_values if use_cache else None
-
-        # ---- Dual-stream forward (disjoint K/V) ----
-        # Each stream computes its own Q/K/V from its own normed input.
-        # Base call: LoRA delta gated off (frozen-base invariant — base
-        # K/V is bit-identical to the unadapted base model's K/V on
-        # normed_base). Adapter call: delta fires on normed_adapt.
-        # Two parallel KV caches: past_key_values (adapter) holds the
-        # adapter K/V; past_key_values_base holds the frozen base K/V.
-        cache_kwargs = None
-        with stream_context("base"):
-            q_base = self.q_proj(normed_base)
-            k_base = self.k_proj(normed_base)
-            v_base = self.v_proj(normed_base)
-            q_base, k_base_shaped, v_base_shaped, cos, sin = self._shape_qkv(
-                q_base, k_base, v_base, position_embeddings,
-            )
-            if use_cache and past_key_values_base is not None:
-                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                k_base_shaped, v_base_shaped = past_key_values_base.update(
-                    k_base_shaped, v_base_shaped, self.layer_idx, cache_kwargs,
-                )
-
-        with stream_context("adapter"):
-            q_adapt = self.q_proj(normed_adapt)
-            k_adapt = self.k_proj(normed_adapt)
-            v_adapt = self.v_proj(normed_adapt)
-            q_adapt, k_adapt_shaped, v_adapt_shaped, _, _ = self._shape_qkv(
-                q_adapt, k_adapt, v_adapt, position_embeddings,
-            )
-            if use_cache and past_key_values is not None:
-                if cache_kwargs is None:
-                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                k_adapt_shaped, v_adapt_shaped = past_key_values.update(
-                    k_adapt_shaped, v_adapt_shaped, self.layer_idx, cache_kwargs,
-                )
-
-        # Two attention calls — each Q against its own K/V.
-        attn_base = self._run_attention(q_base, k_base_shaped, v_base_shaped, attention_mask)
-        attn_adapt = self._run_attention(q_adapt, k_adapt_shaped, v_adapt_shaped, attention_mask)
-
-        # O projections — base under "base" context (frozen-base
-        # invariant), adapter under "adapter" context.
-        with stream_context("base"):
-            o_base = self.o_proj(attn_base)
-        with stream_context("adapter"):
-            o_adapt = self.o_proj(attn_adapt)
-
+        o_base = _base_only(self.o_proj, attn_base)
+        o_adapt = self.o_proj(attn_adapt)
         return o_base, o_adapt, past_key_values if use_cache else None
+
+    def forward_bare(
+        self,
+        normed: torch.Tensor,
+        *,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Cache]]:
+        """Single-stream attention for a bare (no-adapter) model.
+
+        One plain Q/K/V/O pass. On a bare model the projections are ordinary
+        ``nn.Linear`` (or LoRA-disabled), so this is exactly the unadapted base
+        model's attention. Returns ``(o, present_kv)``.
+        """
+        q = self.q_proj(normed)
+        k = self.k_proj(normed)
+        v = self.v_proj(normed)
+        q, k_shaped, v_shaped, cos, sin = self._shape_qkv(q, k, v, position_embeddings)
+        if use_cache and past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            k_shaped, v_shaped = past_key_values.update(
+                k_shaped, v_shaped, self.layer_idx, cache_kwargs,
+            )
+        attn = self._run_attention(q, k_shaped, v_shaped, attention_mask)
+        o = self.o_proj(attn)
+        return o, past_key_values if use_cache else None

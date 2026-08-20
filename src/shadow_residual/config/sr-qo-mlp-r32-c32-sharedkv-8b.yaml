@@ -8,7 +8,6 @@
 
 model:
   base: ibm-granite/granite-4.1-8b
-  shared_base_kv: true
 
 data:
   train_path: ${DATA_ROOT}/train.jsonl
@@ -25,7 +24,9 @@ adapter:
     cross_stream: 32
   alpha: 64
   dropout: 0.05
-  invocation_tokens: "<|start_of_role|>assistant<|end_of_role|>"
+  # Adapter always active; markers shape data/labels + recorded in adapter_config.json.
+  last_context_token: "<|end_of_role|>"
+  last_token: "<|end_of_text|>"
 
 optimizer:
   name: adamw_torch

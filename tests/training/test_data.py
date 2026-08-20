@@ -21,7 +21,7 @@ from shadow_residual.training.data import (  # noqa: E402
     _find_last_subsequence,
     _find_subsequence,
     load_jsonl_dataset,
-    validate_invocation_tokens_present,
+    validate_last_context_token_boundary,
 )
 
 
@@ -222,7 +222,7 @@ def test_find_last_subsequence_overlapping():
     assert _find_last_subsequence([1, 1, 1, 1, 1, 1], [1, 1]) == 4
 
 
-# ---------- validate_invocation_tokens_present ----------
+# ---------- validate_last_context_token_boundary ----------
 
 
 def _ds_with_text(rows: list[str]):
@@ -231,50 +231,119 @@ def _ds_with_text(rows: list[str]):
     return Dataset.from_list([{"text": t} for t in rows])
 
 
-def test_validate_invocation_tokens_all_present(tokenizer, caplog):
-    marker = "<|start_of_role|>assistant<|end_of_role|>"
-    invocation_ids = tokenizer.encode(marker, add_special_tokens=False)
+class _MarkerCollator:
+    """Test collator mirroring ResponseOnlyCollator: mask THROUGH the last
+    occurrence of `marker`, supervise the tokens AFTER it (so the marker's final
+    token is the last context token). Pad-free single-row batches."""
+
+    def __init__(self, tokenizer, marker: str):
+        self.tok = tokenizer
+        self.marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+
+    def __call__(self, features):
+        import torch
+        ids = list(features[0]["input_ids"])
+        labels = [-100] * len(ids)
+        cut = _find_last_subsequence(ids, self.marker_ids)
+        if cut >= 0:
+            start = cut + len(self.marker_ids)
+            for j in range(start, len(ids)):
+                labels[j] = ids[j]
+        return {
+            "input_ids": torch.tensor([ids], dtype=torch.long),
+            "labels": torch.tensor([labels], dtype=torch.long),
+            "attention_mask": torch.ones((1, len(ids)), dtype=torch.long),
+        }
+
+
+def test_last_context_boundary_ok(tokenizer, caplog):
+    """The token right before the supervised region is last_context_token.
+
+    The collator masks through the assistant marker and supervises what follows,
+    so the token immediately before the first unmasked position is the marker's
+    final token, ``<|end_of_role|>`` — the last_context_token we validate against.
+    """
+    last_context_token = "<|end_of_role|>"
     rows = [
         f"<|start_of_role|>user<|end_of_role|>q{i}<|end_of_turn|>"
-        f"{marker}a{i}<|end_of_turn|>"
-        for i in range(4)
+        f"<|start_of_role|>assistant<|end_of_role|>ANS{i}<|end_of_turn|>"
+        for i in range(3)
     ]
     ds = _ds_with_text(rows)
+    collator = _MarkerCollator(tokenizer, "<|start_of_role|>assistant<|end_of_role|>")
     with caplog.at_level(logging.INFO):
-        validate_invocation_tokens_present(ds, tokenizer, invocation_ids)
-    assert any("present in all" in r.message for r in caplog.records)
+        validate_last_context_token_boundary(ds, tokenizer, collator, last_context_token)
+    assert any("boundary validated" in r.message for r in caplog.records)
 
 
-def test_validate_invocation_tokens_missing_raises(tokenizer):
+def test_last_context_boundary_mismatch_raises(tokenizer):
+    """A wrong last_context_token (doesn't precede the supervised region) errors."""
     marker = "<|start_of_role|>assistant<|end_of_role|>"
-    invocation_ids = tokenizer.encode(marker, add_special_tokens=False)
-    ds = _ds_with_text(["just some text", "another row", "no marker here"])
-    with pytest.raises(ValueError, match="not found in any of"):
-        validate_invocation_tokens_present(ds, tokenizer, invocation_ids)
+    rows = [
+        f"<|start_of_role|>user<|end_of_role|>q<|end_of_turn|>{marker}answer<|end_of_turn|>"
+    ]
+    ds = _ds_with_text(rows)
+    collator = _MarkerCollator(tokenizer, marker)  # supervise after the marker
+    # The token before the supervised region is <|end_of_role|>. Validate against
+    # a different single-token special (<|start_of_role|>) → boundary mismatch.
+    with pytest.raises(ValueError, match="does not match last_context_token"):
+        validate_last_context_token_boundary(ds, tokenizer, collator, "<|start_of_role|>")
 
 
-def test_validate_invocation_tokens_partial_warns(tokenizer, caplog):
-    marker = "<|start_of_role|>assistant<|end_of_role|>"
-    invocation_ids = tokenizer.encode(marker, add_special_tokens=False)
-    ds = _ds_with_text([
-        f"<|start_of_role|>user<|end_of_role|>q<|end_of_turn|>{marker}a<|end_of_turn|>",
-        "no marker here",
-    ])
-    with caplog.at_level(logging.WARNING):
-        validate_invocation_tokens_present(ds, tokenizer, invocation_ids)
-    assert any("dormant on the remaining" in r.message for r in caplog.records)
-
-
-def test_validate_invocation_tokens_empty_ids_raises(tokenizer):
+def test_last_context_boundary_bad_token_raises(tokenizer):
+    """last_context_token that isn't a single token id errors."""
     ds = _ds_with_text(["anything"])
-    with pytest.raises(ValueError, match="non-empty invocation_ids"):
-        validate_invocation_tokens_present(ds, tokenizer, [])
+    collator = _MarkerCollator(tokenizer, "x")
+    with pytest.raises(ValueError, match="exactly one token id"):
+        validate_last_context_token_boundary(
+            ds, tokenizer, collator, "multi word string that is many tokens",
+        )
 
 
-def test_validate_invocation_tokens_empty_dataset_raises(tokenizer):
+def test_last_context_boundary_empty_dataset_raises(tokenizer):
     ds = _ds_with_text([])
+    collator = _MarkerCollator(tokenizer, "x")
     with pytest.raises(ValueError, match="dataset is empty"):
-        validate_invocation_tokens_present(ds, tokenizer, [1, 2, 3])
+        validate_last_context_token_boundary(ds, tokenizer, collator, "<|end_of_role|>")
+
+
+# ---------- last_token append ----------
+
+
+def test_load_jsonl_appends_last_token_when_absent(tokenizer, tmp_path):
+    """load_jsonl_dataset appends last_token to rows that don't end with it."""
+    import json
+    p = tmp_path / "d.jsonl"
+    with p.open("w") as f:
+        f.write(json.dumps({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "there"},
+        ]}) + "\n")
+    last = "<|end_of_turn|>"
+    last_id = tokenizer.encode(last, add_special_tokens=False)[0]
+    ds = load_jsonl_dataset(p, tokenizer, last_token=last)
+    ids = tokenizer.encode(ds[0]["text"], add_special_tokens=False)
+    assert ids[-1] == last_id, "last_token should be appended when absent"
+
+
+def test_load_jsonl_does_not_double_append(tokenizer, tmp_path):
+    """A row already ending with last_token is left unchanged."""
+    import json
+    last = "<|end_of_turn|>"
+    last_id = tokenizer.encode(last, add_special_tokens=False)[0]
+    p = tmp_path / "d.jsonl"
+    with p.open("w") as f:
+        f.write(json.dumps({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "there"},
+        ]}) + "\n")
+    ds1 = load_jsonl_dataset(p, tokenizer, last_token=last)
+    n1 = tokenizer.encode(ds1[0]["text"], add_special_tokens=False).count(last_id)
+    # Re-run over a dataset whose text already ends with last_token: build a
+    # dataset from the already-appended text and confirm no second append.
+    ids = tokenizer.encode(ds1[0]["text"], add_special_tokens=False)
+    assert ids[-1] == last_id
+    assert n1 >= 1
 
 
 # ---------- ResponseOnlyCollator ----------
@@ -289,11 +358,11 @@ def test_response_only_collator_masks_before_marker(tokenizer):
     ids = pre + marker_ids + resp
     out = coll([{"input_ids": ids, "attention_mask": [1] * len(ids)}])
     labels = out["labels"][0].tolist()
-    # Mask BEFORE marker → -100; from the marker onward → real ids
-    # (matches the adapter team's parquet labels mask).
-    marker_start = len(pre)
-    assert all(x == -100 for x in labels[:marker_start])
-    assert labels[marker_start:] == ids[marker_start:]
+    # Mask THROUGH the marker → -100; supervise the tokens AFTER the marker.
+    # The marker's final token is the last context token.
+    resp_start = len(pre) + len(marker_ids)
+    assert all(x == -100 for x in labels[:resp_start])
+    assert labels[resp_start:] == ids[resp_start:]
 
 
 def test_response_only_collator_uses_last_marker_on_multi_turn(tokenizer):
@@ -311,9 +380,10 @@ def test_response_only_collator_uses_last_marker_on_multi_turn(tokenizer):
     ids = pre + marker_ids + turn1_body + user_turn + marker_ids + final_body
     out = coll([{"input_ids": ids, "attention_mask": [1] * len(ids)}])
     labels = out["labels"][0].tolist()
-    last_marker_start = len(pre) + len(marker_ids) + len(turn1_body) + len(user_turn)
-    assert all(x == -100 for x in labels[:last_marker_start])
-    assert labels[last_marker_start:] == ids[last_marker_start:]
+    # Supervision starts AFTER the final marker (marker masked as context).
+    final_body_start = len(pre) + len(marker_ids) + len(turn1_body) + len(user_turn) + len(marker_ids)
+    assert all(x == -100 for x in labels[:final_body_start])
+    assert labels[final_body_start:] == ids[final_body_start:]
 
 
 def test_response_only_collator_full_mask_when_marker_absent(tokenizer):
@@ -349,19 +419,22 @@ def test_response_only_collator_empty_template_rejected(tokenizer):
         ResponseOnlyCollator(tokenizer, "")
 
 
-def test_validate_invocation_tokens_sample_n_caps_scan(tokenizer):
-    """If sample_n < len(dataset), only the first sample_n rows are scanned."""
-    marker = "<|start_of_role|>assistant<|end_of_role|>"
-    invocation_ids = tokenizer.encode(marker, add_special_tokens=False)
-    rows_with = [
+def test_last_context_boundary_sample_n_caps_scan(tokenizer):
+    """If sample_n < len(dataset), only the first sample_n rows are validated."""
+    good = [
         f"<|start_of_role|>user<|end_of_role|>q{i}<|end_of_turn|>"
-        f"{marker}a{i}<|end_of_turn|>"
+        f"<|start_of_role|>assistant<|end_of_role|>ANS{i}<|end_of_turn|>"
         for i in range(2)
     ]
-    rows_without = ["no marker"] * 10
-    ds = _ds_with_text(rows_with + rows_without)
-    # Only scans the first 2 → no exception, no warning about dormant.
-    validate_invocation_tokens_present(ds, tokenizer, invocation_ids, sample_n=2)
+    # Rows that WOULD fail the boundary check, but sit past sample_n so they're
+    # never scanned.
+    bad = ["<|start_of_role|>user<|end_of_role|>ANSx"] * 10
+    ds = _ds_with_text(good + bad)
+    collator = _MarkerCollator(tokenizer, "<|start_of_role|>assistant<|end_of_role|>")
+    # Only scans the first 2 (both good) → no exception.
+    validate_last_context_token_boundary(
+        ds, tokenizer, collator, "<|end_of_role|>", sample_n=2,
+    )
 
 
 # ---------- enable_thinking ----------

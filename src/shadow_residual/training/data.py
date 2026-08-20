@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Data utilities: JSONL loader, response-only collator, aLoRA sanity check.
+"""Data utilities: JSONL loader, response-only collator, boundary validator.
 
 Two response-only masking paths are available, selected by train.py at runtime:
 
@@ -75,6 +75,7 @@ def load_jsonl_dataset(
     path: str | Path,
     tokenizer: "PreTrainedTokenizerBase",
     enable_thinking: bool = False,
+    last_token: str | None = None,
 ) -> "Dataset":
     """Load a JSONL file and apply the model's chat template to each row.
 
@@ -89,10 +90,26 @@ def load_jsonl_dataset(
     Templates that don't understand the kwarg ignore it, so the default
     (False) is a no-op.
 
+    ``last_token`` (when set) is an end-of-completion marker: any rendered row
+    whose token ids don't already end with ``last_token`` gets the marker
+    appended (at the string level, so it survives whichever masking path the
+    trainer picks). Rows that already end with it are left unchanged. The
+    string must encode to exactly one token id (enforced by the caller).
+
     Returns a `datasets.Dataset` with a single ``text`` column containing the
     chat-templated string. SFTTrainer reads the ``text`` field directly.
     """
     from datasets import Dataset
+
+    last_token_id: int | None = None
+    if last_token is not None:
+        ids = tokenizer.encode(last_token, add_special_tokens=False)
+        if len(ids) != 1:
+            raise ValueError(
+                f"last_token {last_token!r} must encode to exactly one token id, "
+                f"got {ids}."
+            )
+        last_token_id = ids[0]
 
     rows: list[dict[str, str]] = []
     with Path(path).open("r") as f:
@@ -114,6 +131,14 @@ def load_jsonl_dataset(
                 add_generation_prompt=False,
                 enable_thinking=enable_thinking,
             )
+            if last_token_id is not None:
+                # Append the end-of-completion marker unless the row's tokens
+                # already end with it. Compare on token ids (not string suffix)
+                # so trailing whitespace / template quirks don't cause a false
+                # "already present".
+                row_ids = tokenizer.encode(text, add_special_tokens=False)
+                if not row_ids or row_ids[-1] != last_token_id:
+                    text = text + last_token
             rows.append({"text": text})
 
     if not rows:
@@ -122,15 +147,16 @@ def load_jsonl_dataset(
 
 
 class ResponseOnlyCollator:
-    """Right-pads a batch and masks all label positions before the FINAL
-    assistant marker, so loss is computed on the final assistant turn only.
+    """Right-pads a batch and masks all label positions up to and including the
+    FINAL assistant marker, so loss is computed on the final assistant turn's
+    completion only (the marker itself is context, not supervised).
 
     Constructor takes the marker as a string (e.g. for Granite:
     ``<|start_of_role|>assistant<|end_of_role|>``); we tokenize it once and
     cache the IDs. At call time we pad each row's ``input_ids`` /
     ``attention_mask`` to the longest in the batch, copy ``input_ids`` into
-    ``labels``, set positions before the LAST marker occurrence to -100, and
-    -100 the padding positions too.
+    ``labels``, set positions up to and including the LAST marker occurrence to
+    -100, and -100 the padding positions too.
 
     Two non-obvious design choices, both verified against the adapter team's
     parquet (scripts/inspect_label_boundary.py output —
@@ -144,11 +170,12 @@ class ResponseOnlyCollator:
       underperforming aLoRA earlier on this branch — aLoRA's gating saved
       it; LoRA's wider loss horizon let it drift to free-form factual
       answers instead of the answerability label.
-    - **Mask BEFORE the marker, not through it.** The role-tag triplet
-      ``<|start_of_role|>assistant<|end_of_role|>`` is part of the unmasked
-      region — the model is trained to predict it too. Matches the adapter
-      team's parquet ``labels`` (stored mask starts at the role-tag, not
-      after it).
+    - **Mask THROUGH the marker; supervise what follows.** The role-tag
+      triplet ``<|start_of_role|>assistant<|end_of_role|>`` is MASKED context —
+      supervision starts at the token *after* the marker, so ``<|end_of_role|>``
+      is the last context token and everything after it is generation. This
+      matches ``adapter.last_context_token = "<|end_of_role|>"`` and the
+      ``validate_last_context_token_boundary`` check.
     """
 
     def __init__(self, tokenizer: "PreTrainedTokenizerBase", response_template: str):
@@ -187,11 +214,15 @@ class ResponseOnlyCollator:
                 f.get("attention_mask", [1] * n), dtype=torch.long
             )
 
-            # Find the LAST response template; mask everything before it.
-            # If absent, the whole row stays -100 (no loss contribution).
+            # Find the LAST response template; supervise the completion that
+            # follows it. The marker triplet itself is MASKED (it is context,
+            # not generation) — supervision starts at the token AFTER the
+            # marker, so the marker's final token (<|end_of_role|>) is the last
+            # context token. If absent, the whole row stays -100.
             cut = _find_last_subsequence(list(ids), self.response_template_ids)
             if cut >= 0:
-                labels[i, cut:n] = torch.as_tensor(ids[cut:], dtype=torch.long)
+                start = cut + len(self.response_template_ids)
+                labels[i, start:n] = torch.as_tensor(ids[start:], dtype=torch.long)
 
         return {
             "input_ids": input_ids,
@@ -245,35 +276,60 @@ class DebugPrintingCollator:
         return batch
 
 
-def validate_invocation_tokens_present(
+def validate_last_context_token_boundary(
     dataset: "Dataset",
     tokenizer: "PreTrainedTokenizerBase",
-    invocation_ids: list[int],
+    collator,
+    last_context_token: str,
     sample_n: int = 8,
 ) -> None:
-    """Refuse to start training if the aLoRA invocation tokens are absent from the data.
+    """Refuse to start training unless the supervised region starts right after
+    ``last_context_token``.
 
-    aLoRA's runtime scans every input sequence for the invocation token
-    subsequence. If that scan never matches, the adapter never activates and
-    training silently does nothing useful. Common causes:
+    The adapter is always active; ``last_context_token`` does not gate the
+    model. It is a data-shape contract: the final context/prompt token must be
+    ``last_context_token``, and the supervised region (``labels != -100``) must
+    begin at the very next position. This pins the prompt/completion boundary so
+    a mismatched chat template / marker / tokenizer fails loudly instead of
+    silently supervising the wrong span.
 
-    - invocation_tokens string doesn't match the chat template's assistant
-      marker for this base model;
-    - data was produced with a different tokenizer / chat template version;
-    - wrong base model loaded.
+    Path-independent by construction: we run the *actual* trainer collator over
+    the first ``sample_n`` rows and inspect the labels it produces. This covers
+    both masking paths (TRL ``assistant_only_loss`` — where TRL owns masking, so
+    we can only validate — and our own ``ResponseOnlyCollator``) because both
+    ultimately emit a ``labels`` tensor.
 
-    We sample the first `sample_n` rows of `dataset` (rendered as the `text`
-    column by `load_jsonl_dataset`), tokenize each, and look for the invocation
-    subsequence. Zero matches → ValueError. Partial matches → warning.
+    For each sampled row: find the first unmasked label position ``p``
+    (``labels[p] != -100``) and assert ``input_ids[p-1]`` is
+    ``last_context_token``. Any row where the boundary token is wrong raises.
+    Rows with no unmasked labels (fully-masked prompt-only rows) are skipped
+    with a warning.
+
+    Args:
+        dataset: the training dataset (``text`` column, from
+            :func:`load_jsonl_dataset`).
+        tokenizer: the training tokenizer.
+        collator: the collator the trainer will actually use (already
+            constructed, post-tokenization). Called on tokenized features.
+        last_context_token: the expected final-context-token string; must
+            encode to exactly one token id.
+        sample_n: how many rows to check.
     """
-    if not invocation_ids:
-        raise ValueError("validate_invocation_tokens_present requires non-empty invocation_ids")
+    import torch
+
+    ctx_ids = tokenizer.encode(last_context_token, add_special_tokens=False)
+    if len(ctx_ids) != 1:
+        raise ValueError(
+            f"last_context_token {last_context_token!r} must encode to exactly "
+            f"one token id, got {ctx_ids}."
+        )
+    ctx_id = ctx_ids[0]
 
     n_to_scan = min(sample_n, len(dataset))
     if n_to_scan == 0:
-        raise ValueError("Cannot validate invocation tokens: dataset is empty")
+        raise ValueError("Cannot validate last_context_token: dataset is empty")
 
-    rows_with_token = 0
+    n_checked = 0
     for i in range(n_to_scan):
         text = dataset[i].get("text")
         if text is None:
@@ -282,27 +338,46 @@ def validate_invocation_tokens_present(
                 "Did you load the dataset with load_jsonl_dataset()?"
             )
         ids = tokenizer.encode(text, add_special_tokens=False)
-        if _find_subsequence(ids, invocation_ids) >= 0:
-            rows_with_token += 1
+        # Run the real collator on a single-row batch and read back its labels.
+        batch = collator([{"input_ids": ids, "attention_mask": [1] * len(ids)}])
+        labels = batch.get("labels")
+        input_ids = batch.get("input_ids")
+        if labels is None or input_ids is None:
+            raise ValueError(
+                "Collator did not produce 'labels'/'input_ids'; cannot validate "
+                "the last_context_token boundary."
+            )
+        row_labels = labels[0].tolist() if isinstance(labels, torch.Tensor) else list(labels[0])
+        row_ids = input_ids[0].tolist() if isinstance(input_ids, torch.Tensor) else list(input_ids[0])
 
-    if rows_with_token == 0:
-        raise ValueError(
-            f"aLoRA invocation tokens {invocation_ids} not found in any of "
-            f"{n_to_scan} sampled training rows. The adapter would never activate "
-            f"and training would not learn anything. "
-            f"Common causes: the invocation_tokens string doesn't match the chat "
-            f"template's assistant marker for this base model, the data was "
-            f"produced with a different tokenizer, or you're pointing at the wrong "
-            f"base model."
-        )
+        first_unmasked = next((j for j, v in enumerate(row_labels) if v != -100), None)
+        if first_unmasked is None:
+            logger.warning(
+                "Row %d has no unmasked labels — skipping last_context_token "
+                "boundary check for it.", i,
+            )
+            continue
+        if first_unmasked == 0:
+            raise ValueError(
+                f"Row {i}: supervised region starts at position 0, so there is no "
+                f"preceding context token to match against last_context_token "
+                f"{last_context_token!r}."
+            )
+        preceding = row_ids[first_unmasked - 1]
+        if preceding != ctx_id:
+            raise ValueError(
+                f"Row {i}: the token immediately before the supervised region is "
+                f"{preceding} (decoded: {tokenizer.decode([preceding])!r}), but "
+                f"last_context_token {last_context_token!r} encodes to {ctx_id}. "
+                f"The prompt/completion boundary does not match last_context_token. "
+                f"Common causes: the last_context_token string doesn't match the "
+                f"chat template's assistant marker for this base model, the data "
+                f"was produced with a different tokenizer, or the masking path "
+                f"cuts at a different position."
+            )
+        n_checked += 1
 
-    if rows_with_token < n_to_scan:
-        logger.warning(
-            "aLoRA invocation tokens found in only %d of %d sampled rows — "
-            "the adapter will be dormant on the remaining %d. Verify your data.",
-            rows_with_token, n_to_scan, n_to_scan - rows_with_token,
-        )
-    else:
-        logger.info(
-            "aLoRA invocation tokens present in all %d sampled rows.", n_to_scan,
-        )
+    logger.info(
+        "last_context_token boundary validated on %d/%d sampled rows.",
+        n_checked, n_to_scan,
+    )

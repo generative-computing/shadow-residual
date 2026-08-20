@@ -24,17 +24,9 @@ from shadow_residual.shadow_residual import (
     ShadowResidualDecoderLayer,
     ShadowResidualForCausalLM,
 )
-from shadow_residual.shadow_residual._stream_gated_linear import (
-    _StreamGatedLinear,
-)
 from shadow_residual.shadow_residual.config_helpers import (
     set_shadow_residual,
     validate_shadow_residual_config,
-)
-from shadow_residual.shadow_residual.cross_stream import CrossStream
-from shadow_residual.peft_shadow_residual import CrossStreamLora
-from shadow_residual.peft_shadow_residual.stream_gated_lora import (
-    ShadowResidualLora,
 )
 
 
@@ -73,9 +65,7 @@ def _wrap_with_peft(sr_model, *, target_modules, perturb_lora_b=True):
         target_modules=target_modules,
         lora_dropout=0.0,
     )
-    lora_cfg._register_custom_module(
-        {CrossStream: CrossStreamLora, _StreamGatedLinear: ShadowResidualLora}
-    )
+    # cross_stream + projections all wrapped by stock LoRA (no custom module).
     peft_model = get_peft_model(sr_model, lora_cfg)
     if perturb_lora_b:
         with torch.no_grad():
@@ -90,8 +80,8 @@ def _wrap_with_peft(sr_model, *, target_modules, perturb_lora_b=True):
 
 
 class TestShadowResidualForward:
-    def test_forward_shapes_adapter_only(self, tiny_model):
-        """Bare SR model (no PEFT wrapping) → adapter-only early-exit path."""
+    def test_forward_shapes_bare(self, tiny_model):
+        """Bare SR model (no PEFT wrapping) → bare single-stream path."""
         input_ids = torch.tensor([[1, 2, 3, 4, 5]])
         with torch.no_grad():
             out = tiny_model(input_ids=input_ids)
@@ -101,7 +91,7 @@ class TestShadowResidualForward:
         """SR + PEFT with cross_stream wrapped → dual-stream forward."""
         sr = ShadowResidualForCausalLM(tiny_config)
         peft_model = _wrap_with_peft(
-            sr, target_modules=["k_proj", "cross_stream"],
+            sr, target_modules=["q_proj", "cross_stream"],
         )
         input_ids = torch.tensor([[1, 2, 3, 4, 5]])
         with torch.no_grad():
@@ -111,6 +101,26 @@ class TestShadowResidualForward:
     def test_decoder_layers_are_sr(self, tiny_model):
         for layer in tiny_model.model.layers:
             assert isinstance(layer, ShadowResidualDecoderLayer)
+
+    def test_bare_model_matches_disabled_adapter(self, tiny_config):
+        """A bare SR model (no adapter) runs the single-stream path; its logits
+        must equal the same model's logits under a top-level disable_adapter()
+        (both collapse to the unadapted base). Guards that the bare single-stream
+        path stays base-identical and the two code paths agree."""
+        torch.manual_seed(0)
+        sr = ShadowResidualForCausalLM(tiny_config)
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+        with torch.no_grad():
+            bare = sr(input_ids=input_ids).logits  # never PEFT-wrapped → single-stream
+
+        # Wrap with a trained (nonzero) adapter, then disable it: must match bare.
+        peft_model = _wrap_with_peft(
+            sr, target_modules=["q_proj", "cross_stream"], perturb_lora_b=True,
+        )
+        with torch.no_grad():
+            with peft_model.disable_adapter():
+                disabled = peft_model(input_ids=input_ids).logits
+        torch.testing.assert_close(bare, disabled, atol=1e-5, rtol=1e-4)
 
 
 class TestKVCache:

@@ -9,18 +9,19 @@ broadcasts rank 0's values to other ranks after sharding — peak host
 RAM is one rank's copy instead of N.
 
 Whether the dual-stream forward actually runs is a runtime decision made
-by the SR model itself (see ``modeling_hf.py``): if no :class:`CrossStream`
-site has been replaced by a :class:`CrossStreamLora` wrapper (i.e. the
-user did not list ``"cross_stream"`` in ``target_modules``), every forward
-takes a single-stream early-exit path with compute equivalent to plain
-Granite + the wrapped LoRA deltas. This is why there is no factory-level
-branch: one architecture, two forward paths.
+by the SR model itself (see ``modeling_hf.py``): if no ``cross_stream``
+site has been wrapped by a stock LoRA layer (i.e. the user did not list
+``"cross_stream"`` in ``target_modules``), every forward takes a
+single-stream early-exit path with compute equivalent to plain Granite +
+the wrapped LoRA deltas. This is why there is no factory-level branch: one
+architecture, two forward paths.
 
-ALORA-style mid-sequence activation is provided entirely by stock peft —
-set ``LoraConfig(alora_invocation_tokens=[...])`` and every wrapped
-projection gets gated automatically.  :class:`CrossStreamLora` consumes the
-same ``alora_offsets`` (peft injects it via a pre-forward hook because the
-class inherits :class:`peft.tuners.lora.layer.LoraLayer`).
+There is no custom PEFT code: the cross-stream site is a real frozen
+zero-init ``nn.Linear`` (see ``cross_stream.py``) that stock
+``peft.tuners.lora.layer.Linear`` wraps like any other target. The adapter is
+plain LoRA and always active — the delta fires on every position, in both
+streams' Q/O/MLP and the cross_stream injection. There is no gated/aLoRA
+activation.
 """
 
 from __future__ import annotations
@@ -37,172 +38,24 @@ from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
-from shadow_residual.shadow_residual._stream_gated_linear import (
-    _StreamGatedLinear,
-)
-from shadow_residual.shadow_residual.config_helpers import (
-    set_shadow_residual,
-)
 from shadow_residual.shadow_residual.cross_stream import CrossStream
 from shadow_residual.shadow_residual.weight_transfer import (
     transfer_base_weights,
 )
-
-from .cross_stream_lora import CrossStreamLora
-from .stream_gated_lora import ShadowResidualLora
+# Model-construction helpers live in the model package (no PEFT dependency);
+# imported here for the meta-init / materialize orchestration below. Aliased to
+# the historical ``_``-prefixed names so existing importers keep working.
+from shadow_residual.shadow_residual.build import (
+    build_sr_config as _build_sr_config,
+    build_sr_base as _build_sr_base,
+    reinit_rope_buffers as _reinit_rope_buffers,
+    diagnose_materialized as _diagnose_materialized,
+)
 
 logger = logging.getLogger(__name__)
 
 
 CROSS_STREAM_NAME = "cross_stream"
-
-
-def resolve_shared_base_kv(shared_base_kv: Optional[bool], target_modules) -> bool:
-    """Resolve the effective ``shared_base_kv`` for a build.
-
-    ``shared_base_kv=None`` means "auto": the flag defaults to the shared
-    base-only K/V topology (the SR production variant) when the adapter
-    opts into shadow residual (``"cross_stream"`` in ``target_modules``),
-    and to disjoint / adapter-computed K/V otherwise (plain LoRA / aLoRA).
-    An explicit ``True`` / ``False`` always wins over the auto default.
-
-    A scalar ``target_modules`` ("all-linear", a regex, or ``None``) can't
-    name ``cross_stream``, so it resolves to ``False`` — consistent with
-    :func:`_reject_kv_lora_when_shared`, which also leaves scalar shapes
-    alone.
-
-    When the auto path lands on ``False`` for a LoRA/aLoRA config, a
-    warning is logged so the topology choice is visible (K/V is computed
-    on the adapter stream, not shared from the frozen base).
-    """
-    has_cross_stream = (
-        target_modules is not None
-        and not isinstance(target_modules, str)
-        and CROSS_STREAM_NAME in target_modules
-    )
-    if shared_base_kv is not None:
-        return bool(shared_base_kv)
-    if has_cross_stream:
-        return True
-    logger.warning(
-        "shared_base_kv unset and 'cross_stream' not in target_modules "
-        "(LoRA/aLoRA config) — defaulting to shared_base_kv=False: K/V is "
-        "computed on the adapter stream (disjoint topology). Set "
-        "shared_base_kv explicitly to silence this warning."
-    )
-    return False
-
-
-def _register_cross_stream(lora_config: LoraConfig) -> None:
-    """Attach SR custom-module dispatch to ``lora_config``.
-
-    Two registrations:
-
-    - :class:`CrossStream` → :class:`CrossStreamLora`: turns the no-op
-      cross-stream site into the rank-R base→adapter projection.
-    - :class:`_StreamGatedLinear` → :class:`ShadowResidualLora`: turns
-      every Q/K/V/O/gate/up/down projection in the SR decoder into a
-      stream-gated LoRA wrapper (LoRA delta gated off in
-      ``stream_context("base")``).
-    """
-    lora_config._register_custom_module(
-        {
-            CrossStream: CrossStreamLora,
-            _StreamGatedLinear: ShadowResidualLora,
-        }
-    )
-
-
-def _build_sr_base(
-    base_model_name_or_path: str,
-    *,
-    torch_dtype: Optional[torch.dtype] = None,
-    attn_implementation: Optional[str] = None,
-    shared_base_kv: bool = False,
-) -> ShadowResidualForCausalLM:
-    """Single-process SR base build (no FSDP / meta machinery).
-
-    Used by :func:`load_shadow_residual_peft_model` for single-GPU
-    inference paths where every rank-equivalent process needs a fully
-    real SR model and the FSDP cpu-ram-efficient pattern doesn't apply.
-    The training-time FSDP path goes through
-    :func:`get_shadow_residual_peft_model` instead, which keeps non-rank-0
-    processes on meta until the broadcast.
-    """
-    sr_config = _build_sr_config(
-        base_model_name_or_path,
-        torch_dtype=torch_dtype,
-        attn_implementation=attn_implementation,
-        shared_base_kv=shared_base_kv,
-    )
-    sr_model = ShadowResidualForCausalLM(sr_config)
-    if torch_dtype is not None:
-        sr_model = sr_model.to(dtype=torch_dtype)
-
-    load_kwargs = {"low_cpu_mem_usage": True}
-    if torch_dtype is not None:
-        load_kwargs["torch_dtype"] = torch_dtype
-    if attn_implementation is not None:
-        load_kwargs["attn_implementation"] = attn_implementation
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name_or_path, **load_kwargs,
-    )
-    transfer_base_weights(base_model, sr_model, drain_src=True)
-    del base_model
-    return sr_model
-
-
-def _build_sr_config(
-    base_model_name_or_path: str,
-    *,
-    torch_dtype: Optional[torch.dtype] = None,
-    attn_implementation: Optional[str] = None,
-    shared_base_kv: bool = False,
-) -> ShadowResidualConfig:
-    """Build the SR config by reading the upstream HF config (no weights).
-
-    Pulled out so every rank can call it cheaply (config-only download,
-    no checkpoint shards) — the SR module tree is then constructed
-    identically on every rank from this config. Keeping construction
-    config-driven (vs. via from_pretrained) is what makes meta-init on
-    non-rank-0 produce a structurally identical model to rank 0's real
-    init: from_pretrained has its own meta→load-in-place machinery that
-    historically diverged the parameter insertion order, breaking FSDP's
-    sync_module_states broadcast.
-    """
-    from transformers import AutoConfig
-
-    base_config = AutoConfig.from_pretrained(base_model_name_or_path)
-    config_dict = base_config.to_dict()
-    # Normalize layer_types to all-attention. Some Granite configs ship a
-    # `layer_types` list that includes non-"attention" entries (e.g. mamba
-    # positions on hybrid configs); the SR architecture is attention-only,
-    # so any base whose actual checkpoint is attention-only — including
-    # plain `granite` models that have no mamba weights at all — should
-    # train fine after this normalization. Bases whose checkpoint really
-    # does carry mamba weights would surface as missing q/k/v/o tensors
-    # in `transfer_base_weights` and fail there with a clear error.
-    if config_dict.get("layer_types"):
-        config_dict["layer_types"] = ["attention" for _ in config_dict["layer_types"]]
-    # Force shared_intermediate_size to the upstream's intermediate_size
-    # whenever the upstream's MLP is already unfused. Without this, the
-    # GraniteMoeHybridConfig parent of ShadowResidualConfig defaults
-    # shared_intermediate_size to its own value (1024 for some bases),
-    # leaving SR's MLP a fraction the size of the upstream's. Verified
-    # against ibm-granite/granite-4.1-3b: upstream intermediate_size=8192,
-    # SR was building MLP with shared_intermediate_size=1024 → MLP
-    # weights couldn't be transferred (shape mismatch), MLP stayed
-    # randomly initialized, hidden states blew up 78x at layer 0 (see
-    # scripts/diagnose_sr_vs_upstream.py output).
-    if "intermediate_size" in config_dict and config_dict.get("shared_intermediate_size") is None:
-        config_dict["shared_intermediate_size"] = config_dict["intermediate_size"]
-    sr_config = ShadowResidualConfig(**config_dict)
-    set_shadow_residual(sr_config, enabled=True, shared_base_kv=shared_base_kv)
-    if torch_dtype is not None:
-        sr_config.torch_dtype = torch_dtype
-    if attn_implementation is not None:
-        sr_config._attn_implementation = attn_implementation
-    return sr_config
 
 
 def _materialize_and_transfer(
@@ -280,6 +133,26 @@ def _materialize_and_transfer(
                     adapter_name, init_lora_weights=True,
                 )
 
+    # Re-zero the frozen cross-stream nn.Linear weights. CrossStream is a real
+    # nn.Linear(H, H) that must be exactly zero (so base_layer(h_base)=0 and the
+    # layer output is the pure B·A cross-stream injection). ``to_empty(cpu)``
+    # above rewrote it to uninitialized GARBAGE, and neither transfer_base_weights
+    # (it's not an upstream weight) nor the LoRA reset touches it — so without this
+    # it stays garbage (observed abs_sum ~1e28 / inf / nan per layer), and
+    # cross_stream(h_base) injects inf/nan into the adapter stream → NaN logits on
+    # the adapter path (base stream stays finite). The model's _init_weights
+    # re-zeros it on plain construction, but that does not run after to_empty on
+    # this meta-materialize path. Same bug class as the RoPE-buffer reinit below.
+    from shadow_residual.shadow_residual.cross_stream import CrossStream
+
+    n_cross = 0
+    for module in peft_model.modules():
+        if isinstance(module, CrossStream):
+            torch.nn.init.zeros_(module.weight)
+            module.weight.requires_grad_(False)
+            n_cross += 1
+    logger.info("Re-zeroed %d frozen CrossStream weight(s) after materialize.", n_cross)
+
     # Re-initialize non-persistent RoPE buffers. The rotary embedding
     # registers ``inv_freq`` (and ``original_inv_freq``) with
     # persistent=False, so they are NOT in the upstream state_dict —
@@ -303,73 +176,6 @@ def _materialize_and_transfer(
         _diagnose_materialized(peft_model)
 
 
-def _reinit_rope_buffers(model) -> None:
-    """Recompute non-persistent RoPE ``inv_freq`` buffers after meta-materialize.
-
-    Walks every rotary module (anything carrying a real ``inv_freq`` buffer)
-    and recomputes its frequencies by re-instantiating the rotary class
-    fresh on CPU — its ``__init__`` runs the correct rope-init for whatever
-    rope_type the config declares, so we don't reimplement the HF dispatch
-    (which varies across transformers versions). The freshly-computed
-    ``inv_freq`` / ``original_inv_freq`` are copied in-place into the
-    materialized buffers. No-op when the model has no rotary module (e.g.
-    configs that disable RoPE). Idempotent and safe on a fully-real model.
-    See the caller for why this is required under the FSDP meta-init path.
-    """
-    n_fixed = 0
-    for module in model.modules():
-        buf = getattr(module, "inv_freq", None)
-        if buf is None or getattr(buf, "is_meta", False):
-            continue
-        config = getattr(module, "config", None)
-        if config is None:
-            continue
-        # Re-instantiate the rotary class fresh (real init, CPU). Runs the
-        # model's own rope-init recipe regardless of rope_type.
-        fresh = type(module)(config=config, device=torch.device("cpu"))
-        with torch.no_grad():
-            module.inv_freq.copy_(fresh.inv_freq.to(module.inv_freq.dtype))
-            if hasattr(module, "original_inv_freq") and hasattr(fresh, "original_inv_freq"):
-                module.original_inv_freq.copy_(
-                    fresh.original_inv_freq.to(module.original_inv_freq.dtype)
-                )
-        if hasattr(fresh, "attention_scaling"):
-            module.attention_scaling = fresh.attention_scaling
-        n_fixed += 1
-
-    logger.info("Re-initialized RoPE inv_freq buffers on %d rotary module(s).", n_fixed)
-
-
-def _diagnose_materialized(peft_model) -> None:
-    """Rank-0 finite/zero audit of every parameter and buffer post-materialize."""
-    nonfinite, allzero, n_total = [], [], 0
-    for name, t in list(peft_model.named_parameters()) + list(peft_model.named_buffers()):
-        if t is None or getattr(t, "is_meta", False):
-            nonfinite.append((name, "META"))
-            continue
-        n_total += 1
-        try:
-            if not torch.isfinite(t).all().item():
-                nonfinite.append((name, f"nonfinite shape={tuple(t.shape)} dtype={t.dtype}"))
-            elif t.numel() > 0 and bool((t == 0).all().item()):
-                allzero.append((name, f"all-zero shape={tuple(t.shape)}"))
-        except Exception as e:  # pragma: no cover - diagnostic only
-            nonfinite.append((name, f"check-failed: {e}"))
-
-    logger.info("[SR-DIAG] audited %d real tensors.", n_total)
-    logger.info("[SR-DIAG] non-finite / meta tensors: %d", len(nonfinite))
-    for name, why in nonfinite[:60]:
-        logger.info("[SR-DIAG]   NONFINITE %-70s %s", name, why)
-    logger.info(
-        "[SR-DIAG] all-zero tensors: %d (expected: lora_B.*, biases; "
-        "suspicious: any weight/norm/embedding).", len(allzero),
-    )
-    for name, why in allzero[:60]:
-        suspicious = not ("lora_B" in name or name.endswith(".bias"))
-        logger.info("[SR-DIAG]   %s %-66s %s",
-                    "SUSPECT-ZERO" if suspicious else "ok-zero", name, why)
-
-
 def _build_sr_peft_model_meta(
     sr_config: ShadowResidualConfig,
     lora_config: LoraConfig,
@@ -391,7 +197,6 @@ def _build_sr_peft_model_meta(
             # ``.to(dtype)`` rewrites dtype metadata on meta tensors —
             # no storage alloc.
             sr_model = sr_model.to(dtype=torch_dtype)
-        _register_cross_stream(lora_config)
         peft_model = get_peft_model(sr_model, lora_config, adapter_name=adapter_name)
         if torch_dtype is not None:
             # PEFT's get_peft_model calls cast_adapter_dtype, which
@@ -421,8 +226,8 @@ def _disable_merge_and_unload(peft_model) -> None:
             "merge_and_unload is disabled for shadow-residual PEFT models. "
             "Merging the LoRA delta into the base linear would break the "
             "frozen-base invariant of the shadow-residual architecture. "
-            "Use save_pretrained / load_shadow_residual_peft_model for "
-            "checkpoint round-trips instead."
+            "Use save_pretrained + PeftModel.from_pretrained (on a build_sr_base "
+            "base) for checkpoint round-trips instead."
         )
 
     peft_model.merge_and_unload = _raise
@@ -432,28 +237,41 @@ def _disable_merge_and_unload(peft_model) -> None:
         peft_model.base_model.unmerge_adapter = _raise
 
 
-def _reject_kv_lora_when_shared(lora_config: LoraConfig) -> None:
-    """Forbid LoRA on ``k_proj`` / ``v_proj`` when ``shared_base_kv=True``.
+def _reject_kv_lora(lora_config: LoraConfig) -> None:
+    """Forbid LoRA on ``k_proj`` / ``v_proj``.
 
-    In shared-base-K/V mode the adapter stream never multiplies
-    ``normed_adapt`` by ``W_K`` or ``W_V`` — there is no path through
-    which an adapter-side K/V LoRA delta could affect the cache or the
-    attention output. Silently dropping a configured K/V adapter would
-    be a footgun, so reject the combination at construction time.
+    SR uses shared base-only K/V: the adapter stream never multiplies
+    ``normed_adapt`` by ``W_K`` or ``W_V`` — there is no path through which an
+    adapter-side K/V LoRA delta could affect the cache or the attention output.
+    Silently dropping a configured K/V adapter would be a footgun, so reject the
+    combination at construction time.
+
+    ``"all-linear"`` is forbidden outright: PEFT expands it to every ``nn.Linear``
+    in the model, and SR's ``k_proj`` / ``v_proj`` are ``_StreamGatedLinear``
+    (an ``nn.Linear`` subclass), so it *would* wrap K/V — the delta would then be
+    trained and saved but never fire (base-only K/V calls ``base_layer``). Rejecting
+    the string here (rather than only inspecting an explicit name list) closes that
+    hole; SR has no legitimate all-linear use, since it always includes forbidden K/V.
     """
     targets = lora_config.target_modules
-    if targets is None or isinstance(targets, str):
-        # Scalar shapes ("all-linear", regex, etc.) — leave alone; the
-        # config_helpers validator only catches the explicit list form.
-        # The user opted into "all linears" intentionally; shared_base_kv
-        # is only a meaningful pairing with named target_modules.
+    if targets is None:
+        return
+    if isinstance(targets, str):
+        if targets == "all-linear":
+            raise ValueError(
+                'SR forbids target_modules="all-linear" (it expands to every '
+                "nn.Linear, including the forbidden K/V projections — shared "
+                "base-only K/V has no place for an adapter-side delta to land). "
+                "List the SR target modules explicitly (q_proj, o_proj, mlp, "
+                "cross_stream, …) instead."
+            )
         return
     bad = [name for name in targets if name in {"k_proj", "v_proj"}]
     if bad:
         raise ValueError(
-            "shared_base_kv=True forbids LoRA on K/V projections (no "
-            "place for an adapter-side delta to land — K/V is computed "
-            f"once from normed_base). Got target_modules entries: {bad}."
+            "SR forbids LoRA on K/V projections (shared base-only K/V — no place "
+            "for an adapter-side delta to land; K/V is computed once from "
+            f"normed_base). Remove these target_modules entries: {bad}."
         )
 
 
@@ -464,9 +282,11 @@ def get_shadow_residual_peft_model(
     torch_dtype: Optional[torch.dtype] = None,
     adapter_name: str = "default",
     attn_implementation: Optional[str] = None,
-    shared_base_kv: Optional[bool] = None,
 ):
     """Build a :class:`peft.PeftModel` for shadow-residual + LoRA.
+
+    SR uses a single topology: shared base-only K/V dual-stream. K/V LoRA is
+    forbidden (no place for a K/V delta to land).
 
     Args:
         base_model_name_or_path: HF model id or local path of the base
@@ -474,35 +294,23 @@ def get_shadow_residual_peft_model(
         lora_config: a stock :class:`peft.LoraConfig`.  Driving fields:
 
             * ``target_modules`` — projection names to attach LoRA on, plus
-              optionally ``"cross_stream"`` to opt into shadow residual.
+              ``"cross_stream"`` to opt into shadow residual. Must NOT include
+              ``k_proj`` / ``v_proj``.
             * ``r``, ``lora_alpha``, ``lora_dropout`` — defaults.
-            * ``rank_pattern={"cross_stream": R}`` — overrides cross-stream
-              rank.
-            * ``alora_invocation_tokens`` — when set, every wrapped
-              projection is gated to positions ≥ the last invocation match.
-              :class:`CrossStreamLora` honours the same gate.
+            * ``rank_pattern={"cross_stream": R}`` — overrides cross-stream rank.
+            The adapter is plain LoRA (always active); there is no gated activation.
         torch_dtype: dtype for the base model construction.
         adapter_name: PEFT adapter name (default: ``"default"``).
-        shared_base_kv: when True, the adapter stream attends to a
-            single base-only K/V (one cache; K/V computed once from
-            ``normed_base``). Forbids K/V LoRA. See
-            :mod:`shadow_residual.shadow_residual.attention_hf`. ``None``
-            (the default) auto-resolves via :func:`resolve_shared_base_kv`:
-            True when ``"cross_stream"`` is in ``target_modules``, else
-            False (with a warning).
 
     Returns:
         :class:`peft.PeftModel`.
     """
-    shared_base_kv = resolve_shared_base_kv(shared_base_kv, lora_config.target_modules)
-    if shared_base_kv:
-        _reject_kv_lora_when_shared(lora_config)
+    _reject_kv_lora(lora_config)
     logger.info(
-        "Building SR base from upstream HF Granite; registering CrossStreamLora. "
-        "target_modules=%s — cross_stream %s in target_modules. shared_base_kv=%s",
+        "Building SR base from upstream HF Granite. target_modules=%s "
+        "(cross_stream %s present).",
         lora_config.target_modules,
         "is" if CROSS_STREAM_NAME in (lora_config.target_modules or []) else "is not",
-        shared_base_kv,
     )
 
     # Path-D pipeline: every rank builds SR + PEFT-wrap on meta with an
@@ -514,7 +322,6 @@ def get_shadow_residual_peft_model(
         base_model_name_or_path,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
-        shared_base_kv=shared_base_kv,
     )
 
     peft_model = _build_sr_peft_model_meta(

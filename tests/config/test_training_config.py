@@ -32,8 +32,6 @@ def _minimal(**overrides) -> dict:
 @pytest.mark.parametrize(
     "name",
     [
-        "lora-qkvo-mlp-r16.yaml",
-        "alora-all-linear-r16.yaml",
         "sr-qo-mlp-r32-c32-sharedkv.yaml",
     ],
 )
@@ -54,59 +52,23 @@ def test_g42_config_validates(monkeypatch):
     monkeypatch.setenv("BASE_MODEL", "/models/granite-4.2-3b")
     cfg = load_training_config(EXAMPLES / "sr-qo-mlp-r32-c32-sharedkv-g42.yaml")
     assert cfg.model.base == "/models/granite-4.2-3b"      # ${BASE_MODEL} resolved
-    assert cfg.model.shared_base_kv is True
-    assert cfg.adapter.invocation_tokens == "<|im_start|>assistant\n"  # ChatML marker
+    # ChatML thinking-OFF: generation begins after </think>, so that is the last
+    # context token; the collator masks through "<|im_start|>assistant\n<think></think>".
+    assert cfg.adapter.last_context_token == "</think>"
+    assert cfg.data.assistant_marker == "<|im_start|>assistant\n<think></think>"
+    assert cfg.adapter.last_token == "<|im_end|>"
 
 
-# --- shared_base_kv default + resolution --------------------------------------
-
-def test_shared_base_kv_defaults_to_none():
-    """Unset shared_base_kv is None ('auto'), not a hard False."""
-    cfg = TrainingConfig.model_validate(_minimal())
-    assert cfg.model.shared_base_kv is None
-
-
-def test_shared_base_kv_explicit_values_round_trip():
-    for val in (True, False):
-        cfg = TrainingConfig.model_validate(
-            _minimal(model={"base": "ibm-granite/granite-4.1-3b", "shared_base_kv": val})
+def test_shared_base_kv_key_is_rejected():
+    """SR is shared-KV-only — there is no `shared_base_kv` toggle. The key was
+    removed from ModelConfig; ModelConfig forbids extras, so a YAML that still
+    sets it must fail loudly rather than silently no-op."""
+    import pytest
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        TrainingConfig.model_validate(
+            _minimal(model={"base": "ibm-granite/granite-4.1-3b", "shared_base_kv": True})
         )
-        assert cfg.model.shared_base_kv is val
-
-
-def test_resolve_shared_base_kv_cross_stream_defaults_true():
-    from shadow_residual.peft_shadow_residual.factory import resolve_shared_base_kv
-
-    assert resolve_shared_base_kv(None, ["q_proj", "o_proj", "cross_stream"]) is True
-
-
-def test_resolve_shared_base_kv_lora_defaults_false_with_warning(caplog):
-    from shadow_residual.peft_shadow_residual.factory import resolve_shared_base_kv
-
-    with caplog.at_level(logging.WARNING):
-        result = resolve_shared_base_kv(None, ["q_proj", "k_proj", "v_proj", "o_proj"])
-    assert result is False
-    assert any("shared_base_kv unset" in r.message for r in caplog.records)
-
-
-def test_resolve_shared_base_kv_explicit_wins(caplog):
-    from shadow_residual.peft_shadow_residual.factory import resolve_shared_base_kv
-
-    # Explicit False on a cross_stream config still yields False, no warning.
-    with caplog.at_level(logging.WARNING):
-        assert resolve_shared_base_kv(False, ["q_proj", "cross_stream"]) is False
-        # Explicit True on a LoRA config yields True, no warning.
-        assert resolve_shared_base_kv(True, ["q_proj", "k_proj"]) is True
-    assert not any("shared_base_kv unset" in r.message for r in caplog.records)
-
-
-def test_resolve_shared_base_kv_scalar_target_modules_defaults_false(caplog):
-    from shadow_residual.peft_shadow_residual.factory import resolve_shared_base_kv
-
-    # Scalar / regex / None target_modules can't name cross_stream -> False.
-    with caplog.at_level(logging.WARNING):
-        assert resolve_shared_base_kv(None, None) is False
-        assert resolve_shared_base_kv(None, "all-linear") is False
 
 
 # --- adapter.target_modules: scalar vs dict -----------------------------------
@@ -157,25 +119,37 @@ def test_old_r_field_rejected():
         )
 
 
-# --- adapter.invocation_tokens (gated activation) -----------------------------
+# --- adapter.last_context_token / last_token ----------------------------------
 
-def test_invocation_tokens_unset_keeps_gradient_checkpointing(caplog):
+def test_token_markers_default_none():
+    cfg = TrainingConfig.model_validate(_minimal())
+    assert cfg.adapter.last_context_token is None
+    assert cfg.adapter.last_token is None
+
+
+def test_token_markers_set():
     cfg = TrainingConfig.model_validate(
-        _minimal(batch={"gradient_checkpointing": True})
+        _minimal(adapter={"last_context_token": "<|end_of_role|>", "last_token": "<|end_of_text|>"})
     )
-    assert cfg.adapter.invocation_tokens is None
-    assert cfg.batch.gradient_checkpointing is True
+    assert cfg.adapter.last_context_token == "<|end_of_role|>"
+    assert cfg.adapter.last_token == "<|end_of_text|>"
 
 
-def test_invocation_tokens_set_disables_gradient_checkpointing(caplog):
+def test_token_markers_keep_gradient_checkpointing():
+    """The markers don't gate the adapter and don't touch gradient checkpointing
+    — it's honored as set (no eval/GC force-off; aLoRA was removed)."""
     cfg = _minimal(
-        adapter={"invocation_tokens": "<|x|>"},
+        adapter={"last_context_token": "<|x|>"},
         batch={"gradient_checkpointing": True},
     )
-    with caplog.at_level(logging.WARNING):
-        out = TrainingConfig.model_validate(cfg)
-    assert out.batch.gradient_checkpointing is False
-    assert any("PEFT #2826" in r.message for r in caplog.records)
+    out = TrainingConfig.model_validate(cfg)
+    assert out.batch.gradient_checkpointing is True
+
+
+def test_invocation_tokens_field_rejected():
+    """The old aLoRA field is gone; AdapterConfig forbids extras."""
+    with pytest.raises(ValidationError):
+        TrainingConfig.model_validate(_minimal(adapter={"invocation_tokens": "<|x|>"}))
 
 
 # --- Removed fields are loudly rejected ---------------------------------------
@@ -343,7 +317,18 @@ def test_to_peft_config_scalar_target_modules():
     pc = to_peft_config(cfg)
     assert pc.r == 16
     assert pc.lora_alpha == 32  # default 2 * rank
-    assert pc.target_modules == "all-linear"
+    # Scalar maps to the fixed SR-safe target set — NOT "all-linear", which would
+    # wrap the forbidden K/V projections (rejected in factory._reject_kv_lora).
+    assert sorted(pc.target_modules) == [
+        "cross_stream",
+        "down_proj",
+        "gate_proj",
+        "o_proj",
+        "q_proj",
+        "up_proj",
+    ]
+    assert "k_proj" not in pc.target_modules
+    assert "v_proj" not in pc.target_modules
     # Scalar shape should not produce a rank_pattern
     assert getattr(pc, "rank_pattern", None) in (None, {})
 
@@ -362,13 +347,17 @@ def test_to_peft_config_per_module_target_modules():
     assert pc.rank_pattern == {"q_proj": 16, "gate_proj": 64}
 
 
-def test_invocation_tokens_to_training_arguments_disables_gc():
+def test_to_training_arguments_keeps_gc():
+    """to_training_arguments passes gradient_checkpointing through as configured.
+    Note: train.py separately sets the Trainer's flag False and manages
+    checkpointing on the model itself — this test only pins that the config layer
+    doesn't mutate it."""
     pytest.importorskip("transformers")
     from shadow_residual.config.adapters import to_training_arguments
 
     cfg = TrainingConfig.model_validate(_minimal(
-        adapter={"invocation_tokens": "<|x|>"},
+        adapter={"last_context_token": "<|x|>"},
         batch={"gradient_checkpointing": True},
     ))
     args = to_training_arguments(cfg)
-    assert args.gradient_checkpointing is False
+    assert args.gradient_checkpointing is True

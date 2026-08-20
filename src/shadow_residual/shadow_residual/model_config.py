@@ -18,8 +18,8 @@ duplicate that path without benefit.
 Note: this is a clean break from the previous ``granite_switch`` model type.
 Old full-model checkpoints with ``model_type: "granite_switch"`` in their
 ``config.json`` will no longer auto-resolve via ``AutoConfig``. The adapter
-workflow (``load_shadow_residual_peft_model``) is unaffected — it builds from
-the upstream Granite base model.
+workflow (``build_sr_base`` + ``PeftModel.from_pretrained``) is unaffected —
+it builds from the upstream Granite base model.
 """
 
 from __future__ import annotations

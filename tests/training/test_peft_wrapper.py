@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the shadow-residual PEFT integration (no HF download required).
 
-After Phase 2 of the SR refactor, SR built-in LoRA tensors
-(``q_lora_A``/``o_lora_A``/``gate_up_lora_B_slices``/``down_lora_B``) and
-the ``_freeze_sr_builtin_loras`` helper no longer exist. LoRA comes
-exclusively from PEFT, dispatched onto the SR ``_StreamGatedLinear``
-projections via :class:`ShadowResidualLora` and onto the no-op
-:class:`CrossStream` site via :class:`CrossStreamLora`.
+SR is adapted with 100% stock PEFT: there is no custom LoRA layer class and no
+``_register_custom_module`` call. The cross-stream site is a real frozen
+zero-init ``nn.Linear`` (:class:`CrossStream`) that stock
+:class:`peft.tuners.lora.layer.Linear` wraps like any other target when
+``"cross_stream"`` is in ``target_modules``. The Q/K/V/O/MLP projections are
+likewise wrapped by stock LoRA; the base-stream frozen invariant is a pure
+``base_layer()`` call in the decoder, not a custom wrapper.
 
 What this file exercises:
 
-- :class:`CrossStreamLora` is dispatched at every ``cross_stream`` site
-  when ``"cross_stream"`` is in ``target_modules``.
+- Stock ``lora.Linear`` is dispatched at every ``cross_stream`` site when
+  ``"cross_stream"`` is in ``target_modules``.
 - ``rank_pattern`` / ``alpha_pattern`` flow through to the wrapper.
 - End-to-end forward returns the right logits shape.
 - ``save_pretrained`` writes the standard PEFT layout (no SR sidecar).
@@ -28,17 +29,11 @@ from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
-from shadow_residual.shadow_residual._stream_gated_linear import (
-    _StreamGatedLinear,
-)
 from shadow_residual.shadow_residual.config_helpers import (
     set_shadow_residual,
 )
+from peft.tuners.lora.layer import Linear as StockLoraLinear
 from shadow_residual.shadow_residual.cross_stream import CrossStream
-from shadow_residual.peft_shadow_residual import CrossStreamLora
-from shadow_residual.peft_shadow_residual.stream_gated_lora import (
-    ShadowResidualLora,
-)
 
 
 @pytest.fixture
@@ -66,10 +61,16 @@ def _make_peft_sr_model(sr_model, **lora_kwargs):
         lora_dropout=0.0,
         **lora_kwargs,
     )
-    lora_cfg._register_custom_module(
-        {CrossStream: CrossStreamLora, _StreamGatedLinear: ShadowResidualLora}
-    )
+    # No custom-module registration: cross_stream is a stock LoRA target.
     return get_peft_model(sr_model, lora_cfg), lora_cfg
+
+
+def _cross_stream_wrappers(peft_model):
+    """Stock lora.Linear layers whose wrapped base is a CrossStream site."""
+    return [
+        m for m in peft_model.modules()
+        if isinstance(m, StockLoraLinear) and isinstance(m.base_layer, CrossStream)
+    ]
 
 
 def test_cross_stream_sites_present_on_sr_model(tiny_sr_model):
@@ -78,12 +79,12 @@ def test_cross_stream_sites_present_on_sr_model(tiny_sr_model):
     assert len(sites) >= 1
 
 
-def test_peft_wraps_cross_stream_with_custom_layer(tiny_sr_model):
-    """get_peft_model installs CrossStreamLora at every cross_stream site."""
+def test_peft_wraps_cross_stream_with_stock_layer(tiny_sr_model):
+    """get_peft_model installs a STOCK lora.Linear at every cross_stream site."""
     peft_model, _ = _make_peft_sr_model(tiny_sr_model)
 
-    wrappers = [m for m in peft_model.modules() if isinstance(m, CrossStreamLora)]
-    assert wrappers, "expected at least one CrossStreamLora wrapper in the model"
+    wrappers = _cross_stream_wrappers(peft_model)
+    assert wrappers, "expected at least one stock lora.Linear on a cross_stream site"
 
     for w in wrappers:
         assert "default" in w.lora_A
@@ -96,7 +97,7 @@ def test_rank_pattern_overrides_cross_stream_rank(tiny_sr_model):
     peft_model, _ = _make_peft_sr_model(
         tiny_sr_model, r=8, rank_pattern={"cross_stream": 16},
     )
-    wrappers = [m for m in peft_model.modules() if isinstance(m, CrossStreamLora)]
+    wrappers = _cross_stream_wrappers(peft_model)
     assert wrappers
     for w in wrappers:
         assert w.lora_A["default"].weight.shape == (16, 64)
@@ -108,7 +109,7 @@ def test_alpha_pattern_overrides_cross_stream_alpha(tiny_sr_model):
     peft_model, _ = _make_peft_sr_model(
         tiny_sr_model, r=8, lora_alpha=16, alpha_pattern={"cross_stream": 32},
     )
-    wrappers = [m for m in peft_model.modules() if isinstance(m, CrossStreamLora)]
+    wrappers = _cross_stream_wrappers(peft_model)
     assert wrappers
     for w in wrappers:
         # scaling = alpha / r = 32 / 8 = 4.0 (vs default 16/8 = 2.0)
@@ -124,22 +125,21 @@ def test_forward_through_peft_sr_model(tiny_sr_model):
     assert out.logits.shape == (1, 6, tiny_sr_model.config.vocab_size)
 
 
-def test_q_proj_target_installs_shadow_residual_lora(tiny_sr_model):
-    """target_modules=['q_proj','cross_stream'] dispatches SR LoRA on q_proj."""
+def test_q_proj_and_cross_stream_both_install_stock_lora(tiny_sr_model):
+    """target_modules=['q_proj','cross_stream'] dispatches STOCK LoRA on BOTH
+    q_proj and cross_stream — SR uses no custom projection wrapper at all. The
+    base-stream gate is a pure base_layer() call in the decoder."""
     peft_model, _ = _make_peft_sr_model(
         tiny_sr_model, target_modules=["q_proj", "cross_stream"],
     )
-    sr_loras = [
+    q_loras = [
         (n, m) for n, m in peft_model.named_modules()
-        if isinstance(m, ShadowResidualLora)
+        if n.endswith(".q_proj") and isinstance(m, StockLoraLinear)
     ]
-    assert sr_loras, "expected ShadowResidualLora dispatched on q_proj"
-    assert any(n.endswith(".q_proj") for n, _ in sr_loras)
+    assert q_loras, "expected a stock lora.Linear dispatched on q_proj"
 
-    cross_wrappers = [
-        m for m in peft_model.modules() if isinstance(m, CrossStreamLora)
-    ]
-    assert cross_wrappers, "expected CrossStreamLora dispatched on cross_stream"
+    cross_wrappers = _cross_stream_wrappers(peft_model)
+    assert cross_wrappers, "expected a stock lora.Linear dispatched on cross_stream"
 
 
 def test_save_pretrained_writes_standard_peft_layout(tiny_sr_model):

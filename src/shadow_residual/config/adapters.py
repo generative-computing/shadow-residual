@@ -16,6 +16,21 @@ if TYPE_CHECKING:
     from transformers import TrainerCallback, TrainingArguments
 
 
+# SR-safe target set for a uniform scalar rank. Excludes k_proj/v_proj (shared
+# base-only K/V — an adapter-side K/V delta has nowhere to land) and includes
+# cross_stream (engages the dual-stream SR forward). See
+# factory._reject_kv_lora, which forbids the "all-linear" shortcut for the same
+# reason.
+_SR_SCALAR_TARGETS = [
+    "q_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "cross_stream",
+]
+
+
 def to_training_arguments(cfg: TrainingConfig) -> "TrainingArguments":
     """Build transformers.TrainingArguments from a unified config.
 
@@ -89,8 +104,11 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
         r_scalar = min(a.target_modules.values())
         rank_pattern: dict[str, int] | None = dict(a.target_modules)
     else:
-        # Uniform scalar: apply to "all-linear" with the same rank everywhere.
-        target_names = "all-linear"
+        # Uniform scalar: apply the same rank to the fixed SR-safe module set.
+        # NOT "all-linear" — that would wrap the forbidden K/V projections
+        # (rejected in factory._reject_kv_lora). Listing modules explicitly keeps
+        # K/V out and engages the dual-stream forward via "cross_stream".
+        target_names = _SR_SCALAR_TARGETS
         r_scalar = a.target_modules
         rank_pattern = None
 

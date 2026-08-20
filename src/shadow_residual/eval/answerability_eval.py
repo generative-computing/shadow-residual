@@ -292,10 +292,9 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
         device_str: "auto", "cpu", or "cuda"
     """
     from transformers import AutoTokenizer
+    from peft import PeftModel
 
-    from shadow_residual.peft_shadow_residual import (
-        load_shadow_residual_peft_model,
-    )
+    from shadow_residual.shadow_residual.build import build_sr_base
 
     # Resolve device
     if device_str == "auto":
@@ -324,11 +323,8 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
     # path: cross-stream LoRA weights need CrossStream sites to bind to,
     # which only exist on a ShadowResidualForCausalLM.
     print(f"Loading SR base + adapter from: {adapter_path}")
-    model = load_shadow_residual_peft_model(
-        base_model_name,
-        adapter_path,
-        torch_dtype=dtype,
-    )
+    base_model = build_sr_base(base_model_name, torch_dtype=dtype)
+    model = PeftModel.from_pretrained(base_model, adapter_path)
     model = model.to(device)
     model.eval()
 

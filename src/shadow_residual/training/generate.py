@@ -480,10 +480,9 @@ def run_generation_under_fsdp(
         StateDictType,
     )
 
-    from shadow_residual.peft_shadow_residual.factory import (
-        _build_sr_config,
+    from shadow_residual.shadow_residual.build import build_sr_config as _build_sr_config
+    from shadow_residual.training.factory import (
         _build_sr_peft_model_meta,
-        resolve_shared_base_kv,
     )
 
     is_rank0 = accelerator.process_index == 0
@@ -579,9 +578,6 @@ def run_generation_under_fsdp(
             cfg.model.base,
             torch_dtype=torch.bfloat16,
             attn_implementation=cfg.model.attn_implementation,
-            shared_base_kv=resolve_shared_base_kv(
-                cfg.model.shared_base_kv, peft_config.target_modules
-            ),
         )
         rebuilt = _build_sr_peft_model_meta(
             sr_config,
@@ -673,10 +669,9 @@ def main(argv: list[str] | None = None) -> int:
     # transformers/peft installed.
     import torch
     from transformers import AutoTokenizer
+    from peft import PeftModel
 
-    from shadow_residual.peft_shadow_residual import (
-        load_shadow_residual_peft_model,
-    )
+    from shadow_residual.shadow_residual.build import build_sr_base
 
     # Load tokenizer (prefer the one saved next to the adapter; some adapters
     # carry tokenizer changes worth preserving).
@@ -692,13 +687,12 @@ def main(argv: list[str] | None = None) -> int:
     # only correct path: the cross-stream weights need CrossStream sites
     # to bind to, which only exist on a ShadowResidualForCausalLM.
     logger.info("Loading SR base + adapter from %s ...", checkpoint_path)
-    model = load_shadow_residual_peft_model(
+    base_model = build_sr_base(
         cfg.model.base,
-        str(checkpoint_path),
         torch_dtype=torch.bfloat16,
         attn_implementation=cfg.model.attn_implementation,
-        shared_base_kv=cfg.model.shared_base_kv,
     )
+    model = PeftModel.from_pretrained(base_model, str(checkpoint_path))
     if torch.cuda.is_available():
         model = model.to("cuda")
 

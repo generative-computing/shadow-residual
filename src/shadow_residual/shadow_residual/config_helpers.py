@@ -30,25 +30,18 @@ def validate_shadow_residual_config(config: ShadowResidualConfig) -> None:
       checkpoints.
     - ``shadow_residual=True`` requires every layer to be of type
       ``"attention"`` (no SSM / mamba layers).
-    - ``shared_base_kv=True`` requires ``shadow_residual=True``. The flag
-      is an SR-internal knob (it picks between disjoint per-stream K/V
-      and a single base-only K/V shared with the adapter stream).
 
-    The previous check ``num_adapters > 0`` was dropped — SR does not
-    use adapter routing or switching scaffolding.
+    SR uses a single K/V topology (shared base-only K/V), so there is no
+    ``shared_base_kv`` toggle to validate.
 
     Raises:
         ValueError: if any of the above is violated.
     """
     shadow_residual = bool(getattr(config, "shadow_residual", False))
     cross_stream_rank = getattr(config, "cross_stream_rank", None)
-    shared_base_kv = bool(getattr(config, "shared_base_kv", False))
 
     if cross_stream_rank is not None and not shadow_residual:
         raise ValueError("cross_stream_rank requires shadow_residual=True")
-
-    if shared_base_kv and not shadow_residual:
-        raise ValueError("shared_base_kv=True requires shadow_residual=True")
 
     if not shadow_residual:
         return
@@ -66,23 +59,17 @@ def set_shadow_residual(
     *,
     enabled: bool = True,
     cross_stream_rank: "int | None" = None,
-    shared_base_kv: bool = False,
 ) -> ShadowResidualConfig:
     """Mutate ``config`` to enable shadow-residual and validate the result.
 
-    ``shared_base_kv`` selects between disjoint per-stream K/V (the
-    default — adapter K/V is computed from ``normed_adapt`` into a
-    second cache) and a single base-only K/V (computed once from
-    ``normed_base``, shared with the adapter stream's Q at attention
-    time, single cache). The shared mode forbids LoRA on ``k_proj`` /
-    ``v_proj`` because there is no place for an adapter-side K/V delta
-    to land — that constraint is enforced at PEFT-attach time, not here.
+    SR uses a single K/V topology (shared base-only K/V) — K/V is computed once
+    from the base stream and shared with the adapter stream's Q; LoRA on
+    ``k_proj`` / ``v_proj`` is forbidden (enforced at PEFT-attach time).
 
     Returns the same config object for chaining.
     """
     config.shadow_residual = enabled
     config.cross_stream_rank = cross_stream_rank
-    config.shared_base_kv = shared_base_kv
     validate_shadow_residual_config(config)
     return config
 

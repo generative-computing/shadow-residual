@@ -22,7 +22,7 @@ from transformers import (
     GraniteMoeHybridForCausalLM,
 )
 
-from shadow_residual.peft_shadow_residual.factory import _build_sr_base
+from shadow_residual.training.factory import _build_sr_base
 from shadow_residual.shadow_residual import ShadowResidualForCausalLM
 from shadow_residual.shadow_residual.model_config import (
     ShadowResidualConfig as ShadowResidualConfig,
@@ -85,8 +85,13 @@ def _patch_auto(monkeypatch, _factory_mod, tiny_base_model):
         def from_pretrained(cls, *a, **kw):
             return tiny_base_model
 
+    # AutoModelForCausalLM is used both in factory (_materialize_and_transfer)
+    # and in the model-construction module build.py (build_sr_base). Patch both
+    # namespaces so whichever path the test drives hits the stub.
     monkeypatch.setattr(_factory_mod, "AutoModelForCausalLM", _StubAuto)
-    # _build_sr_config does ``from transformers import AutoConfig`` at call
+    from shadow_residual.shadow_residual import build as _build_mod
+    monkeypatch.setattr(_build_mod, "AutoModelForCausalLM", _StubAuto)
+    # build_sr_config does ``from transformers import AutoConfig`` at call
     # time, so patch the canonical attribute on the transformers module.
     monkeypatch.setattr(_transformers_mod, "AutoConfig", _StubAutoConfig)
 
@@ -99,7 +104,7 @@ def test_build_sr_base_via_monkeypatch(tiny_base_model, monkeypatch):
     weights); we monkey-patch both to return our tiny in-memory model so
     the test runs offline and fast.
     """
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
+    from shadow_residual.training import factory as _factory_mod
 
     _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
 
@@ -198,8 +203,8 @@ def test_get_peft_model_non_rank0_stays_on_meta(tiny_base_model, monkeypatch):
       - ``transfer_base_weights`` is NOT called (skipped on non-rank-0).
     """
     from peft import LoraConfig
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
@@ -228,7 +233,7 @@ def test_get_peft_model_non_rank0_stays_on_meta(tiny_base_model, monkeypatch):
 
     monkeypatch.setattr(_factory_mod, "transfer_base_weights", _spy_transfer)
 
-    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"])
+    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "o_proj"])
     peft_model = get_shadow_residual_peft_model(
         "ignored-path", lora_config, torch_dtype=None,
     )
@@ -277,8 +282,8 @@ def test_get_peft_model_rank0_materializes_and_transfers(tiny_base_model, monkey
     → from_pretrained → transfer with drain_src=True → reset_lora_parameters.
     """
     from peft import LoraConfig
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
@@ -294,7 +299,7 @@ def test_get_peft_model_rank0_materializes_and_transfers(tiny_base_model, monkey
 
     monkeypatch.setattr(_factory_mod, "transfer_base_weights", _spy_transfer)
 
-    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"])
+    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "o_proj"])
     peft_model = get_shadow_residual_peft_model(
         "ignored-path", lora_config, torch_dtype=None,
     )
@@ -312,6 +317,52 @@ def test_get_peft_model_rank0_materializes_and_transfers(tiny_base_model, monkey
     assert p.device.type == "cpu", f"rank 0 should have CPU params; got {p.device}."
 
 
+def test_materialize_rezeros_frozen_cross_stream(tiny_base_model, monkeypatch):
+    """After meta-materialize, every frozen CrossStream weight must be EXACTLY zero.
+
+    Regression guard for the adapter-stream NaN bug: CrossStream is a real
+    ``nn.Linear(H, H)`` that must be all-zero so ``base_layer(h_base)=0`` and the
+    layer output is the pure B·A cross-stream injection. ``to_empty(cpu)`` in
+    ``_materialize_and_transfer`` rewrites it to uninitialized GARBAGE
+    (observed abs_sum ~1e28 / inf / nan on granite-4.1-3b), and neither
+    transfer_base_weights nor the LoRA reset touches it — so without an explicit
+    re-zero, ``cross_stream(h_base)`` injects inf/nan into the adapter stream and
+    the adapter-path logits go NaN (base-stream logits stay finite). Confirmed on
+    real Granite: adapters-ON forward → NaN; re-zero → finite.
+    """
+    import torch
+    from peft import LoraConfig
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
+        get_shadow_residual_peft_model,
+    )
+    from shadow_residual.shadow_residual.cross_stream import CrossStream
+
+    _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    # SR forbids K/V LoRA — target Q/O (not k/v_proj) alongside cross_stream.
+    lora_config = LoraConfig(
+        r=2, lora_alpha=4, target_modules=["q_proj", "o_proj", "cross_stream"],
+    )
+    peft_model = get_shadow_residual_peft_model(
+        "ignored-path", lora_config, torch_dtype=None,
+    )
+
+    n = 0
+    for module in peft_model.modules():
+        if isinstance(module, CrossStream):
+            n += 1
+            w = module.weight
+            assert torch.isfinite(w).all(), "cross_stream weight non-finite after materialize"
+            assert float(w.abs().sum()) == 0.0, (
+                "cross_stream base weight must be EXACTLY zero after materialize "
+                f"(got abs_sum={float(w.abs().sum())}) — to_empty garbage not re-zeroed"
+            )
+            assert w.requires_grad is False, "cross_stream must stay frozen"
+    assert n > 0, "expected at least one CrossStream site in the built model"
+
+
 def test_materialize_reties_lm_head_to_embed_tokens(tiny_base_model, monkeypatch):
     """After meta-materialize, lm_head.weight must SHARE storage with embed_tokens.
 
@@ -326,15 +377,15 @@ def test_materialize_reties_lm_head_to_embed_tokens(tiny_base_model, monkeypatch
     invariant on the rank-0 / non-FSDP (all-ranks-materialize) path.
     """
     from peft import LoraConfig
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
     _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
     monkeypatch.setenv("LOCAL_RANK", "0")
 
-    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"])
+    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "o_proj"])
     peft_model = get_shadow_residual_peft_model(
         "ignored-path", lora_config, torch_dtype=None,
     )
@@ -417,8 +468,8 @@ def test_untied_weight_transfer_populates_lm_head(tiny_untied_base_model, monkey
     the embedding afterwards (which would clobber it → garbage logits → NaN).
     """
     from peft import LoraConfig
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
@@ -431,7 +482,7 @@ def test_untied_weight_transfer_populates_lm_head(tiny_untied_base_model, monkey
     assert src_lm.data_ptr() != src_emb.data_ptr()
     assert not torch.allclose(src_lm, src_emb)
 
-    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"])
+    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "o_proj"])
     peft_model = get_shadow_residual_peft_model("ignored-path", lora_config, torch_dtype=None)
 
     sr_inner = peft_model.base_model.model
@@ -469,7 +520,7 @@ def test_reinit_rope_buffers_restores_nonfinite_inv_freq():
     from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
         GraniteMoeHybridRotaryEmbedding,
     )
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training.factory import (
         _reinit_rope_buffers,
     )
 
@@ -501,15 +552,15 @@ def test_get_peft_model_unset_local_rank_treated_as_rank0(tiny_base_model, monke
     accidentally hit the meta-device path.
     """
     from peft import LoraConfig
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
     _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
     monkeypatch.delenv("LOCAL_RANK", raising=False)
 
-    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"])
+    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "o_proj"])
     peft_model = get_shadow_residual_peft_model(
         "ignored-path", lora_config, torch_dtype=None,
     )
@@ -534,15 +585,15 @@ def test_get_peft_model_rank0_lora_init_is_kaiming_a_zero_b(tiny_base_model, mon
     """
     from peft import LoraConfig
     from peft.tuners.lora.layer import LoraLayer
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
     _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
     monkeypatch.setenv("LOCAL_RANK", "0")
 
-    lora_config = LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj"])
+    lora_config = LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "o_proj"])
     peft_model = get_shadow_residual_peft_model(
         "ignored-path", lora_config, torch_dtype=None,
     )
@@ -583,8 +634,8 @@ def test_get_peft_model_rank0_base_weights_match_upstream(tiny_base_model, monke
     landed in a stale tensor reference.
     """
     from peft import LoraConfig
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
@@ -606,7 +657,7 @@ def test_get_peft_model_rank0_base_weights_match_upstream(tiny_base_model, monke
     src_cfg = tiny_base_model.config
     for layer_idx in range(src_cfg.num_hidden_layers):
         sr_attn = sr_inner.model.layers[layer_idx].self_attn
-        # q_proj is now a ShadowResidualLora wrapper; the base weight
+        # q_proj is now a stock lora.Linear wrapper; the base weight
         # lives on .base_layer.weight.
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
             sr_proj = getattr(sr_attn, proj)
@@ -729,7 +780,7 @@ def test_build_sr_base_from_unfused_granite(tiny_granite_base_model, monkeypatch
 
     This test reproduces both: every dst MLP weight must equal the src.
     """
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
+    from shadow_residual.training import factory as _factory_mod
 
     _patch_auto(monkeypatch, _factory_mod, tiny_granite_base_model)
 
@@ -792,15 +843,15 @@ def test_get_peft_model_meta_path_uniform_dtype(tiny_base_model, monkeypatch):
     block containing both.
     """
     from peft import LoraConfig
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
     _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
     monkeypatch.setenv("LOCAL_RANK", "1")  # non-rank-0: stays on meta
 
-    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"])
+    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "o_proj"])
     peft_model = get_shadow_residual_peft_model(
         "ignored-path", lora_config, torch_dtype=torch.bfloat16,
     )
@@ -828,15 +879,15 @@ def test_get_peft_model_rank0_materialized_uniform_dtype(tiny_base_model, monkey
     default for empty Linear).
     """
     from peft import LoraConfig
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
     _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
     monkeypatch.setenv("LOCAL_RANK", "0")
 
-    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"])
+    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "o_proj"])
     peft_model = get_shadow_residual_peft_model(
         "ignored-path", lora_config, torch_dtype=torch.bfloat16,
     )
@@ -866,8 +917,8 @@ def test_get_peft_model_non_rank0_materializes_without_fsdp(tiny_base_model, mon
     """
     import torch
     from peft import LoraConfig
-    from shadow_residual.peft_shadow_residual import factory as _factory_mod
-    from shadow_residual.peft_shadow_residual.factory import (
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
         get_shadow_residual_peft_model,
     )
 
@@ -895,7 +946,7 @@ def test_get_peft_model_non_rank0_materializes_without_fsdp(tiny_base_model, mon
 
     monkeypatch.setattr(_factory_mod, "transfer_base_weights", _spy_transfer)
 
-    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"])
+    lora_config = LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "o_proj"])
     peft_model = get_shadow_residual_peft_model(
         "ignored-path", lora_config, torch_dtype=None,
     )
@@ -907,3 +958,78 @@ def test_get_peft_model_non_rank0_materializes_without_fsdp(tiny_base_model, mon
     assert len(transfer_calls) >= 1, "without FSDP, non-rank-0 must transfer base weights"
     meta_params = [n for n, p in peft_model.named_parameters() if p.device.type == "meta"]
     assert not meta_params, f"non-rank-0 still has meta params without FSDP: {meta_params[:3]}"
+
+
+def test_kv_lora_rejected(tiny_base_model, monkeypatch):
+    """SR is shared-base-K/V only: listing k_proj / v_proj in target_modules must
+    raise (no place for an adapter-side K/V delta to land). Unconditional now —
+    not gated on a shared_base_kv flag."""
+    from peft import LoraConfig
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
+        get_shadow_residual_peft_model,
+    )
+
+    _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    for bad in (["q_proj", "k_proj", "cross_stream"], ["q_proj", "v_proj"]):
+        with pytest.raises(ValueError, match="K/V"):
+            get_shadow_residual_peft_model(
+                "ignored-path", LoraConfig(r=2, lora_alpha=4, target_modules=bad),
+                torch_dtype=None,
+            )
+
+
+def test_scalar_target_modules_wraps_sr_safe_set_not_kv(tiny_base_model, monkeypatch):
+    """A scalar (uniform-rank) config must wrap exactly the SR-safe projections
+    on the real module tree — and never K/V.
+
+    This is the end-to-end guard behind the C1 fix. `to_peft_config` maps a
+    scalar rank to the fixed SR-safe list (not "all-linear", which PEFT would
+    expand to every nn.Linear — including k_proj/v_proj, which are
+    _StreamGatedLinear, an nn.Linear subclass). Asserting the LoraConfig list is
+    not enough: PEFT still has to resolve that list against SR's modules and
+    attach lora.Linear to exactly the intended layers. We verify the wrapped set
+    by walking named_modules(), so a future change to the scalar mapping, the
+    module names, or PEFT's resolver that let a K/V delta land would fail here.
+    """
+    from peft.tuners.lora.layer import LoraLayer
+    from shadow_residual.config.adapters import to_peft_config
+    from shadow_residual.config.training_config import TrainingConfig
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
+        get_shadow_residual_peft_model,
+    )
+
+    _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    cfg = TrainingConfig.model_validate(
+        {
+            "model": {"base": "ignored-path"},
+            "data": {"train_path": "/tmp/t.jsonl", "val_path": "/tmp/v.jsonl"},
+            "save": {"output_dir": "/tmp/out"},
+            "adapter": {"target_modules": 4},  # scalar → SR-safe set
+        }
+    )
+    peft_model = get_shadow_residual_peft_model(
+        "ignored-path", to_peft_config(cfg), torch_dtype=None,
+    )
+
+    wrapped: set[str] = set()
+    for name, module in peft_model.named_modules():
+        if isinstance(module, LoraLayer):
+            # module name tail is the projection it wraps, e.g. "...layers.0.self_attn.q_proj"
+            wrapped.add(name.rsplit(".", 1)[-1])
+
+    assert wrapped == {
+        "q_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "cross_stream",
+    }, f"scalar config wrapped unexpected module set: {sorted(wrapped)}"
+    assert "k_proj" not in wrapped, "K/V must never be LoRA-wrapped (shared base-only K/V)"
+    assert "v_proj" not in wrapped

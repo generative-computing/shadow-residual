@@ -4,9 +4,14 @@
 # cross_stream) but adapted for Granite 4.2:
 #   - model.base is supplied via ${BASE_MODEL} so the SAME config serves both
 #     the 3b and 8b 4.2 checkpoints (the launcher sets the path).
-#   - invocation_tokens uses the ChatML assistant marker "<|im_start|>assistant\n"
-#     (4.2 moved from the 4.1 <|start_of_role|>...<|end_of_role|> format to
-#     ChatML). See docs/GRANITE_4.1_vs_4.2.md.
+#   - The adapter is always active (no gated activation). last_context_token /
+#     last_token are recorded into adapter_config.json and shape the data/labels.
+#     ChatML (thinking OFF) renders the assistant opener as
+#     "<|im_start|>assistant\n<think></think>", so generation begins right after
+#     </think> — last_context_token=</think>, and the collator masks through the
+#     whole opener (assistant_marker includes the empty think block). 4.2 moved
+#     from the 4.1 <|start_of_role|>...<|end_of_role|> format to ChatML. See
+#     docs/GRANITE_4.1_vs_4.2.md.
 #
 # 4.2 has tie_word_embeddings=False (a separate lm_head.weight); the SR factory
 # handles that automatically from the base config — no config knob needed here.
@@ -15,7 +20,6 @@
 
 model:
   base: ${BASE_MODEL}
-  shared_base_kv: true
 
 data:
   train_path: ${DATA_ROOT}/train.jsonl
@@ -23,11 +27,16 @@ data:
   max_length: 4096
   # Granite 4.2 uses ChatML. The trainer falls back to ResponseOnlyCollator
   # (the standalone chat_template.jinja isn't detected as having {% generation %}
-  # tags), which masks all labels before this marker. The 4.1 default
-  # (<|start_of_role|>assistant<|end_of_role|>) never appears in ChatML-rendered
-  # 4.2 data → every label masked → NaN loss. Set the ChatML assistant marker so
-  # response-only masking finds the assistant turn.
-  assistant_marker: "<|im_start|>assistant\n"
+  # tags), which masks THROUGH this marker and supervises the tokens after it.
+  # The ChatML template renders the assistant opener as
+  #   <|im_start|>assistant\n<think></think>   (thinking OFF, our case)
+  # so the marker must include the empty think block: generation begins right
+  # after </think>, making </think> the last context token. Matching only
+  # "<|im_start|>assistant\n" would instead supervise "<think></think>" and put
+  # the boundary at the '\n'. (Thinking-ON would render "<|im_start|>assistant\n
+  # <think>\n" and want a trailing-newline boundary — these adapters train
+  # thinking OFF, empty <think></think> target.)
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
 
 adapter:
   target_modules:
@@ -39,7 +48,13 @@ adapter:
     cross_stream: 32
   alpha: 64
   dropout: 0.05
-  invocation_tokens: "<|im_start|>assistant\n"
+  # last_context_token = the final context token before generation. For 4.2
+  # thinking-OFF the assistant opener ends in <think></think>, so generation
+  # starts right after </think> — that is the last context token (single token
+  # id on the 4.2 tokenizer). last_token = end-of-completion marker (ChatML turn
+  # terminator <|im_end|>), appended to rows that don't already end with it.
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
 
 optimizer:
   name: adamw_torch

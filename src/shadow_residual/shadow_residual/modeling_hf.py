@@ -52,14 +52,14 @@ def _any_cross_stream_wrapped(layers) -> bool:
     """Has any decoder layer's ``cross_stream`` site been wrapped by PEFT?
 
     The bare :class:`CrossStream` site is a no-op (returns zeros). When
-    PEFT installs a :class:`CrossStreamLora` (because the user listed
+    PEFT wraps it with a stock ``lora.Linear`` (because the user listed
     ``"cross_stream"`` in ``target_modules``), it replaces the
     ``cross_stream`` attribute with the wrapper. The wrapper is not a
     :class:`CrossStream` instance — its ``base_layer`` is.
 
-    This check decides whether the dual-stream forward needs to run. A
-    bare ``CrossStream`` everywhere → single-stream early-exit; any
-    wrapped site anywhere → dual-stream forward.
+    This check decides whether the dual-stream forward runs. A bare
+    ``CrossStream`` everywhere → bare single-stream (unadapted base); any wrapped
+    site → dual-stream forward.
     """
     for layer in layers:
         cs = getattr(layer, "cross_stream", None)
@@ -70,6 +70,23 @@ def _any_cross_stream_wrapped(layers) -> bool:
     return False
 
 
+def _adapters_globally_disabled(modules) -> bool:
+    """True iff a top-level ``disable_adapter()`` is currently in effect.
+
+    When the user wraps a forward in ``with peft_model.disable_adapter():`` every
+    LoRA layer's ``disable_adapters`` flag is set; the SR model then takes the
+    bare single-stream path (the unadapted base) instead of dual-stream. On a bare
+    (unwrapped) model there are no LoRA layers, so this returns False (and the
+    absence of a wrapped cross_stream selects the bare path anyway).
+    """
+    from peft.tuners.lora.layer import LoraLayer
+
+    for m in modules:
+        if isinstance(m, LoraLayer):
+            return bool(getattr(m, "disable_adapters", False))
+    return False
+
+
 class ShadowResidualPreTrainedModel(GraniteMoeHybridPreTrainedModel):
     """``PreTrainedModel`` base class for shadow-residual models."""
 
@@ -77,6 +94,19 @@ class ShadowResidualPreTrainedModel(GraniteMoeHybridPreTrainedModel):
     base_model_prefix = "model"
     _no_split_modules = ["ShadowResidualDecoderLayer"]
     _is_stateful = True
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        # The cross-stream site is a frozen zero-init nn.Linear. The parent's
+        # _init_weights treats it as a generic linear and fills it with a normal
+        # distribution — which would make base_layer(h_base) nonzero and pollute
+        # the adapter stream (breaking the frozen-base invariant and the
+        # cross-stream "pure B·A" semantics). Re-zero it after the parent runs so
+        # post_init() leaves it as an exact no-op. Kept frozen.
+        if isinstance(module, CrossStream):
+            nn.init.zeros_(module.weight)
+            module.weight.requires_grad_(False)
 
 
 class ShadowResidualModel(ShadowResidualPreTrainedModel):
@@ -112,6 +142,7 @@ class ShadowResidualModel(ShadowResidualPreTrainedModel):
             self.rotary_emb = None
 
         self.gradient_checkpointing = False
+
         self.post_init()
 
     def get_input_embeddings(self):
@@ -201,150 +232,64 @@ class ShadowResidualModel(ShadowResidualPreTrainedModel):
                 inputs_embeds, position_ids=position_ids,
             )
 
-        # ---- Decoder loop: adapter-only early-exit vs. dual-stream ----
-        # Two ways to enter dual-stream mode:
-        #   1. A CrossStream site has been wrapped by PEFT — the standard
-        #      SR path with per-layer base→adapter injection.
-        #   2. ``shared_base_kv=True`` is set on the config — "weak SR":
-        #      both streams flow in parallel, K/V is computed once from
-        #      ``normed_base``, but no cross_stream wrapping → bare
-        #      CrossStream returns zeros so the per-layer merge is a
-        #      no-op. Useful for ablating the W_cross contribution
-        #      while keeping the frozen-base K/V topology.
-        # Otherwise we take the adapter-only single-stream early-exit
-        # (one Q/O/MLP pass per layer with the LoRA delta firing).
-        cross_stream_active = _any_cross_stream_wrapped(self.layers)
-        shared_base_kv = bool(getattr(self.config, "shared_base_kv", False))
+        # ---- Decoder loop: dual-stream (adapter) vs. bare single-stream ----
+        # An SR adapter is "active" iff a cross_stream site has been PEFT-wrapped
+        # AND adapters are not globally disabled (top-level disable_adapter()).
+        #   * active   → shared-base-K/V dual-stream over a stacked [2,B,S,H]
+        #                tensor. Under training with gradient checkpointing the
+        #                GradientCheckpointingLayer.__call__ checkpoints each layer
+        #                (the dual-stream forward is pure, so recompute is exact);
+        #                otherwise the same forward runs directly.
+        #   * inactive → bare single-stream = the unadapted base model (a plain
+        #                causal LM). Also the path a top-level disable_adapter()
+        #                collapses to.
+        adapter_active = _any_cross_stream_wrapped(self.layers) and not _adapters_globally_disabled(self.modules())
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        if cross_stream_active or shared_base_kv:
-            # When shared_base_kv is on, the adapter stream attends to
-            # K/V derived from normed_base (single cache: past_key_values).
-            # The disjoint per-stream base cache is unused in that mode.
-
-            # Disjoint base K/V cache — frozen-base invariant requires
-            # the base stream's K/V to be adapter-free, so it can't share
-            # storage with the adapter cache. Bind its lifetime to the
-            # adapter cache so it persists across generate() decode steps:
-            # transformers' generate loop threads the same past_key_values
-            # object through every step, so we keep the same base cache as
-            # long as the same adapter cache object keeps coming back; a
-            # fresh adapter cache (new generate() call, or training step)
-            # triggers a fresh base cache.
-            if use_cache and not shared_base_kv:
-                if (
-                    getattr(self, "_pkv_base_owner", None) is not past_key_values
-                    or getattr(self, "_pkv_base", None) is None
-                ):
-                    self._pkv_base = DynamicCache(config=self.config)
-                    self._pkv_base_owner = past_key_values
-                past_key_values_base = self._pkv_base
-            else:
-                past_key_values_base = None
-
-            h_base = inputs_embeds
-            h_adapt = inputs_embeds.clone()
+        if adapter_active:
+            hs = torch.stack([inputs_embeds, inputs_embeds.clone()], dim=0)  # [2,B,S,H]
+            checkpointing = self.gradient_checkpointing and self.training
             for decoder_layer in self.layers:
                 if output_hidden_states:
-                    all_hidden_states += (h_base,)
-
-                # Manually checkpoint the layer under training (NOT via a
-                # GradientCheckpointingLayer __call__, which would trigger PEFT's
-                # fragile hook/guard machinery). The layer's own forward re-runs on
-                # recompute and re-enters offset_recovery_enabled(), so the gated
-                # variants recover alora_offsets from their cache on recompute.
-                if self.gradient_checkpointing and self.training:
-                    def _layer_call(hb, ha, layer=decoder_layer, _kw=kwargs):
-                        return layer(
-                            hb, ha,
-                            cross_stream_active=True,
-                            attention_mask=causal_mask,
-                            position_ids=position_ids,
-                            past_key_values=past_key_values,
-                            past_key_values_base=past_key_values_base,
-                            output_attentions=output_attentions,
-                            use_cache=use_cache,
-                            cache_position=cache_position,
-                            position_embeddings=position_embeddings,
-                            **_kw,
-                        )
-                    layer_outputs = self._gradient_checkpointing_func(
-                        _layer_call, h_base, h_adapt,
-                    )
-                else:
-                    layer_outputs = decoder_layer(
-                        h_base, h_adapt,
-                        cross_stream_active=True,
+                    all_hidden_states += (hs[0],)
+                if checkpointing:
+                    decoder_layer.gradient_checkpointing = True
+                    hs = decoder_layer(
+                        hs,
                         attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_values=past_key_values,
-                        past_key_values_base=past_key_values_base,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
+                        past_key_values=None,   # training: no cache
                         cache_position=cache_position,
                         position_embeddings=position_embeddings,
-                        **kwargs,
                     )
-
-                h_base, h_adapt = layer_outputs[0]
-
-                if output_attentions and len(layer_outputs) > 1 and layer_outputs[1] is not None:
-                    all_self_attns += (layer_outputs[1],)
-
-            # The base→adapter coupling already happened per-layer via
-            # cross_stream(h_base) injection inside each decoder layer
-            # (see decoder_hf.py). After the last layer we norm + project
-            # the adapter stream directly.
-            hidden_states = self.norm(h_adapt)
+                else:
+                    decoder_layer.gradient_checkpointing = False
+                    hs = decoder_layer(
+                        hs,
+                        attention_mask=causal_mask,
+                        past_key_values=past_key_values,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                    )
+            # Only norm(h_adapt) reaches the LM head; the base→adapter coupling
+            # already happened per-layer via cross_stream(h_base).
+            hidden_states = self.norm(hs[1])
         else:
-            # Adapter-only early-exit: no h_base maintained.
-            h_adapt = inputs_embeds
+            # Bare single-stream: no adapter → exactly the unadapted base model.
+            h = inputs_embeds
             for decoder_layer in self.layers:
                 if output_hidden_states:
-                    all_hidden_states += (h_adapt,)
-
-                # Manual checkpoint (see dual-stream branch). The layer forward
-                # re-enters offset_recovery_enabled() on recompute so the gated
-                # variants recover alora_offsets from cache.
-                if self.gradient_checkpointing and self.training:
-                    def _layer_call(ha, layer=decoder_layer, _kw=kwargs):
-                        return layer(
-                            None, ha,
-                            cross_stream_active=False,
-                            attention_mask=causal_mask,
-                            position_ids=position_ids,
-                            past_key_values=past_key_values,
-                            output_attentions=output_attentions,
-                            use_cache=use_cache,
-                            cache_position=cache_position,
-                            position_embeddings=position_embeddings,
-                            **_kw,
-                        )
-                    layer_outputs = self._gradient_checkpointing_func(
-                        _layer_call, h_adapt,
-                    )
-                else:
-                    layer_outputs = decoder_layer(
-                        None, h_adapt,
-                        cross_stream_active=False,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_values=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings,
-                        **kwargs,
-                    )
-
-                _, h_adapt = layer_outputs[0]
-
-                if output_attentions and len(layer_outputs) > 1 and layer_outputs[1] is not None:
-                    all_self_attns += (layer_outputs[1],)
-
-            hidden_states = self.norm(h_adapt)
+                    all_hidden_states += (h,)
+                h = decoder_layer.forward_bare(
+                    h,
+                    attention_mask=causal_mask,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                )
+            hidden_states = self.norm(h)
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)

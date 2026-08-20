@@ -5,11 +5,12 @@ Two entry points that consume the unified Pydantic-validated YAML schema:
 - `train.py` — build an SR + LoRA model and fine-tune it on a base model (CLI + YAML).
 - `generate.py` — run a trained adapter against an eval set, write predictions JSONL.
 
-The schema deliberately does not name specific architectures (LoRA, aLoRA,
-shadow-residual). Training behavior is determined by which fields are set —
-most importantly `adapter.invocation_tokens` (gated activation when non-null,
-plain unconditional adapter when null) and whether `"cross_stream"` appears in
-`adapter.target_modules` (turns on the SR dual-stream forward).
+The schema deliberately does not name specific architectures (LoRA,
+shadow-residual). The adapter is always active (plain LoRA). Training behavior is
+determined by which fields are set — whether `"cross_stream"` appears in
+`adapter.target_modules` (turns on the SR dual-stream forward), and the optional
+`adapter.last_context_token` / `adapter.last_token` markers that shape the
+data/labels (see below).
 
 ## Quick start
 
@@ -78,20 +79,23 @@ prediction from `generated_content`. Sampling parameters (`max_new_tokens`,
 `temperature`, `top_p`, `do_sample`, `batch_size`) come from the `generation:`
 block of the YAML.
 
-## Determining adapter activation
+## Adapter activation and the token markers
 
-- `adapter.invocation_tokens: null` (default) → unconditional adapter.
-  Every forward pass routes through the LoRA delta.
-- `adapter.invocation_tokens: "<some token sequence>"` → gated activation
-  (aLoRA-style). PEFT scans each sequence for the token IDs; the LoRA delta is
-  zeroed until they appear, then applied for the remainder. The schema
-  validator auto-forces `batch.gradient_checkpointing=False` (PEFT #2826);
-  `train.py` re-enables non-reentrant checkpointing explicitly for gated SR.
+The adapter is **always active** (plain LoRA) — every forward routes through the
+LoRA delta on every position. There is no gated/aLoRA activation. Two optional
+single-token markers shape the training data/labels (enforced in `train.py`) and
+are recorded into the saved `adapter_config.json` for downstream tooling:
 
-Intrinsics (answerability, citations, etc.) typically use the literal Granite
-assistant marker `"<|start_of_role|>assistant<|end_of_role|>"` as the
-invocation tokens — the adapter activates exactly at the start of every
-assistant response.
+- `adapter.last_context_token` — the final context/prompt token. `train.py`
+  validates that the supervised region (`labels != -100`) starts immediately
+  after it (validate + error) and covers both masking paths (TRL
+  `assistant_only_loss` and the `ResponseOnlyCollator` fallback).
+- `adapter.last_token` — end-of-completion marker. `train.py` appends it to any
+  training row whose tokens don't already end with it (at the text level, so both
+  masking paths inherit it).
+
+Each must encode to exactly one token id for the tokenizer. Gradient
+checkpointing is honored as set (no force-off); mid-training eval is compatible.
 
 ## Shadow-residual selection
 
@@ -103,7 +107,7 @@ assistant response.
 - `model.shared_base_kv: true` → adapter attends a single base-only K/V (one
   cache); forbids LoRA on `k_proj` / `v_proj`. Leave it unset (the default) to
   auto-resolve: `true` when `"cross_stream"` is in `target_modules` (the SR
-  production default), `false` otherwise (plain LoRA/aLoRA → K/V on the adapter
+  production default), `false` otherwise (plain LoRA → K/V on the adapter
   stream; a warning is logged). An explicit `true`/`false` always wins.
 
 ## Per-module rank
@@ -111,7 +115,8 @@ assistant response.
 `adapter.target_modules` carries both the module names and the LoRA ranks:
 
 ```yaml
-# Uniform: rank 32 applied to "all-linear"
+# Uniform: rank 32 applied to the SR-safe target set
+# (q_proj, o_proj, gate/up/down_proj, cross_stream — never K/V)
 adapter:
   target_modules: 32
 

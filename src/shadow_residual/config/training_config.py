@@ -2,13 +2,15 @@
 """Unified training-config schema.
 
 A single Pydantic model for adapter training. The schema does not name
-specific architectures (LoRA vs. aLoRA vs. shadow-residual) — those are
-implementation details. The training behavior is determined by which fields
-are set:
+specific architectures (LoRA vs. shadow-residual) — those are implementation
+details. The adapter is always active (no gated/aLoRA activation); the two
+optional token fields shape the *data/labels*, not the model forward:
 
-- `adapter.invocation_tokens` unset (None)  → plain adapter training (LoRA-style)
-- `adapter.invocation_tokens` set           → gated adapter activation (aLoRA-style),
-                                              gradient_checkpointing forced off (PEFT #2826)
+- `adapter.last_context_token` — the final context/prompt token. When set,
+  train.py validates that the supervised region (`labels != -100`) starts
+  immediately after it (validate + error).
+- `adapter.last_token` — end-of-completion marker. When set, train.py appends
+  it to any training row whose tokens don't already end with it.
 
 Defaults follow the canonical synthesis in docs/TRAINING_CONFIG_DELTA.html §8.
 
@@ -73,17 +75,6 @@ class _Strict(BaseModel):
 class ModelConfig(_Strict):
     base: str = Field(..., description="HF model ID or local path, e.g. ibm-granite/granite-4.1-3b")
     attn_implementation: str | None = None  # e.g. "sdpa", "flash_attention_2"
-    # SR-architecture knob: when True, the adapter stream attends to a
-    # single base-only K/V (one cache, K/V computed once from normed_base);
-    # when False, disjoint per-stream K/V (two caches). Forbids LoRA on
-    # k_proj / v_proj when True.
-    #
-    # None (the default) means "auto": resolved at build time by
-    # resolve_shared_base_kv (peft_shadow_residual/factory.py) from the
-    # adapter's target_modules — True when "cross_stream" is present (the SR
-    # production default), False otherwise (LoRA/aLoRA, K/V on the adapter
-    # stream; a warning is logged). An explicit True/False here always wins.
-    shared_base_kv: bool | None = None
     # Dtype the SR+PEFT model is materialized in. "bf16" (default) loads the
     # whole model — base AND trainable LoRA adapters — in bfloat16. "fp32"
     # loads everything in float32; with accelerate mixed_precision: bf16 this
@@ -118,7 +109,10 @@ class AdapterConfig(_Strict):
     # `target_modules` carries BOTH the module-name selection and the LoRA
     # rank in a single field. Two shapes:
     #
-    #   - scalar int (e.g. `32`)         → uniform rank, applied to "all-linear"
+    #   - scalar int (e.g. `32`)         → uniform rank on the SR-safe target
+    #                                      set (q/o + MLP + cross_stream; NOT
+    #                                      "all-linear" — that would wrap the
+    #                                      forbidden K/V projections)
     #   - dict[str, int]                 → per-module names AND ranks
     #
     # The dict form is concise (no separate `rank` field, no risk of the
@@ -128,9 +122,18 @@ class AdapterConfig(_Strict):
     dropout: float = Field(0.0, ge=0.0, le=1.0)
     bias: Bias = Bias.NONE
     task_type: Literal["CAUSAL_LM"] = "CAUSAL_LM"
-    # When set, the adapter activates only after this token sequence appears
-    # in the input (aLoRA-style). When None, plain unconditional adapter.
-    invocation_tokens: str | None = None
+    # The adapter is always active. These two optional single-token markers
+    # shape the training data/labels (enforced in train.py) and are recorded
+    # into the saved adapter_config.json:
+    #   - last_context_token: the final context/prompt token. When set, the
+    #     supervised region (labels != -100) must start immediately after it;
+    #     train.py validates this and errors on mismatch.
+    #   - last_token: end-of-completion marker. When set, train.py appends it
+    #     to any row whose tokens don't already end with it.
+    # Each must encode to exactly ONE token id (validated in train.py where the
+    # tokenizer is available).
+    last_context_token: str | None = None
+    last_token: str | None = None
 
     @field_validator("target_modules")
     @classmethod
@@ -241,18 +244,6 @@ class TrainingConfig(BaseModel):
     save: SaveConfig
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     generation: GenerationConfig | None = None
-
-    @model_validator(mode="after")
-    def _gated_activation_disables_gc(self):
-        """When invocation_tokens is set (aLoRA-style activation), force
-        gradient_checkpointing off — they're incompatible (PEFT #2826)."""
-        if self.adapter.invocation_tokens is not None and self.batch.gradient_checkpointing:
-            logger.warning(
-                "adapter.invocation_tokens is set (gated activation) + "
-                "gradient_checkpointing=True is incompatible (PEFT #2826); forcing False."
-            )
-            self.batch.gradient_checkpointing = False
-        return self
 
 
 # --- Loader -------------------------------------------------------------------
