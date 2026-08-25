@@ -33,6 +33,7 @@ def build_sr_config(
     *,
     torch_dtype: Optional[torch.dtype] = None,
     attn_implementation: Optional[str] = None,
+    share_moe_routing: bool = True,
 ) -> ShadowResidualConfig:
     """Build the SR config by reading the upstream HF config (no weights).
 
@@ -69,10 +70,26 @@ def build_sr_config(
     # weights couldn't be transferred (shape mismatch), MLP stayed
     # randomly initialized, hidden states blew up 78x at layer 0 (see
     # scripts/diagnose_sr_vs_upstream.py output).
-    if "intermediate_size" in config_dict and config_dict.get("shared_intermediate_size") is None:
+    #
+    # MoE bases (Granite 5.0 / granitemoe, num_local_experts > 0) have NO dense
+    # shared_mlp — their `intermediate_size` is the *per-expert* FFN width. The
+    # SR MLP on such a base is the frozen expert bank (built from num_local_experts
+    # + intermediate_size directly, see decoder_hf.ShadowResidualMLP), which never
+    # reads shared_intermediate_size. Rewriting it to the per-expert width would be
+    # harmless but misleading, so skip the force in MoE mode.
+    is_moe = int(config_dict.get("num_local_experts") or 0) > 0
+    if (
+        not is_moe
+        and "intermediate_size" in config_dict
+        and config_dict.get("shared_intermediate_size") is None
+    ):
         config_dict["shared_intermediate_size"] = config_dict["intermediate_size"]
     sr_config = ShadowResidualConfig(**config_dict)
     set_shadow_residual(sr_config, enabled=True)
+    # MoE-only routing mode (no-op on dense bases). Not serialized — it is a
+    # forward-path choice, not a weight, so a saved adapter carries no record of
+    # it; train and serve must pass the same value (see build_sr_base).
+    sr_config.share_moe_routing = bool(share_moe_routing)
     if torch_dtype is not None:
         sr_config.torch_dtype = torch_dtype
     if attn_implementation is not None:
@@ -85,6 +102,7 @@ def build_sr_base(
     *,
     torch_dtype: Optional[torch.dtype] = None,
     attn_implementation: Optional[str] = None,
+    share_moe_routing: bool = True,
 ) -> ShadowResidualForCausalLM:
     """Single-process SR base build (no FSDP / meta machinery).
 
@@ -95,11 +113,21 @@ def build_sr_base(
     The training-time FSDP path goes through
     :func:`get_shadow_residual_peft_model` instead, which keeps non-rank-0
     processes on meta until the broadcast.
+
+    ``share_moe_routing`` (MoE bases only) routes once on the base stream and
+    reuses that expert partition for the adapter stream; on by default. Set
+    ``False`` to route each stream independently. It is a forward-path choice,
+    not a weight — the served value must match what the adapter was **trained**
+    with or the forward diverges from training. When serving a saved adapter,
+    prefer sourcing it from the adapter itself via
+    :func:`shadow_residual.training.generation_utils.read_share_moe_routing_from_adapter`
+    (train.py records it in ``adapter_config.json``) rather than hand-passing.
     """
     sr_config = build_sr_config(
         base_model_name_or_path,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
+        share_moe_routing=share_moe_routing,
     )
     sr_model = ShadowResidualForCausalLM(sr_config)
     if torch_dtype is not None:

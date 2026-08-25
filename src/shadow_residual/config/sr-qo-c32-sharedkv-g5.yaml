@@ -1,0 +1,92 @@
+# Granite 5.0 (granitemoe, GraniteMoeForCausalLM) SR training config.
+#
+# ITERATION 1 = ATTENTION-ONLY. Granite 5.0 is a sparse-MoE decoder: every
+# layer's FFN is a frozen expert bank (block_sparse_moe: router +
+# GraniteMoeParallelExperts), with no dense shared_mlp. SR runs the experts
+# FROZEN so the base stream stays bit-identical to the stock model, and puts
+# all trainable capacity in attention (Q, O) + cross_stream. There is NO
+# gate/up/down LoRA here (unlike the dense 4.x configs) — the MLP is the sparse
+# expert bank and expert LoRA is a later iteration. K/V LoRA is forbidden
+# (shared base-only K/V), so the target set is exactly {q_proj, o_proj,
+# cross_stream}.
+#
+# 5.0 uses the SAME ChatML template as Granite 4.2 (verified against the base's
+# chat_template.jinja): thinking OFF renders the assistant opener as
+# "<|im_start|>assistant\n<think></think>" and the turn terminator is
+# <|im_end|>. So the markers match the 4.2 config exactly. See
+# docs/GRANITE_4.1_vs_4.2.md and docs/SR_5_0_SUPPORT_PLAN.md.
+#
+# 5.0 has tie_word_embeddings=False (a separate lm_head.weight); the SR factory
+# handles that automatically from the base config — no config knob needed here.
+# model.base is supplied via ${BASE_MODEL} so the launcher sets the path.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  # ChatML assistant opener, thinking OFF (see g42 config for the full rationale
+  # on why the empty <think></think> block is part of the marker).
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  # Attention-only: no gate/up/down (frozen sparse experts), no k/v (shared
+  # base-only K/V). cross_stream engages the dual-stream SR forward.
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    cross_stream: 32
+  alpha: 64
+  dropout: 0.05
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+  # DUAL (independent) MoE routing — each stream routes on its own hidden state.
+  # Explicitly opts OUT of shared routing (which is the default); the shared arm
+  # lives in the -shared sibling.
+  share_moe_routing: false
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

@@ -134,6 +134,13 @@ class AdapterConfig(_Strict):
     # tokenizer is available).
     last_context_token: str | None = None
     last_token: str | None = None
+    # MoE bases (Granite 5.0 / granitemoe) only: when true (the default), the
+    # decoder routes once on the base stream and reuses that expert partition for
+    # the adapter stream; set false to route each stream independently. No-op on
+    # dense bases. Recorded into the saved adapter_config.json and read back by
+    # the serving path (training.generation_utils.read_share_moe_routing_from_adapter)
+    # so the adapter self-describes its routing mode.
+    share_moe_routing: bool = True
 
     @field_validator("target_modules")
     @classmethod

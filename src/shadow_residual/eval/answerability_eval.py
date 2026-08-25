@@ -295,6 +295,9 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
     from peft import PeftModel
 
     from shadow_residual.shadow_residual.build import build_sr_base
+    from shadow_residual.training.generation_utils import (
+        read_share_moe_routing_from_adapter,
+    )
 
     # Resolve device
     if device_str == "auto":
@@ -323,7 +326,15 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
     # path: cross-stream LoRA weights need CrossStream sites to bind to,
     # which only exist on a ShadowResidualForCausalLM.
     print(f"Loading SR base + adapter from: {adapter_path}")
-    base_model = build_sr_base(base_model_name, torch_dtype=dtype)
+    # Source the MoE routing mode from the adapter itself (train.py records it in
+    # adapter_config.json) so a shared-routing adapter is served with the same
+    # forward path it was trained under — no hand-passed flag, no silent drift.
+    # No-op / False for dense bases and older adapters lacking the key.
+    share_moe_routing = read_share_moe_routing_from_adapter(adapter_path)
+    print(f"share_moe_routing (from adapter_config.json): {share_moe_routing}")
+    base_model = build_sr_base(
+        base_model_name, torch_dtype=dtype, share_moe_routing=share_moe_routing,
+    )
     model = PeftModel.from_pretrained(base_model, adapter_path)
     model = model.to(device)
     model.eval()

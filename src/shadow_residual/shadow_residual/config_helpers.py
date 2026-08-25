@@ -29,7 +29,13 @@ def validate_shadow_residual_config(config: ShadowResidualConfig) -> None:
       objects for backward compatibility with the vLLM backend and saved
       checkpoints.
     - ``shadow_residual=True`` requires every layer to be of type
-      ``"attention"`` (no SSM / mamba layers).
+      ``"attention"`` (no SSM / mamba layers). Note: sparse-MoE bases (Granite
+      5.0 / ``granitemoe``, ``num_local_experts > 0``) are attention-only for
+      token mixing — the experts are the FFN, not a layer type — so they pass
+      this check.
+    - When ``num_local_experts > 0``, ``num_experts_per_tok`` must be a positive
+      integer no larger than ``num_local_experts`` (the top-k router cannot select
+      more experts than exist).
 
     SR uses a single K/V topology (shared base-only K/V), so there is no
     ``shared_base_kv`` toggle to validate.
@@ -52,6 +58,15 @@ def validate_shadow_residual_config(config: ShadowResidualConfig) -> None:
             "shadow_residual=True requires all layer_types to be 'attention' "
             "(no SSM / mamba layers)."
         )
+
+    num_local_experts = int(getattr(config, "num_local_experts", 0) or 0)
+    if num_local_experts > 0:
+        top_k = getattr(config, "num_experts_per_tok", None)
+        if not isinstance(top_k, int) or top_k <= 0 or top_k > num_local_experts:
+            raise ValueError(
+                "num_experts_per_tok must be a positive integer <= "
+                f"num_local_experts ({num_local_experts}); got {top_k!r}."
+            )
 
 
 def set_shadow_residual(

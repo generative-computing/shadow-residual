@@ -282,6 +282,7 @@ def get_shadow_residual_peft_model(
     torch_dtype: Optional[torch.dtype] = None,
     adapter_name: str = "default",
     attn_implementation: Optional[str] = None,
+    share_moe_routing: bool = True,
 ):
     """Build a :class:`peft.PeftModel` for shadow-residual + LoRA.
 
@@ -301,6 +302,11 @@ def get_shadow_residual_peft_model(
             The adapter is plain LoRA (always active); there is no gated activation.
         torch_dtype: dtype for the base model construction.
         adapter_name: PEFT adapter name (default: ``"default"``).
+        share_moe_routing: MoE bases only — route once on the base stream and
+            reuse that expert partition for the adapter stream (vs. independent
+            per-stream routing); on by default. No-op on dense bases. train.py
+            records it into the saved ``adapter_config.json`` so the serving path
+            can source it back rather than hand-passing.
 
     Returns:
         :class:`peft.PeftModel`.
@@ -322,6 +328,7 @@ def get_shadow_residual_peft_model(
         base_model_name_or_path,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
+        share_moe_routing=share_moe_routing,
     )
 
     peft_model = _build_sr_peft_model_meta(

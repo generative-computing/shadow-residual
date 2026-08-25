@@ -86,6 +86,16 @@ forward is pure, so recompute is exact — no manual checkpointing or custom
 recompute-stable variant. The adapter is plain LoRA (no aLoRA offset hooks), so
 **mid-training eval is compatible** with gradient checkpointing.
 
+**Post-training generation under FSDP — pass `--skip-post-train-generate`.** In an
+FSDP run the in-job generation path gathers/rebuilds the model on rank 0 and
+generates there while the other ranks wait at a collective barrier. A full eval
+set takes longer than the default 30-minute collective timeout, so the idle ranks
+abort and the job dies *after* training completes (the checkpoint is already
+saved). Autoregressive generation gains nothing from sharding anyway. The pattern:
+train with `--skip-post-train-generate`, then run generation/eval as a **separate
+single-GPU process** against the saved adapter (no distributed group, no barrier).
+Single-GPU / non-FSDP runs are unaffected and can generate in-job.
+
 Vela: use the YAMLs in `examples/vela/`. Pin `trl<1.7` (already in pyproject).
 `eval_loss: nan` per epoch is expected for prompt-only eval rows.
 

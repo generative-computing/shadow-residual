@@ -672,6 +672,9 @@ def main(argv: list[str] | None = None) -> int:
     from peft import PeftModel
 
     from shadow_residual.shadow_residual.build import build_sr_base
+    from shadow_residual.training.generation_utils import (
+        read_share_moe_routing_from_adapter,
+    )
 
     # Load tokenizer (prefer the one saved next to the adapter; some adapters
     # carry tokenizer changes worth preserving).
@@ -687,10 +690,17 @@ def main(argv: list[str] | None = None) -> int:
     # only correct path: the cross-stream weights need CrossStream sites
     # to bind to, which only exist on a ShadowResidualForCausalLM.
     logger.info("Loading SR base + adapter from %s ...", checkpoint_path)
+    # Source the MoE routing mode from the adapter (train.py records it in
+    # adapter_config.json) so generation uses the same forward path the adapter
+    # was trained under — covers both post-train and standalone generation. No-op
+    # / False for dense bases and older adapters lacking the key.
+    share_moe_routing = read_share_moe_routing_from_adapter(str(checkpoint_path))
+    logger.info("share_moe_routing (from adapter_config.json): %s", share_moe_routing)
     base_model = build_sr_base(
         cfg.model.base,
         torch_dtype=torch.bfloat16,
         attn_implementation=cfg.model.attn_implementation,
+        share_moe_routing=share_moe_routing,
     )
     model = PeftModel.from_pretrained(base_model, str(checkpoint_path))
     if torch.cuda.is_available():

@@ -1,0 +1,81 @@
+# Granite 5.0 (granitemoe, GraniteMoeForCausalLM) SR training config.
+# DEFAULT-ROUTING variant: adapter.share_moe_routing is OMITTED, so it takes the
+# schema default (currently True = shared expert routing). Use this to exercise
+# the default routing behavior explicitly (vs. -g5.yaml which pins false / dual,
+# and -g5-shared.yaml which pins true). Everything else matches the g5 configs.
+#
+# ITERATION 1 = ATTENTION-ONLY. Granite 5.0 is a sparse-MoE decoder: every
+# layer's FFN is a frozen expert bank (block_sparse_moe: router +
+# GraniteMoeParallelExperts), with no dense shared_mlp. SR runs the experts
+# FROZEN so the base stream stays bit-identical to the stock model, and puts all
+# trainable capacity in attention (Q, O) + cross_stream. K/V LoRA is forbidden
+# (shared base-only K/V), so the target set is exactly {q_proj, o_proj,
+# cross_stream}.
+#
+# 5.0 uses the SAME ChatML template as Granite 4.2 (thinking OFF): assistant
+# opener "<|im_start|>assistant\n<think></think>", turn terminator <|im_end|>.
+# See docs/SR_5_0_SUPPORT_PLAN.md. model.base is supplied via ${BASE_MODEL}.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    cross_stream: 32
+  alpha: 64
+  dropout: 0.05
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+  # share_moe_routing intentionally OMITTED -> schema default (shared).
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

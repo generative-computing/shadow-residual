@@ -196,6 +196,36 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
                 n_skipped += 1
             return
 
+        # Sparse-MoE expert bank (Granite 5.0 / granitemoe). Upstream stores the
+        # expert weights under `block_sparse_moe.*`; the SR MLP nests the mirrored
+        # frozen bank under `.mlp.` (router + input_linear + output_linear, see
+        # decoder_hf.ShadowResidualMLP MoE mode). Straight copy_ — no reslice:
+        #   * input_linear.weight  : 3-D [n_experts, 2*inter, H] (gate⊕up fused;
+        #                            SR's SwiGLU chunk consumes it identically)
+        #   * output_linear.weight : 3-D [n_experts, H, inter]
+        #   * router.layer.weight  : 2-D [n_experts, H]
+        # (The experts are NOT LoRA targets in the attention-only iteration, so no
+        # .base_layer indirection is expected on the destination — but we accept it
+        # for symmetry with the other branches in case that changes.)
+        for moe_tail, sr_name in (
+            ("block_sparse_moe.input_linear.weight", "mlp.input_linear.weight"),
+            ("block_sparse_moe.output_linear.weight", "mlp.output_linear.weight"),
+            ("block_sparse_moe.router.layer.weight", "mlp.router.layer.weight"),
+        ):
+            if src_key.endswith(moe_tail) or src_key.endswith(
+                moe_tail.replace(".weight", ".base_layer.weight")
+            ):
+                marker = "block_sparse_moe."
+                layer_prefix = src_key[: src_key.index(marker)]
+                dst_key = layer_prefix + sr_name
+                if dst_key in dst_keys and dst_state[dst_key].shape == src_val.shape:
+                    with torch.no_grad():
+                        dst_state[dst_key].copy_(src_val)
+                    n_copied += 1
+                else:
+                    n_skipped += 1
+                return
+
         # Already-unfused MLP on the upstream — keys live nested under .mlp.
         # (granite, llama, qwen, … all do this). The SR decoder layer also
         # nests gate_proj / up_proj / down_proj under self.mlp, so the key

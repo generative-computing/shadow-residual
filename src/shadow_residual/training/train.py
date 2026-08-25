@@ -339,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         lora_config=peft_config,
         torch_dtype=model_dtype,
         attn_implementation=cfg.model.attn_implementation,
+        share_moe_routing=cfg.adapter.share_moe_routing,
     )
     model.print_trainable_parameters()
 
@@ -484,17 +485,23 @@ def main(argv: list[str] | None = None) -> int:
                 "(src/shadow_residual/config/accelerate/fsdp_4gpu.yaml) so the FSDP save consolidates."
             )
 
-        # Record the two SR markers into the saved adapter_config.json as extra
-        # keys (stock LoraConfig doesn't serialize them). They're metadata for
-        # downstream tooling/serving — the string form (portable across
-        # tokenizers) plus the resolved id for the training tokenizer. Stock
+        # Record SR-specific metadata into the saved adapter_config.json as extra
+        # keys (stock LoraConfig doesn't serialize them). Stock
         # PeftConfig.from_pretrained tolerates unknown keys, so this doesn't
-        # break reload.
+        # break reload. Two kinds:
+        #   - the two token markers (string form + resolved id for the training
+        #     tokenizer);
+        #   - share_moe_routing: the MoE routing mode this adapter was trained
+        #     under. It is a forward-path choice, not a weight, so the saved
+        #     adapter_model.safetensors is identical either way — without recording
+        #     it here the adapter has no memory of its routing mode, and a served
+        #     model built with the wrong build_sr_base(share_moe_routing=...) would
+        #     silently diverge from training. Persisting it lets the serving path
+        #     read it back (see training.generation_utils.
+        #     read_share_moe_routing_from_adapter) so the
+        #     adapter self-describes.
         adapter_cfg_path = out / "adapter_config.json"
-        if adapter_cfg_path.exists() and (
-            cfg.adapter.last_context_token is not None
-            or cfg.adapter.last_token is not None
-        ):
+        if adapter_cfg_path.exists():
             import json as _json
             with adapter_cfg_path.open("r") as f:
                 adapter_cfg = _json.load(f)
@@ -504,11 +511,14 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.adapter.last_token is not None:
                 adapter_cfg["last_token"] = cfg.adapter.last_token
                 adapter_cfg["last_token_id"] = last_token_id
+            adapter_cfg["share_moe_routing"] = bool(cfg.adapter.share_moe_routing)
             with adapter_cfg_path.open("w") as f:
                 _json.dump(adapter_cfg, f, indent=2)
             logger.info(
-                "Patched adapter_config.json with last_context_token=%r last_token=%r.",
+                "Patched adapter_config.json with last_context_token=%r "
+                "last_token=%r share_moe_routing=%r.",
                 cfg.adapter.last_context_token, cfg.adapter.last_token,
+                bool(cfg.adapter.share_moe_routing),
             )
 
     # 9. Post-training generation, gated on the generation block being present.
