@@ -346,6 +346,49 @@ def test_load_jsonl_does_not_double_append(tokenizer, tmp_path):
     assert n1 >= 1
 
 
+def test_load_jsonl_no_double_append_when_marker_precedes_trailing_newline(
+    tokenizer, tmp_path
+):
+    """Regression: Granite's ChatML template ends rows with ``<|im_end|>\\n`` —
+    the marker followed by a trailing newline token. The append check must look
+    past trailing whitespace, otherwise it re-appends the marker and produces a
+    doubled ``<|im_end|>\\n<|im_end|>`` tail on every row.
+
+    We simulate that shape by wrapping the real tokenizer so apply_chat_template
+    returns text ending in ``<|end_of_turn|>\\n`` (marker + newline). Everything
+    else (encode/decode) delegates to the real tokenizer.
+    """
+    last = "<|end_of_turn|>"
+    last_id = tokenizer.encode(last, add_special_tokens=False)[0]
+
+    class _TrailingNewlineTokenizer:
+        def __init__(self, base):
+            self._base = base
+
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+        def apply_chat_template(self, messages, **kwargs):
+            # Mimic ChatML: the row ends with the terminator THEN a newline.
+            return "user says hi assistant answers" + last + "\n"
+
+    wrapped = _TrailingNewlineTokenizer(tokenizer)
+    p = tmp_path / "d.jsonl"
+    with p.open("w") as f:
+        f.write(json.dumps({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "there"},
+        ]}) + "\n")
+
+    ds = load_jsonl_dataset(p, wrapped, last_token=last)
+    ids = tokenizer.encode(ds[0]["text"], add_special_tokens=False)
+    # The marker must appear exactly once — not doubled — and the trailing
+    # newline is preserved (it was already there).
+    assert ids.count(last_id) == 1, (
+        f"marker was re-appended past the trailing newline; ids={ids}"
+    )
+
+
 # ---------- ResponseOnlyCollator ----------
 
 

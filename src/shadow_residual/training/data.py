@@ -42,6 +42,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _last_non_whitespace_token(
+    ids: list[int], tokenizer: "PreTrainedTokenizerBase"
+) -> int | None:
+    """Return the last token id in ``ids`` that decodes to something other than
+    pure whitespace, or None if the list is empty or all-whitespace.
+
+    Used to decide whether a row already ends with the ``last_token`` marker:
+    Granite's ChatML template appends a trailing newline after ``<|im_end|>``, so
+    the marker is the last *meaningful* token even though the literal last token
+    is the newline.
+    """
+    for tok_id in reversed(ids):
+        if tokenizer.decode([tok_id]).strip():
+            return tok_id
+    return None
+
+
 def _find_subsequence(haystack: list[int], needle: list[int]) -> int:
     """Return the start index of `needle` in `haystack`, or -1 if absent."""
     if not needle or len(needle) > len(haystack):
@@ -91,10 +108,15 @@ def load_jsonl_dataset(
     (False) is a no-op.
 
     ``last_token`` (when set) is an end-of-completion marker: any rendered row
-    whose token ids don't already end with ``last_token`` gets the marker
-    appended (at the string level, so it survives whichever masking path the
-    trainer picks). Rows that already end with it are left unchanged. The
-    string must encode to exactly one token id (enforced by the caller).
+    that doesn't already carry the marker at the end gets it appended (at the
+    string level, so it survives whichever masking path the trainer picks).
+    "At the end" ignores trailing whitespace tokens: Granite's ChatML template
+    emits ``<|im_end|>\n`` (a trailing newline after the terminator), so the
+    literal last token is the newline, not the marker — checking only the very
+    last token id would wrongly re-append the marker and produce a doubled
+    ``<|im_end|>\n<|im_end|>`` tail on every row. Rows already ending in the
+    marker (with or without trailing whitespace) are left unchanged. The string
+    must encode to exactly one token id (enforced by the caller).
 
     Returns a `datasets.Dataset` with a single ``text`` column containing the
     chat-templated string. SFTTrainer reads the ``text`` field directly.
@@ -132,12 +154,14 @@ def load_jsonl_dataset(
                 enable_thinking=enable_thinking,
             )
             if last_token_id is not None:
-                # Append the end-of-completion marker unless the row's tokens
-                # already end with it. Compare on token ids (not string suffix)
-                # so trailing whitespace / template quirks don't cause a false
-                # "already present".
+                # Append the end-of-completion marker unless the row already
+                # ends with it. Scan past trailing whitespace-only tokens before
+                # comparing: Granite's ChatML template ends rows with
+                # "<|im_end|>\n", so the literal last token is the newline and a
+                # naive row_ids[-1] check would re-append the marker, doubling it.
                 row_ids = tokenizer.encode(text, add_special_tokens=False)
-                if not row_ids or row_ids[-1] != last_token_id:
+                last_meaningful = _last_non_whitespace_token(row_ids, tokenizer)
+                if last_meaningful != last_token_id:
                     text = text + last_token
             rows.append({"text": text})
 
