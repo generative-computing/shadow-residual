@@ -103,6 +103,15 @@ class DataConfig(_Strict):
     # behavior; templates that ignore the kwarg treat it as a no-op. Overridable
     # from the CLI via `--thinking` (CLI wins).
     enable_thinking: bool = False
+    # ChatML (Granite 4.2/5.0) document placement. When RAG `documents` are
+    # injected as a tool (search-response) message, this controls where it lands:
+    #   - False (default): after the LAST user turn (plain agentic RAG flow).
+    #   - True: before the FIRST assistant turn — for judge/guardian data where a
+    #     later user turn carries a judging *instruction* and the documents are
+    #     grounding for the first assistant answer being evaluated.
+    # No-op for non-ChatML (Granite 4.1) rendering and for rows without documents.
+    # Overridable from the CLI via `--instruction-as-user-message` (CLI wins).
+    instruction_as_user_message: bool = False
 
 
 class AdapterConfig(_Strict):

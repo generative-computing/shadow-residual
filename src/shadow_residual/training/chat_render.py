@@ -10,11 +10,15 @@ for an answerability task that must ground its decision in the documents.
 
 For ChatML-style tokenizers (detected by ``<|im_start|>`` in the vocab) we
 therefore inject the retrieved documents the **agentic** way: as a ``tool``
-message (a search/knowledge-base tool response) placed right after the last user
-turn. Granite 4.2's template renders a ``tool`` message as a
-``<tool_response>[...]</tool_response>`` block, so the documents land in the
-prompt as retrieved context — matching how 4.2 natively represents RAG. Non-ChatML
-tokenizers (Granite 4.1) keep the native ``documents=`` path unchanged.
+message (a search/knowledge-base tool response). Granite 4.2's template renders a
+``tool`` message as a ``<tool_response>[...]</tool_response>`` block, so the
+documents land in the prompt as retrieved context — matching how 4.2 natively
+represents RAG. Non-ChatML tokenizers (Granite 4.1) keep the native
+``documents=`` path unchanged.
+
+Where the tool message lands is controlled by ``instruction_as_user_message``:
+after the last user turn by default, or before the first assistant turn when the
+flag is set (judge/guardian data — see ``render_chat``).
 """
 
 from __future__ import annotations
@@ -94,6 +98,33 @@ def _insert_documents_as_tool(messages: list[dict], documents: list[Any]) -> lis
     return messages[: last_user + 1] + [tool_msg] + messages[last_user + 1 :]
 
 
+def _insert_documents_before_first_assistant(
+    messages: list[dict], documents: list[Any]
+) -> list[dict]:
+    """Return a new messages list with a ``tool`` (search-response) message
+    inserted immediately BEFORE the first assistant turn.
+
+    Used for judge/guardian data where the retrieved documents are the grounding
+    context for the FIRST assistant answer (the answer being evaluated), and a
+    later user turn carries the judging *instruction*. Placing the docs after the
+    last user turn (the default) would bury them after the instruction and just
+    before the label; placing them before the first assistant answer keeps them
+    as that answer's grounding, matching how the answer was actually produced.
+
+    If there is no assistant turn (e.g. an eval prompt rendered with
+    ``add_generation_prompt``), there is no answer to precede, so we fall back to
+    :func:`_insert_documents_as_tool` (after the last user turn).
+    """
+    messages = list(messages)
+    first_asst = next(
+        (i for i, m in enumerate(messages) if m.get("role") == "assistant"), None
+    )
+    if first_asst is None:
+        return _insert_documents_as_tool(messages, documents)
+    tool_msg = _tool_message_for_documents(documents)
+    return messages[:first_asst] + [tool_msg] + messages[first_asst:]
+
+
 def render_chat(
     tokenizer: "PreTrainedTokenizerBase",
     messages: list[dict],
@@ -102,17 +133,29 @@ def render_chat(
     tools: Optional[list[Any]] = None,
     add_generation_prompt: bool = False,
     enable_thinking: bool = False,
+    instruction_as_user_message: bool = False,
 ) -> str:
     """Apply the chat template, ensuring RAG ``documents`` reach the prompt.
 
     - Non-ChatML tokenizer (Granite 4.1): pass ``documents=`` natively — the
       template renders them (behavior unchanged from before this helper existed).
     - ChatML tokenizer (Granite 4.2): its template ignores ``documents=``, so
-      inject them as a ``tool`` (search-response) message after the last user
-      turn; the template renders it as a ``<tool_response>`` block.
+      inject them as a ``tool`` (search-response) message; the template renders
+      it as a ``<tool_response>`` block. Placement depends on
+      ``instruction_as_user_message``:
+
+      - ``False`` (default): after the LAST user turn — the plain agentic flow
+        (user asks → tool returns docs → assistant answers).
+      - ``True``: before the FIRST assistant turn — for judge/guardian data
+        where a later user turn is a judging *instruction* and the documents are
+        grounding for the first assistant answer being evaluated. Falls back to
+        the ``False`` placement when there is no assistant turn.
     """
     if documents and _is_chatml_tokenizer(tokenizer):
-        messages = _insert_documents_as_tool(messages, documents)
+        if instruction_as_user_message:
+            messages = _insert_documents_before_first_assistant(messages, documents)
+        else:
+            messages = _insert_documents_as_tool(messages, documents)
         return tokenizer.apply_chat_template(
             messages,
             tools=tools,

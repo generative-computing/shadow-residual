@@ -93,6 +93,7 @@ def load_jsonl_dataset(
     tokenizer: "PreTrainedTokenizerBase",
     enable_thinking: bool = False,
     last_token: str | None = None,
+    instruction_as_user_message: bool = False,
 ) -> "Dataset":
     """Load a JSONL file and apply the model's chat template to each row.
 
@@ -106,6 +107,11 @@ def load_jsonl_dataset(
     model's thinking/reasoning trace for templates that support it (Granite).
     Templates that don't understand the kwarg ignore it, so the default
     (False) is a no-op.
+
+    ``instruction_as_user_message`` is forwarded to :func:`render_chat` to control
+    where injected RAG documents land on ChatML tokenizers: after the last user
+    turn (False, default) or before the first assistant turn (True — judge/guardian
+    data). No-op for non-ChatML rendering and for rows without documents.
 
     ``last_token`` (when set) is an end-of-completion marker: any rendered row
     that doesn't already carry the marker at the end gets it appended (at the
@@ -152,6 +158,7 @@ def load_jsonl_dataset(
                 tools=obj.get("tools"),
                 add_generation_prompt=False,
                 enable_thinking=enable_thinking,
+                instruction_as_user_message=instruction_as_user_message,
             )
             if last_token_id is not None:
                 # Append the end-of-completion marker unless the row already

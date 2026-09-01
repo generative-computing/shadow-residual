@@ -185,6 +185,19 @@ def test_packing_lives_in_trainer_block():
     assert cfg.trainer.packing is True
 
 
+def test_instruction_as_user_message_defaults_false():
+    cfg = TrainingConfig.model_validate(_minimal())
+    assert cfg.data.instruction_as_user_message is False
+
+
+def test_instruction_as_user_message_accepts_true():
+    cfg = TrainingConfig.model_validate(
+        _minimal(data={"train_path": "/tmp/t.jsonl", "val_path": "/tmp/v.jsonl",
+                       "instruction_as_user_message": True})
+    )
+    assert cfg.data.instruction_as_user_message is True
+
+
 # --- validation block (formerly `eval:`) --------------------------------------
 
 def test_validation_block_replaces_eval():

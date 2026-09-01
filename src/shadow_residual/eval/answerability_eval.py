@@ -178,7 +178,7 @@ def load_dataset(dataset_path, dataset_size=100000):
 
 def run_inference_base(base_model_name, all_messages, all_documents,
                        batch_size, device_str, enable_thinking=False,
-                       max_new_tokens=30):
+                       max_new_tokens=30, instruction_as_user_message=False):
     """Run HuggingFace inference with the base model only (no adapter).
 
     This serves as a baseline to measure the adapter's contribution.
@@ -229,6 +229,7 @@ def run_inference_base(base_model_name, all_messages, all_documents,
             documents=doc_dicts,
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
+            instruction_as_user_message=instruction_as_user_message,
         )
         prompts.append(prompt)
 
@@ -280,7 +281,7 @@ def run_inference_base(base_model_name, all_messages, all_documents,
 
 def run_inference_peft(base_model_name, adapter_path, all_messages, all_documents,
                        batch_size, device_str, enable_thinking=False,
-                       max_new_tokens=30):
+                       max_new_tokens=30, instruction_as_user_message=False):
     """Run HuggingFace inference with a PEFT LoRA adapter.
 
     Args:
@@ -354,6 +355,7 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
             documents=doc_dicts,
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
+            instruction_as_user_message=instruction_as_user_message,
         )
         prompts.append(prompt)
 
@@ -663,6 +665,13 @@ def main():
              "when the block is present, so scoring works either way.",
     )
     parser.add_argument(
+        "--instruction-as-user-message", dest="instruction_as_user_message",
+        action="store_true",
+        help="[base/peft] Inject RAG documents before the first assistant turn "
+             "(judge/guardian data) instead of after the last user turn. ChatML "
+             "(Granite 4.2/5.0) only. Must match the value used at training time.",
+    )
+    parser.add_argument(
         "--max-new-tokens", type=int, default=30,
         help="[base/peft] Max new tokens to generate per sample. Default 30 — "
              "enough for Granite 4.2's '<think></think>\"unanswerable\"' target "
@@ -736,6 +745,7 @@ def main():
             args.batch_size, args.device,
             enable_thinking=args.enable_thinking,
             max_new_tokens=args.max_new_tokens,
+            instruction_as_user_message=args.instruction_as_user_message,
         )
     else:  # peft
         raw_predictions = run_inference_peft(
@@ -744,6 +754,7 @@ def main():
             args.batch_size, args.device,
             enable_thinking=args.enable_thinking,
             max_new_tokens=args.max_new_tokens,
+            instruction_as_user_message=args.instruction_as_user_message,
         )
 
     # Process predictions

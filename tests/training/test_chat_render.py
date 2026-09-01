@@ -108,3 +108,46 @@ def test_no_documents_noop(chatml):
     assert "<tool_response>" not in out
     assert "NATIVE_DOC:" not in out
     assert "[user] Is it answerable?" in out
+
+
+# ---------- instruction_as_user_message placement ----------
+
+# Judge/guardian shape: question → answer being judged → judge instruction → label.
+JUDGE_MSGS = [
+    {"role": "user", "content": "q1_question"},
+    {"role": "assistant", "content": "a1_answer_being_judged"},
+    {"role": "user", "content": "q2_judge_instruction"},
+    {"role": "assistant", "content": "a2_label"},
+]
+
+
+def test_instruction_as_user_message_inserts_before_first_assistant():
+    """flag=True: docs land before the FIRST assistant turn (the answer being
+    judged), not after the last user turn."""
+    tok = _FakeTokenizer(chatml=True)
+    out = render_chat(tok, JUDGE_MSGS, documents=DOCS,
+                      instruction_as_user_message=True)
+    # tool block sits between the first user turn and the first assistant answer.
+    assert out.index("q1_question") < out.index("[tool]") < out.index("a1_answer_being_judged")
+    # and BEFORE the judge instruction (definitely not at the end).
+    assert out.index("[tool]") < out.index("q2_judge_instruction")
+
+
+def test_instruction_as_user_message_default_unchanged():
+    """flag omitted: docs land after the LAST user turn (the judge instruction),
+    i.e. just before the final label — the pre-existing behavior."""
+    tok = _FakeTokenizer(chatml=True)
+    out = render_chat(tok, JUDGE_MSGS, documents=DOCS)
+    # tool block sits after the judge instruction, before the final label.
+    assert out.index("q2_judge_instruction") < out.index("[tool]") < out.index("a2_label")
+
+
+def test_instruction_as_user_message_no_assistant_falls_back():
+    """flag=True but no assistant turn (e.g. eval prompt): fall back to
+    after-last-user placement without crashing."""
+    tok = _FakeTokenizer(chatml=True)
+    msgs = [{"role": "user", "content": "only_user_turn"}]
+    out = render_chat(tok, msgs, documents=DOCS, add_generation_prompt=True,
+                      instruction_as_user_message=True)
+    assert "[tool]" in out and "<tool_response>" in out
+    assert out.index("only_user_turn") < out.index("[tool]")

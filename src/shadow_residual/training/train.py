@@ -71,6 +71,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--thinking", "--enable-thinking", dest="enable_thinking", action="store_true",
                    help="Set data.enable_thinking=True — forwarded to "
                         "apply_chat_template(enable_thinking=...) when rendering training rows.")
+    p.add_argument("--instruction-as-user-message", dest="instruction_as_user_message",
+                   action="store_true",
+                   help="Set data.instruction_as_user_message=True — inject RAG documents "
+                        "before the first assistant turn (judge/guardian data) instead of "
+                        "after the last user turn. ChatML (Granite 4.2/5.0) only.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", action="store_true",
                    help="Periodically log a decoded training example + labels from the collator. "
@@ -106,6 +111,8 @@ def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
         cfg.runtime.report_to = ["wandb"]
     if args.enable_thinking:
         cfg.data.enable_thinking = True
+    if args.instruction_as_user_message:
+        cfg.data.instruction_as_user_message = True
     if args.debug_collator:
         cfg.trainer.debug_collator = True
         # Also turn on generation debug printing at the same rate, unless the
@@ -378,11 +385,13 @@ def main(argv: list[str] | None = None) -> int:
         cfg.data.train_path, tok,
         enable_thinking=cfg.data.enable_thinking,
         last_token=cfg.adapter.last_token,
+        instruction_as_user_message=cfg.data.instruction_as_user_message,
     )
     val_ds = load_jsonl_dataset(
         cfg.data.val_path, tok,
         enable_thinking=cfg.data.enable_thinking,
         last_token=cfg.adapter.last_token,
+        instruction_as_user_message=cfg.data.instruction_as_user_message,
     )
     logger.info("Train rows: %d, Val rows: %d", len(train_ds), len(val_ds))
 
