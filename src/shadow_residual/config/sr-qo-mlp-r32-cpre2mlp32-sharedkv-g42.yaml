@@ -1,0 +1,88 @@
+# W-cross ablation on Granite 4.2, arm 3 of 5: base PRE-ATTENTION → adapter
+# POST-MLP — the base stream is read at the layer's ENTRY and injected at the
+# adapter's layer EXIT.
+#
+# Identical to sr-qo-mlp-r32-c32-sharedkv-g42.yaml (arm 1, the baseline) except
+# that `cross_stream` is replaced by `cross_stream_pre_attn_to_post_mlp`. Same
+# rank, same alpha, same trainable-parameter count.
+#
+# What varies vs arm 1: only the SOURCE point. Both taps write into the adapter
+# stream at the same place (layer exit); arm 1 reads the base state at that same
+# exit, this arm reads it at the layer entry — i.e. one layer further back, since
+# the stacked hidden state passes between layers untouched and a layer's entry
+# point IS the previous layer's exit point. So this arm asks whether the adapter
+# benefits from a *staler* base state at the same injection site.
+#
+# Runs the ordinary interleaved dual-stream forward: the source precedes the
+# destination, so `h_base` at layer entry is already in hand when the adapter
+# reaches its post-MLP injection. No restructuring, no throughput difference.
+#
+# The tap set built on the model is DERIVED from target_modules, so naming the tap
+# here is the whole switch. See shadow_residual/cross_stream.py::CROSS_STREAM_TAPS.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  # ChatML assistant opener, thinking OFF — see arm 1 for the full reasoning.
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream_pre_attn_to_post_mlp: 32
+  alpha: 64                          # alpha/r == 2.0 on every module
+  dropout: 0.05
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

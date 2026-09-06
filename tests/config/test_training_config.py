@@ -32,7 +32,15 @@ def _minimal(**overrides) -> dict:
 @pytest.mark.parametrize(
     "name",
     [
+        # All five arms of the W-cross ablation. They differ only in the
+        # cross-stream key(s) under adapter.target_modules (and, for the two-tap
+        # arm, a per-module alpha dict), so validating every one of them is what
+        # pins that the schema accepts each tap name and each alpha form.
         "sr-qo-mlp-r32-c32-sharedkv.yaml",
+        "sr-qo-mlp-r32-cattn32-sharedkv.yaml",
+        "sr-qo-mlp-r32-cboth16-sharedkv.yaml",
+        "sr-qo-mlp-r32-cpre2mlp32-sharedkv.yaml",
+        "sr-qo-mlp-r32-cmlp2pre32-sharedkv.yaml",
     ],
 )
 def test_examples_validate(monkeypatch, name):
@@ -44,19 +52,54 @@ def test_examples_validate(monkeypatch, name):
     assert cfg.save.output_dir == "/runs/job1/checkpoints"
 
 
-def test_g42_config_validates(monkeypatch):
-    """The Granite 4.2 variant: ${BASE_MODEL} interpolation + ChatML marker."""
+# The five Granite 4.2 ablation arms → the cross-stream tap(s) each one trains.
+# These are the configs the answerability ablation actually runs, so every arm must
+# validate AND resolve to the tap set its filename advertises — a copy-paste slip in
+# the cross-stream key would otherwise only surface as a mislabelled GPU run.
+_G42_ARMS = {
+    "sr-qo-mlp-r32-c32-sharedkv-g42.yaml": ("cross_stream",),
+    "sr-qo-mlp-r32-cattn32-sharedkv-g42.yaml": ("cross_stream_post_attn",),
+    "sr-qo-mlp-r32-cpre2mlp32-sharedkv-g42.yaml": (
+        "cross_stream_pre_attn_to_post_mlp",
+    ),
+    "sr-qo-mlp-r32-cmlp2pre32-sharedkv-g42.yaml": (
+        "cross_stream_post_mlp_to_pre_attn",
+    ),
+    "sr-qo-mlp-r32-cboth32-sharedkv-g42.yaml": (
+        "cross_stream",
+        "cross_stream_post_attn",
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_G42_ARMS), ids=list(_G42_ARMS))
+def test_g42_config_validates(monkeypatch, name):
+    """The Granite 4.2 arms: ${BASE_MODEL} interpolation + ChatML markers.
+
+    Also pins the rank contract for the ablation: every targeted module is r=32
+    with a scalar alpha of 64, so ``alpha/r == 2.0`` holds across all five arms and
+    effective LoRA scale is never a confound.
+    """
+    from shadow_residual.shadow_residual.cross_stream import (
+        cross_stream_taps_from_target_modules,
+    )
+
     monkeypatch.setenv("DATA_ROOT", "/data")
     monkeypatch.setenv("RUN_DIR", "/runs/job1")
     monkeypatch.setenv("EVAL_DATA", "/data/eval.jsonl")
     monkeypatch.setenv("BASE_MODEL", "/models/granite-4.2-3b")
-    cfg = load_training_config(EXAMPLES / "sr-qo-mlp-r32-c32-sharedkv-g42.yaml")
+    cfg = load_training_config(EXAMPLES / name)
     assert cfg.model.base == "/models/granite-4.2-3b"      # ${BASE_MODEL} resolved
     # ChatML thinking-OFF: generation begins after </think>, so that is the last
     # context token; the collator masks through "<|im_start|>assistant\n<think></think>".
     assert cfg.adapter.last_context_token == "</think>"
     assert cfg.data.assistant_marker == "<|im_start|>assistant\n<think></think>"
     assert cfg.adapter.last_token == "<|im_end|>"
+
+    targets = cfg.adapter.target_modules
+    assert set(targets.values()) == {32}, f"{name}: every module must be r=32"
+    assert cfg.adapter.alpha == 64, f"{name}: alpha must be 64 (alpha/r == 2.0)"
+    assert cross_stream_taps_from_target_modules(list(targets)) == _G42_ARMS[name]
 
 
 def test_shared_base_kv_key_is_rejected():
@@ -345,6 +388,67 @@ def test_to_peft_config_per_module_target_modules():
     assert pc.r == 16
     assert sorted(pc.target_modules) == ["gate_proj", "q_proj"]
     assert pc.rank_pattern == {"q_proj": 16, "gate_proj": 64}
+
+
+def test_scalar_alpha_produces_no_alpha_pattern():
+    pytest.importorskip("peft")
+    from shadow_residual.config.adapters import to_peft_config
+
+    cfg = TrainingConfig.model_validate(
+        _minimal(adapter={"target_modules": {"q_proj": 16, "gate_proj": 64}, "alpha": 32})
+    )
+    pc = to_peft_config(cfg)
+    assert pc.lora_alpha == 32
+    assert getattr(pc, "alpha_pattern", None) in (None, {})
+
+
+def test_per_module_alpha_emits_alpha_pattern():
+    """A dict `alpha` projects to PEFT's `alpha_pattern`, which is what makes a
+    parameter-aligned ablation possible: LoRA scales by alpha / r, so halving a
+    module's rank without halving its alpha would change its effective scale too."""
+    pytest.importorskip("peft")
+    from shadow_residual.config.adapters import to_peft_config
+
+    cfg = TrainingConfig.model_validate(_minimal(adapter={
+        "target_modules": {"cross_stream": 16, "cross_stream_post_attn": 16, "q_proj": 32},
+        "alpha": {"cross_stream": 32, "cross_stream_post_attn": 32, "q_proj": 64},
+    }))
+    pc = to_peft_config(cfg)
+    assert pc.alpha_pattern == {
+        "cross_stream": 32, "cross_stream_post_attn": 32, "q_proj": 64,
+    }
+    # PEFT resolves ONE target_name_key across chain(rank_pattern, alpha_pattern)
+    # and indexes BOTH with it, so the key sets must be identical.
+    assert set(pc.alpha_pattern) == set(pc.rank_pattern)
+    # Scalar fallbacks are the minima of each dict.
+    assert pc.r == 16
+    assert pc.lora_alpha == 32
+    # alpha / r == 2.0 for every module — the aligned-ablation property.
+    for name, r in pc.rank_pattern.items():
+        assert pc.alpha_pattern[name] / r == pytest.approx(2.0)
+
+
+def test_dict_alpha_requires_dict_target_modules():
+    with pytest.raises(ValidationError, match="dict form of"):
+        TrainingConfig.model_validate(_minimal(adapter={
+            "target_modules": 32,
+            "alpha": {"q_proj": 64},
+        }))
+
+
+def test_dict_alpha_key_set_must_match_target_modules():
+    """An omitted module silently falling back to the scalar alpha is exactly the
+    uncontrolled scale change an aligned ablation is trying to remove."""
+    with pytest.raises(ValidationError, match="must match"):
+        TrainingConfig.model_validate(_minimal(adapter={
+            "target_modules": {"q_proj": 32, "cross_stream": 16},
+            "alpha": {"q_proj": 64},
+        }))
+    with pytest.raises(ValidationError, match="must match"):
+        TrainingConfig.model_validate(_minimal(adapter={
+            "target_modules": {"q_proj": 32},
+            "alpha": {"q_proj": 64, "o_proj": 64},
+        }))
 
 
 def test_to_training_arguments_keeps_gc():

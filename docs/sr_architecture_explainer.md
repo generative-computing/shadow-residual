@@ -173,9 +173,45 @@ The previous diagram zoomed into one layer. This one zooms *out*: the embedding 
 
 Vertical inter-layer view. The two lanes run the full height of the figure; each layer is one card with all of its intermediates (input LN → per-stream attn → +residual → post-attn LN → per-stream MLP → +residual → cross-stream merge) stacked top-to-bottom. The only base→adapter coupling is the per-layer cross-stream merge at the bottom of each layer; the lanes are otherwise parallel and never crossed across layers. After the last layer, `h_base` is dropped and only `norm(h_adapt)` reaches `lm_head`.
 
+### 1.4b The cross-stream tap registry — *where* base feeds adapter
+
+The diagrams above show the tap at the bottom of the layer, which is the default and the only site SR had originally. It is not the only *possible* site: the tap is defined by a **(base source point, adapter destination point)** pair, and `shadow_residual/cross_stream.py` holds the registry of the ones SR knows how to build.
+
+```python
+# module name → (base source point, adapter destination point)
+CROSS_STREAM_TAPS: dict[str, tuple[str, str]] = {
+    "cross_stream":                      ("post_mlp",  "post_mlp"),   # legacy name / default
+    "cross_stream_post_attn":            ("post_attn", "post_attn"),
+    "cross_stream_pre_attn_to_post_mlp": ("pre_attn",  "post_mlp"),
+    "cross_stream_post_mlp_to_pre_attn": ("post_mlp",  "pre_attn"),
+}
+DEFAULT_CROSS_STREAM_TAPS = ("cross_stream",)
+
+#: the tap-able points within a layer, in execution order
+CROSS_STREAM_POINT_ORDER = {"pre_attn": 0, "post_attn": 1, "post_mlp": 2}
+```
+
+Three rules make this work without a second config field and without any custom PEFT code:
+
+- **The tap set is derived from `target_modules`, not configured separately.** An unwrapped tap is a frozen zero-init `nn.Linear` — a guaranteed no-op — so building one that no LoRA targets would be pure dead weight. Therefore the taps *built* on the model are exactly the `cross_stream*` names present in `target_modules` (`cross_stream_taps_from_target_modules`). One source of truth, nothing to drift, and the saved `adapter_config.json` already records everything the serving path needs to rebuild the same tree (`training/generation_utils.py::read_cross_stream_taps_from_adapter`).
+- **Taps are direct attributes of the decoder layer, in registry order.** Not an `nn.ModuleDict` — that inserts a path segment and would force PEFT to target an ambiguous leaf name. Registry order (rather than, say, set order) gives every rank an identical module insertion order, which the FSDP meta-init path in `training/factory.py` depends on.
+- **Injection is a sum, resolved by destination.** `ShadowResidualDecoderLayer._inject(h_adapt, dst, base_pts)` adds every configured tap whose destination is `dst`, reading its source out of `base_pts` — a `point → tensor` map the forward fills in as the base stream reaches each point. Multiple taps at the same destination simply accumulate. A tap whose source is not yet in `base_pts` raises `KeyError` rather than silently reading the wrong state.
+
+**Which wirings are meaningful.** Not all nine `(source, destination)` pairs are distinct models. The stacked `[2,B,S,H]` hidden state passes between layers untouched, so `adapter_pre_attn[i]` **is** `adapter_post_mlp[i-1]` — literally the same tensor — and likewise on the base side. A `pre_attn → pre_attn` tap is therefore just `cross_stream` with its weight re-indexed by one layer: the same model family, not a new wiring, and an ablation arm that would reproduce the baseline. The two cross-position rows above survive that test. `pre_attn → post_mlp` feeds a one-layer-stale base state into the *same* destination the default tap uses (its destination index does not shift with its source). `post_mlp → pre_attn` is resolved **within** layer *i*, which makes it the only **zero-lag** wiring in the registry — every other tap hands the adapter a base state one layer behind, while this one lets the adapter's attention see the base stream's output for the very layer it is in.
+
+**Two execution orders.** The default decoder forward **interleaves** the streams sublayer by sublayer, which lets it fuse each layernorm into one `cat([h_base, h_adapt])` call. That order cannot serve a tap whose destination *precedes* its source: when the adapter reaches `pre_attn`, the base stream has not reached `post_mlp` yet. So `cross_stream_taps_need_base_ahead` (a comparison over `CROSS_STREAM_POINT_ORDER`) decides once **at construction time** — hence identically on every FSDP rank — whether the layer runs `_forward_base_ahead` instead: the base stream's *whole* layer first, recording every point, then the adapter's. Legal and non-circular, because `h_base` never depends on `h_adapt`.
+
+Base-ahead is a **reordering of pure ops**, not extra compute — `ShadowResidualAttention` already made two separate attention calls, one per stream's Q, and is now split into `forward_base` (which owns the single K/V computation and the *one* cache update, returning the shaped K/V) and `forward_adapt` (Q only, against that shared K/V). The MLP block splits the same way, with the base phase routing MoE first and the adapter phase reusing the stashed partition. The one thing the order genuinely gives up is the fused layernorms — they become one call per stream. RMSNorm is row-wise so this is mathematically identical, but kernel selection could drift the last bit, which is why the interleaved path is kept as the default rather than replaced: only the arm that needs base-ahead pays, and every previously-trained topology reproduces bit-for-bit.
+
+**Back-compat is by naming.** The post-MLP tap keeps the module name `cross_stream`, so existing YAMLs and existing `adapter_model.safetensors` load unchanged and reproduce bit-identically; a config that names no tap gets `DEFAULT_CROSS_STREAM_TAPS`.
+
+**Cost.** Each extra tap is a frozen, permanently-zero `H×H` per layer — the accepted dead weight of the stock-PEFT path (`base_layer(x) == 0` is what makes `lora.Linear`'s output a pure `B·A` injection). Two taps double it to `2·H²·L`. Acceptable for a 3b ablation; it is the reason "drop the dead `H×H`" is a prerequisite before scaling to the full wiring grid or to 8b/30b bases. Note that this is per *built* tap, and only targeted taps are built — a five-arm ablation never pays for more than the arm it is running.
+
+**Parameter-aligned comparisons.** LoRA scales its delta by `alpha / r`, so an N-tap run at `r/N` is *not* comparable to the 1-tap baseline unless alpha follows: halving rank doubles effective scale. `adapter.alpha` therefore accepts a per-module dict alongside the per-module `target_modules` dict and projects to PEFT's `alpha_pattern`. The schema requires the two dicts to carry **exactly the same key set** — partly so no module silently falls back to the scalar default (the confound), and partly because PEFT's `lora.model._create_and_replace` resolves a *single* `target_name_key` out of `chain(rank_pattern.keys(), alpha_pattern.keys())` and then indexes **both** dicts with it. See `config/sr-qo-mlp-r32-cboth16-sharedkv.yaml` for the aligned two-tap run (`2·(16+16)·H·L == 2·32·H·L`, `alpha/r == 2.0` throughout).
+
 ### 1.5 Adapter-only early-exit
 
-When `"cross_stream"` is *not* in `target_modules`, no `CrossStream` site has been wrapped — the model gate `_any_cross_stream_wrapped(self.layers)` in `modeling_hf.py` returns `False` and the decoder takes a **single-stream path**: only `h_adapt` is computed, with one Q/K/V/O pass per layer under the default `"adapter"` context. Compute is equivalent to plain LoRA on Granite (modulo unfused QKV / gate-up reduction order).
+When no `cross_stream*` tap is in `target_modules`, no `CrossStream` site has been wrapped — the model gate `_any_cross_stream_wrapped(self.layers)` in `modeling_hf.py` returns `False` and the decoder takes a **single-stream path**: only `h_adapt` is computed, with one Q/K/V/O pass per layer under the default `"adapter"` context. Compute is equivalent to plain LoRA on Granite (modulo unfused QKV / gate-up reduction order).
 
 ```
    adapter-only early-exit (no cross_stream wrapped)

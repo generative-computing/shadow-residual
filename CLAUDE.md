@@ -15,6 +15,25 @@ stream** (bit-exact with the unadapted base) and a **trainable adapter stream**
 `lora.Linear` wraps like any other target. The adapter is plain LoRA and
 **always active** — the delta fires on every position (no gated/aLoRA activation).
 
+**Cross-stream taps are a registry, not one hard-coded site.**
+`cross_stream.py::CROSS_STREAM_TAPS` maps a module name to a (base source,
+adapter destination) pair — `cross_stream` = post-MLP → post-MLP (the default, and
+the legacy name kept for back-compat), `cross_stream_post_attn` = post-attention →
+post-attention, plus the two cross-position wirings
+`cross_stream_pre_attn_to_post_mlp` and `cross_stream_post_mlp_to_pre_attn`. The
+taps *built* on the model are **derived from `target_modules`** (an untargeted tap
+is a frozen-zero no-op, so building one is pure dead weight); there is no separate
+config field. A tap whose destination *precedes* its source (only
+`cross_stream_post_mlp_to_pre_attn` today) makes the decoder select
+`_forward_base_ahead` — the base stream's whole layer runs before the adapter's —
+decided once at construction so it is identical on every FSDP rank. It is
+arithmetically equivalent to the interleaved path but cannot fuse the two
+layernorms, so every other topology keeps the interleaved default and reproduces
+bit-for-bit. Each tap costs a frozen, permanently-zero `H×H` per layer. For
+parameter-aligned ablations `adapter.alpha` accepts a per-module dict (→ PEFT
+`alpha_pattern`) over exactly the `target_modules` keys, so `alpha/r` can be held
+constant while rank varies. See §1.4b of the explainer.
+
 **Single topology: shared base-only K/V.** K and V are computed once from the
 base stream and shared with both streams' Q; there is one KV cache. LoRA on
 `k_proj` / `v_proj` is forbidden (rejected at build time — no place for a K/V

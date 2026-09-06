@@ -9,18 +9,21 @@ broadcasts rank 0's values to other ranks after sharding — peak host
 RAM is one rank's copy instead of N.
 
 Whether the dual-stream forward actually runs is a runtime decision made
-by the SR model itself (see ``modeling_hf.py``): if no ``cross_stream``
-site has been wrapped by a stock LoRA layer (i.e. the user did not list
-``"cross_stream"`` in ``target_modules``), every forward takes a
+by the SR model itself (see ``modeling_hf.py``): if no cross-stream
+site has been wrapped by a stock LoRA layer (i.e. the user listed no tap
+name in ``target_modules``), every forward takes a
 single-stream early-exit path with compute equivalent to plain Granite +
 the wrapped LoRA deltas. This is why there is no factory-level branch: one
 architecture, two forward paths.
 
-There is no custom PEFT code: the cross-stream site is a real frozen
+Which cross-stream sites exist is derived from ``target_modules`` — see
+``cross_stream.cross_stream_taps_from_target_modules``.
+
+There is no custom PEFT code: each cross-stream site is a real frozen
 zero-init ``nn.Linear`` (see ``cross_stream.py``) that stock
 ``peft.tuners.lora.layer.Linear`` wraps like any other target. The adapter is
 plain LoRA and always active — the delta fires on every position, in both
-streams' Q/O/MLP and the cross_stream injection. There is no gated/aLoRA
+streams' Q/O/MLP and the cross-stream injections. There is no gated/aLoRA
 activation.
 """
 
@@ -38,7 +41,10 @@ from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
-from shadow_residual.shadow_residual.cross_stream import CrossStream
+from shadow_residual.shadow_residual.cross_stream import (
+    CrossStream,
+    cross_stream_taps_from_target_modules,
+)
 from shadow_residual.shadow_residual.weight_transfer import (
     transfer_base_weights,
 )
@@ -53,9 +59,6 @@ from shadow_residual.shadow_residual.build import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-CROSS_STREAM_NAME = "cross_stream"
 
 
 def _materialize_and_transfer(
@@ -133,7 +136,8 @@ def _materialize_and_transfer(
                     adapter_name, init_lora_weights=True,
                 )
 
-    # Re-zero the frozen cross-stream nn.Linear weights. CrossStream is a real
+    # Re-zero the frozen cross-stream nn.Linear weights (every configured tap —
+    # the isinstance walk below covers them all). CrossStream is a real
     # nn.Linear(H, H) that must be exactly zero (so base_layer(h_base)=0 and the
     # layer output is the pure B·A cross-stream injection). ``to_empty(cpu)``
     # above rewrote it to uninitialized GARBAGE, and neither transfer_base_weights
@@ -294,11 +298,15 @@ def get_shadow_residual_peft_model(
             Granite model.
         lora_config: a stock :class:`peft.LoraConfig`.  Driving fields:
 
-            * ``target_modules`` — projection names to attach LoRA on, plus
-              ``"cross_stream"`` to opt into shadow residual. Must NOT include
-              ``k_proj`` / ``v_proj``.
+            * ``target_modules`` — projection names to attach LoRA on, plus one or
+              more cross-stream tap names (``"cross_stream"``,
+              ``"cross_stream_post_attn"``; see
+              :data:`shadow_residual.shadow_residual.cross_stream.CROSS_STREAM_TAPS`)
+              to opt into shadow residual. The taps named here are also the taps
+              BUILT on the model. Must NOT include ``k_proj`` / ``v_proj``.
             * ``r``, ``lora_alpha``, ``lora_dropout`` — defaults.
-            * ``rank_pattern={"cross_stream": R}`` — overrides cross-stream rank.
+            * ``rank_pattern`` / ``alpha_pattern`` — per-module rank / alpha
+              overrides, e.g. ``rank_pattern={"cross_stream": R}``.
             The adapter is plain LoRA (always active); there is no gated activation.
         torch_dtype: dtype for the base model construction.
         adapter_name: PEFT adapter name (default: ``"default"``).
@@ -312,11 +320,22 @@ def get_shadow_residual_peft_model(
         :class:`peft.PeftModel`.
     """
     _reject_kv_lora(lora_config)
+    # Which cross-stream sites to build is DERIVED from target_modules: the tap
+    # set is exactly the set of cross_stream* LoRA targets (an untargeted tap is
+    # a frozen zero-init no-op, so building one would be pure dead weight).
+    # Deriving it means there is no second config field to drift, and the saved
+    # adapter_config.json already records everything the serving path needs.
+    cross_stream_taps = cross_stream_taps_from_target_modules(
+        lora_config.target_modules
+    )
     logger.info(
         "Building SR base from upstream HF Granite. target_modules=%s "
-        "(cross_stream %s present).",
+        "cross_stream_taps=%s (dual-stream forward %s engage).",
         lora_config.target_modules,
-        "is" if CROSS_STREAM_NAME in (lora_config.target_modules or []) else "is not",
+        cross_stream_taps,
+        "will"
+        if any(t in (lora_config.target_modules or []) for t in cross_stream_taps)
+        else "will not",
     )
 
     # Path-D pipeline: every rank builds SR + PEFT-wrap on meta with an
@@ -329,6 +348,7 @@ def get_shadow_residual_peft_model(
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         share_moe_routing=share_moe_routing,
+        cross_stream_taps=cross_stream_taps,
     )
 
     peft_model = _build_sr_peft_model_meta(

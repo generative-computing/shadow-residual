@@ -10,9 +10,17 @@ frozen base weights via ``base_layer`` (``_base_only`` / ``mlp.forward_base_only
 — a pure call with no adapter-state mutation — so it is bit-identical to the
 unadapted base model. The adapter stream runs the wrapped projections so the LoRA
 delta fires (always active — plain LoRA, on every position). K/V is computed once
-from the base stream (shared, one cache). At the end of each layer the cross-stream
-site couples base → adapter: ``h_adapt += W_cross(h_base)`` — the per-layer
-base→adapter merge.
+from the base stream (shared, one cache). One or more cross-stream sites couple
+base → adapter inside the layer: ``h_adapt += W_cross(h_base)``. Which sites exist
+is config-driven (``config.cross_stream_taps``); the default is the historical
+single post-MLP tap named ``cross_stream``. See :data:`cross_stream.CROSS_STREAM_TAPS`.
+
+The two streams are normally **interleaved** sublayer by sublayer, so each
+layernorm runs once over a concatenated batch. A tap whose destination precedes
+its source (e.g. base post-MLP → adapter pre-attention) cannot be served that
+way, so such a tap set selects :meth:`ShadowResidualDecoderLayer._forward_base_ahead`
+instead — the base stream's whole layer first, then the adapter's. The choice is
+made once at construction from the tap set.
 
 Because the forward is pure (no contextvar / ``disable_adapter`` toggling) and the
 layer is a :class:`GradientCheckpointingLayer` with a single stacked
@@ -47,7 +55,12 @@ from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
 from ._stream_gated_linear import _StreamGatedLinear, _base_only
 from .attention_hf import ShadowResidualAttention
-from .cross_stream import CrossStream
+from .cross_stream import (
+    CROSS_STREAM_TAPS,
+    DEFAULT_CROSS_STREAM_TAPS,
+    CrossStream,
+    cross_stream_taps_need_base_ahead,
+)
 
 
 class ShadowResidualMLP(nn.Module):
@@ -235,11 +248,80 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
             config.hidden_size, eps=config.rms_norm_eps,
         )
 
-        # Cross-stream site — the per-layer base→adapter merge point. A frozen
-        # zero-init nn.Linear (no-op) until PEFT wraps it with stock LoRA when
-        # ``"cross_stream"`` is in target_modules. On a bare model it contributes
+        # Cross-stream sites — the per-layer base→adapter merge points. Each is a
+        # frozen zero-init nn.Linear (no-op) until PEFT wraps it with stock LoRA
+        # when its name is in target_modules. On a bare model each contributes
         # zero to h_adapt.
-        self.cross_stream = CrossStream(config.hidden_size)
+        #
+        # Which sites exist is config-driven (``cross_stream_taps``, a list of
+        # names from cross_stream.CROSS_STREAM_TAPS, normally derived from
+        # target_modules by training.factory). Default = the historical single
+        # post-MLP tap named ``cross_stream``. Order follows the config list, so
+        # module insertion order is identical on every rank — required by the
+        # FSDP meta-init path in training.factory.
+        self.cross_stream_tap_names = tuple(
+            getattr(config, "cross_stream_taps", None) or DEFAULT_CROSS_STREAM_TAPS
+        )
+        for tap_name in self.cross_stream_tap_names:
+            setattr(self, tap_name, CrossStream(config.hidden_size))
+
+        # A tap whose destination PRECEDES its source cannot be served by the
+        # interleaved forward — see :meth:`_forward_base_ahead`. Decided once
+        # here, from the tap set, so it is identical on every FSDP rank; every
+        # same-point and forward-flowing topology keeps the interleaved path.
+        self._base_ahead = cross_stream_taps_need_base_ahead(
+            self.cross_stream_tap_names
+        )
+
+    def _inject(
+        self, h_adapt: torch.Tensor, dst: str, base_pts: dict,
+    ) -> torch.Tensor:
+        """Add every configured tap whose destination is ``dst`` into ``h_adapt``.
+
+        ``base_pts`` maps a base-stream point name (``pre_attn`` / ``post_attn`` /
+        ``post_mlp``) to the base hidden state there; a tap reads the entry for
+        its own source point. The caller only populates points the base stream
+        has actually reached, so a tap wired to a not-yet-computed source would
+        raise ``KeyError`` rather than silently read the wrong state — which is
+        what ``_base_ahead`` exists to prevent.
+
+        Pure (reads ``base_pts``, returns a new ``h_adapt``) — never mutates the
+        base stream, and safe under gradient-checkpoint recompute.
+        """
+        for tap_name in self.cross_stream_tap_names:
+            src, tap_dst = CROSS_STREAM_TAPS[tap_name]
+            if tap_dst == dst:
+                h_adapt = h_adapt + getattr(self, tap_name)(base_pts[src])
+        return h_adapt
+
+    def _mlp_base(
+        self, normed_base: torch.Tensor, bsz: int,
+    ) -> Tuple[torch.Tensor, Optional[tuple]]:
+        """Base-stream MLP. Returns ``(mlp_base, routing)``.
+
+        ``routing`` is the MoE partition to reuse for the adapter stream under
+        ``share_moe_routing`` (routed on ``normed_base``, so the base stream stays
+        bit-identical to stock), and ``None`` otherwise.
+        """
+        if self.mlp.is_moe and self.share_moe_routing:
+            length, emb = normed_base.shape[1], normed_base.shape[2]
+            routing = self.mlp._route(normed_base)
+            mlp_base = self.mlp._apply_experts(
+                normed_base.reshape(-1, emb), *routing, bsz=bsz, length=length,
+            )
+            return mlp_base, routing
+        return self.mlp.forward_base_only(normed_base), None
+
+    def _mlp_adapt(
+        self, normed_adapt: torch.Tensor, bsz: int, routing: Optional[tuple],
+    ) -> torch.Tensor:
+        """Adapter-stream MLP, reusing ``routing`` from :meth:`_mlp_base` if given."""
+        if routing is not None:
+            length, emb = normed_adapt.shape[1], normed_adapt.shape[2]
+            return self.mlp._apply_experts(
+                normed_adapt.reshape(-1, emb), *routing, bsz=bsz, length=length,
+            )
+        return self.mlp(normed_adapt)
 
     def forward(
         self,
@@ -258,10 +340,28 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         and checkpoint-friendly. K/V is computed once from the base stream (shared);
         the KV cache is mutated in place inside attention and not returned (the model
         loop keeps its own reference).
+
+        The two streams are normally **interleaved** sublayer by sublayer, which
+        lets each layernorm run once over a concatenated batch. When a configured
+        tap needs the base state from a point the interleaved order has not reached
+        yet, :meth:`_forward_base_ahead` runs instead.
         """
         del kwargs
+        if self._base_ahead:
+            return self._forward_base_ahead(
+                hs,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
         h_base, h_adapt = hs[0], hs[1]
         bsz = h_base.shape[0]
+        # Base-stream points available to taps, filled in as the base stream
+        # reaches them. On this path every tap's source is at or before its
+        # destination, so a tap always finds its source point already present.
+        base_pts = {"pre_attn": h_base}
 
         normed = self.input_layernorm(torch.cat([h_base, h_adapt], dim=0))
         normed_base, normed_adapt = normed[:bsz], normed[bsz:]
@@ -277,31 +377,97 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         )
         h_base = h_base + o_base * self.residual_multiplier
         h_adapt = h_adapt + o_adapt * self.residual_multiplier
+        base_pts["post_attn"] = h_base
+
+        # Post-attention cross-stream injection (base → adapter), if configured.
+        h_adapt = self._inject(h_adapt, "post_attn", base_pts)
 
         normed = self.post_attention_layernorm(torch.cat([h_base, h_adapt], dim=0))
         normed_base, normed_adapt = normed[:bsz], normed[bsz:]
 
-        if self.mlp.is_moe and self.share_moe_routing:
-            # Route once on the base stream; run both streams' experts through
-            # that partition. The base stream still routes on normed_base (so it
-            # stays bit-identical to stock); the adapter stream reuses the base's
-            # expert selection rather than routing on normed_adapt.
-            length, emb = normed_base.shape[1], normed_base.shape[2]
-            routing = self.mlp._route(normed_base)
-            mlp_base = self.mlp._apply_experts(
-                normed_base.reshape(-1, emb), *routing, bsz=bsz, length=length,
-            )
-            mlp_adapt = self.mlp._apply_experts(
-                normed_adapt.reshape(-1, emb), *routing, bsz=bsz, length=length,
-            )
-        else:
-            mlp_base = self.mlp.forward_base_only(normed_base)
-            mlp_adapt = self.mlp(normed_adapt)
+        # Under share_moe_routing the base stream routes once and the adapter
+        # stream reuses that partition rather than routing on normed_adapt.
+        mlp_base, routing = self._mlp_base(normed_base, bsz)
+        mlp_adapt = self._mlp_adapt(normed_adapt, bsz, routing)
         h_base = h_base + mlp_base * self.residual_multiplier
         h_adapt = h_adapt + mlp_adapt * self.residual_multiplier
+        base_pts["post_mlp"] = h_base
 
-        # End-of-layer cross-stream injection: base → adapter (the per-layer merge).
-        h_adapt = h_adapt + self.cross_stream(h_base)
+        # End-of-layer (post-MLP) cross-stream injection: base → adapter.
+        h_adapt = self._inject(h_adapt, "post_mlp", base_pts)
+
+        return torch.stack([h_base, h_adapt], dim=0)
+
+    def _forward_base_ahead(
+        self,
+        hs: torch.Tensor,
+        *,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Dual-stream forward with the base stream's whole layer run *first*.
+
+        Required by any tap whose destination precedes its source (e.g. base
+        post-MLP → adapter pre-attention), because the adapter stream must not
+        start until every base point exists. Legal and non-circular: ``h_base``
+        never depends on ``h_adapt``, so hoisting the base sublayers changes
+        nothing about the base stream.
+
+        Arithmetically equivalent to :meth:`forward` on any topology both can
+        serve — every op here is the same pure function of the same inputs. The
+        only structural difference is that the two layernorms run once per stream
+        instead of once over a concatenated batch (row-wise, so mathematically
+        identical), which is why the interleaved path is kept as the default.
+
+        Same contract as :meth:`forward`: pure, stacked ``[2, B, S, H]`` in and
+        out, exactly one KV-cache update (inside ``self_attn.forward_base``).
+
+        Note: with ``config.attention_dropout > 0`` in training this draws
+        attention-dropout RNG in a different sequence than :meth:`forward`. Granite
+        defaults to 0.0, and non-reentrant checkpointing saves/restores RNG state,
+        so recompute stays exact either way.
+        """
+        h_base, h_adapt = hs[0], hs[1]
+        bsz = h_base.shape[0]
+
+        # --- base stream: the whole layer, recording every tap-able point ---
+        base_pts = {"pre_attn": h_base}
+        o_base, k_shaped, v_shaped = self.self_attn.forward_base(
+            self.input_layernorm(h_base),
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=past_key_values is not None,
+            cache_position=cache_position,
+        )
+        h_base = h_base + o_base * self.residual_multiplier
+        base_pts["post_attn"] = h_base
+
+        mlp_base, routing = self._mlp_base(
+            self.post_attention_layernorm(h_base), bsz,
+        )
+        h_base = h_base + mlp_base * self.residual_multiplier
+        base_pts["post_mlp"] = h_base
+
+        # --- adapter stream: reuses the base's shared K/V and MoE routing ---
+        h_adapt = self._inject(h_adapt, "pre_attn", base_pts)
+        o_adapt = self.self_attn.forward_adapt(
+            self.input_layernorm(h_adapt),
+            k_shaped,
+            v_shaped,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+        )
+        h_adapt = h_adapt + o_adapt * self.residual_multiplier
+        h_adapt = self._inject(h_adapt, "post_attn", base_pts)
+
+        mlp_adapt = self._mlp_adapt(
+            self.post_attention_layernorm(h_adapt), bsz, routing,
+        )
+        h_adapt = h_adapt + mlp_adapt * self.residual_multiplier
+        h_adapt = self._inject(h_adapt, "post_mlp", base_pts)
 
         return torch.stack([h_base, h_adapt], dim=0)
 

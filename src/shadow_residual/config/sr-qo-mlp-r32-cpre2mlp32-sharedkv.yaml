@@ -1,0 +1,89 @@
+# W-cross ablation, arm 4 of 5: a CROSS-POSITION tap — the base stream is read at
+# LAYER ENTRY (pre-attention) and injected into the adapter stream at the end of
+# the layer (post-MLP).
+#
+# Identical to sr-qo-mlp-r32-c32-sharedkv.yaml (arm 1, the baseline) except that
+# `cross_stream` is replaced by `cross_stream_pre_attn_to_post_mlp`. Same rank,
+# same alpha, same trainable-parameter count — only the base SOURCE point moves.
+#
+# What this actually varies: the layer's entry base state IS the previous layer's
+# exit base state (base_pre_attn[i] == base_post_mlp[i-1]), so this arm feeds the
+# adapter a one-layer-STALE base state into the same destination arm 1 uses. It is
+# not reducible to arm 1 with a re-indexed weight, because the destination index
+# does not shift along with the source. It runs the ordinary interleaved
+# dual-stream forward — the base state it needs is already in hand at layer entry.
+#
+# The tap set built on the model is DERIVED from target_modules, so naming the tap
+# here is the whole switch: no other cross-stream module is constructed, and the
+# saved adapter_config.json self-describes the topology for the serving path. See
+# shadow_residual/cross_stream.py::CROSS_STREAM_TAPS.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ibm-granite/granite-4.1-3b
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream_pre_attn_to_post_mlp: 32
+  alpha: 64
+  dropout: 0.05
+  # Adapter is always active. These two single-token markers shape the
+  # data/labels (validated/appended in train.py) and are recorded into
+  # adapter_config.json. last_context_token = the final prompt token (the
+  # supervised region must start right after it); last_token = end-of-completion
+  # marker (appended to rows lacking it).
+  last_context_token: "<|end_of_role|>"
+  last_token: "<|end_of_text|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4           # 1 GPU * 1 * 32 = effective batch 32
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

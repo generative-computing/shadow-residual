@@ -45,4 +45,43 @@ def read_share_moe_routing_from_adapter(adapter_path: str) -> bool:
         return False
 
 
-__all__ = ["read_share_moe_routing_from_adapter"]
+def read_cross_stream_taps_from_adapter(adapter_path: str) -> tuple[str, ...]:
+    """Read which cross-stream sites an adapter was trained with.
+
+    The tap set is not a separate saved field — it *is* the set of
+    ``cross_stream*`` entries in the adapter's ``target_modules`` (see
+    :func:`shadow_residual.shadow_residual.cross_stream.cross_stream_taps_from_target_modules`).
+    Building the SR base with a different tap set leaves the saved LoRA tensors
+    with no module to attach to, so source it from the adapter::
+
+        from shadow_residual.shadow_residual.build import build_sr_base
+        from shadow_residual.training.generation_utils import (
+            read_cross_stream_taps_from_adapter,
+        )
+
+        taps = read_cross_stream_taps_from_adapter(adapter_path)
+        base = build_sr_base(base_id, torch_dtype=..., cross_stream_taps=taps)
+        model = PeftModel.from_pretrained(base, adapter_path)
+
+    Returns the historical single ``("cross_stream",)`` topology when the config
+    is missing or names no tap — which is what an SR base builds by default, so
+    older adapters keep loading unchanged.
+    """
+    from shadow_residual.shadow_residual.cross_stream import (
+        DEFAULT_CROSS_STREAM_TAPS,
+        cross_stream_taps_from_target_modules,
+    )
+
+    cfg_path = os.path.join(adapter_path, "adapter_config.json")
+    try:
+        with open(cfg_path) as f:
+            targets = json.load(f).get("target_modules")
+    except (FileNotFoundError, ValueError):
+        return DEFAULT_CROSS_STREAM_TAPS
+    return cross_stream_taps_from_target_modules(targets)
+
+
+__all__ = [
+    "read_share_moe_routing_from_adapter",
+    "read_cross_stream_taps_from_adapter",
+]

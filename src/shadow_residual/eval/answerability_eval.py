@@ -296,6 +296,7 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
 
     from shadow_residual.shadow_residual.build import build_sr_base
     from shadow_residual.training.generation_utils import (
+        read_cross_stream_taps_from_adapter,
         read_share_moe_routing_from_adapter,
     )
 
@@ -332,8 +333,16 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
     # No-op / False for dense bases and older adapters lacking the key.
     share_moe_routing = read_share_moe_routing_from_adapter(adapter_path)
     print(f"share_moe_routing (from adapter_config.json): {share_moe_routing}")
+    # Same idea for the cross-stream topology: build exactly the tap sites the
+    # adapter's target_modules names, or its saved cross-stream LoRA tensors have
+    # nothing to bind to.
+    cross_stream_taps = read_cross_stream_taps_from_adapter(adapter_path)
+    print(f"cross_stream_taps (from adapter_config.json): {cross_stream_taps}")
     base_model = build_sr_base(
-        base_model_name, torch_dtype=dtype, share_moe_routing=share_moe_routing,
+        base_model_name,
+        torch_dtype=dtype,
+        share_moe_routing=share_moe_routing,
+        cross_stream_taps=cross_stream_taps,
     )
     model = PeftModel.from_pretrained(base_model, adapter_path)
     model = model.to(device)

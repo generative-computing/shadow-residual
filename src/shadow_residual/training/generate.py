@@ -574,10 +574,21 @@ def run_generation_under_fsdp(
     n_done = 0
     if is_rank0:
         logger.info("[FSDP-generate] rebuilding non-FSDP SR+PEFT model on rank 0 (meta init)...")
+        # The rebuilt module tree must carry the SAME cross-stream tap sites the
+        # trained model had, or the gathered cross-stream LoRA tensors land in
+        # load_state_dict's `missing` list and the taps silently stay zero. Derive
+        # them from the in-memory peft_config (same rule training.factory uses).
+        from shadow_residual.shadow_residual.cross_stream import (
+            cross_stream_taps_from_target_modules,
+        )
+
         sr_config = _build_sr_config(
             cfg.model.base,
             torch_dtype=torch.bfloat16,
             attn_implementation=cfg.model.attn_implementation,
+            cross_stream_taps=cross_stream_taps_from_target_modules(
+                peft_config.target_modules
+            ),
         )
         rebuilt = _build_sr_peft_model_meta(
             sr_config,
@@ -673,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from shadow_residual.shadow_residual.build import build_sr_base
     from shadow_residual.training.generation_utils import (
+        read_cross_stream_taps_from_adapter,
         read_share_moe_routing_from_adapter,
     )
 
@@ -696,11 +708,17 @@ def main(argv: list[str] | None = None) -> int:
     # / False for dense bases and older adapters lacking the key.
     share_moe_routing = read_share_moe_routing_from_adapter(str(checkpoint_path))
     logger.info("share_moe_routing (from adapter_config.json): %s", share_moe_routing)
+    # Same idea for the cross-stream topology: build exactly the tap sites the
+    # adapter's target_modules names, or its saved cross-stream LoRA tensors have
+    # nothing to bind to.
+    cross_stream_taps = read_cross_stream_taps_from_adapter(str(checkpoint_path))
+    logger.info("cross_stream_taps (from adapter_config.json): %s", cross_stream_taps)
     base_model = build_sr_base(
         cfg.model.base,
         torch_dtype=torch.bfloat16,
         attn_implementation=cfg.model.attn_implementation,
         share_moe_routing=share_moe_routing,
+        cross_stream_taps=cross_stream_taps,
     )
     model = PeftModel.from_pretrained(base_model, str(checkpoint_path))
     if torch.cuda.is_available():

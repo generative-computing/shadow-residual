@@ -86,9 +86,10 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
     """Build peft.LoraConfig from the adapter block.
 
     `cfg.adapter.target_modules` is either a scalar rank (uniform) or a
-    dict[name, rank] (per-module). Both shapes need to be projected into
-    PEFT's three-field surface: `r`, `target_modules`, and optional
-    `rank_pattern`.
+    dict[name, rank] (per-module). `cfg.adapter.alpha` mirrors that: a scalar,
+    or a dict[name, alpha] over the same keys. Both shapes are projected into
+    PEFT's surface: `r`, `lora_alpha`, `target_modules`, and the optional
+    `rank_pattern` / `alpha_pattern` overrides.
     """
     from peft import LoraConfig
 
@@ -112,9 +113,22 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
         r_scalar = a.target_modules
         rank_pattern = None
 
+    if isinstance(a.alpha, dict):
+        # Per-module alpha: same projection shape as rank above. The schema
+        # guarantees these keys are EXACTLY `target_modules`' keys, which matters
+        # more than it looks: PEFT's `lora.model._create_and_replace` resolves ONE
+        # `target_name_key` out of chain(rank_pattern.keys(), alpha_pattern.keys())
+        # and then indexes BOTH dicts with that single key. Key sets that differ
+        # would silently resolve the wrong override for one of the two.
+        alpha_scalar = min(a.alpha.values())
+        alpha_pattern: dict[str, int] | None = dict(a.alpha)
+    else:
+        alpha_scalar = a.alpha
+        alpha_pattern = None
+
     kwargs: dict[str, Any] = dict(
         r=r_scalar,
-        lora_alpha=a.alpha,
+        lora_alpha=alpha_scalar,
         lora_dropout=a.dropout,
         bias=a.bias,
         target_modules=target_names,
@@ -122,6 +136,8 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
     )
     if rank_pattern is not None:
         kwargs["rank_pattern"] = rank_pattern
+    if alpha_pattern is not None:
+        kwargs["alpha_pattern"] = alpha_pattern
 
     return LoraConfig(**kwargs)
 

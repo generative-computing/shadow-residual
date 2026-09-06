@@ -14,6 +14,7 @@ This module reproduces that validation as a free function. Call
 
 from typing import Iterable
 
+from shadow_residual.shadow_residual.cross_stream import CROSS_STREAM_TAPS
 from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
 
@@ -36,6 +37,10 @@ def validate_shadow_residual_config(config: ShadowResidualConfig) -> None:
     - When ``num_local_experts > 0``, ``num_experts_per_tok`` must be a positive
       integer no larger than ``num_local_experts`` (the top-k router cannot select
       more experts than exist).
+    - ``cross_stream_taps``, when set, must be a non-empty list of names drawn from
+      :data:`shadow_residual.shadow_residual.cross_stream.CROSS_STREAM_TAPS`.
+      An unknown name would only surface as a ``KeyError`` deep inside the decoder
+      forward, so catch it here.
 
     SR uses a single K/V topology (shared base-only K/V), so there is no
     ``shared_base_kv`` toggle to validate.
@@ -58,6 +63,20 @@ def validate_shadow_residual_config(config: ShadowResidualConfig) -> None:
             "shadow_residual=True requires all layer_types to be 'attention' "
             "(no SSM / mamba layers)."
         )
+
+    taps = getattr(config, "cross_stream_taps", None)
+    if taps is not None:
+        if not taps:
+            raise ValueError(
+                "cross_stream_taps must name at least one cross-stream site; "
+                f"valid names: {sorted(CROSS_STREAM_TAPS)}."
+            )
+        unknown = [name for name in taps if name not in CROSS_STREAM_TAPS]
+        if unknown:
+            raise ValueError(
+                f"Unknown cross_stream_taps entries: {unknown}. "
+                f"Valid names: {sorted(CROSS_STREAM_TAPS)}."
+            )
 
     num_local_experts = int(getattr(config, "num_local_experts", 0) or 0)
     if num_local_experts > 0:

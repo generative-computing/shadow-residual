@@ -34,16 +34,48 @@ from shadow_residual.shadow_residual.config_helpers import (
     set_shadow_residual,
 )
 from shadow_residual.shadow_residual.modeling_hf import ShadowResidualModel
+from shadow_residual.shadow_residual.cross_stream import (
+    cross_stream_taps_from_target_modules,
+)
 
-# Stream-gated projections + the cross_stream merge site — the full target set
+# Stream-gated projections + EVERY cross-stream merge site — the full target set
 # the real SR configs train, so the checkpointed forward exercises every
-# stream-context branch.
-_TARGET_MODULES = ["q_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "cross_stream"]
+# stream-context branch and every injection point (post-attn and post-MLP; a tap
+# added mid-layer is a new recompute path, so it belongs in this set).
+_TARGET_MODULES = [
+    "q_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "cross_stream",
+    "cross_stream_post_attn",
+]
+
+# Same projections, but with the one tap whose destination precedes its source.
+# That tap selects the decoder's BASE-AHEAD forward — a different execution order
+# (base sublayers in full, then the adapter's, with unfused layernorms), i.e. a
+# genuinely different recompute path. Checkpointing exactness has to be pinned on
+# it too, so the recompute tests run over both topologies.
+_BASE_AHEAD_TARGET_MODULES = [
+    "q_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "cross_stream_post_mlp_to_pre_attn",
+]
+
+_TOPOLOGIES = {
+    "interleaved": _TARGET_MODULES,
+    "base_ahead": _BASE_AHEAD_TARGET_MODULES,
+}
 
 
-def _build_sr_peft_model(lora_dropout: float = 0.0):
+def _build_sr_peft_model(lora_dropout: float = 0.0, target_modules=None):
     """Tiny SR + PEFT model. Mirrors the fixture in
     tests/training/test_peft_wrapper.py."""
+    target_modules = list(target_modules or _TARGET_MODULES)
     cfg = ShadowResidualConfig(
         vocab_size=300,
         hidden_size=64,
@@ -55,12 +87,17 @@ def _build_sr_peft_model(lora_dropout: float = 0.0):
         max_lora_rank=8,
         switch_head_dim=16,
     )
+    # The taps BUILT on the model are derived from target_modules — same rule
+    # training.factory uses — so both injection sites exist here.
+    cfg.cross_stream_taps = list(
+        cross_stream_taps_from_target_modules(target_modules)
+    )
     set_shadow_residual(config=cfg, enabled=True)
     model = ShadowResidualForCausalLM(cfg)
     lora_cfg = LoraConfig(
         r=8,
         lora_alpha=16,
-        target_modules=list(_TARGET_MODULES),
+        target_modules=target_modules,
         lora_dropout=lora_dropout,
     )
     return get_peft_model(model, lora_cfg)
@@ -105,7 +142,8 @@ def _set_lora_b_nonzero(model):
                     m.lora_B[adapter].weight.normal_(0.0, 0.02)
 
 
-def test_lora_gradients_match_with_and_without_checkpointing():
+@pytest.mark.parametrize("topology", list(_TOPOLOGIES), ids=list(_TOPOLOGIES))
+def test_lora_gradients_match_with_and_without_checkpointing(topology):
     """LoRA training gradients under gradient checkpointing must EQUAL those
     without checkpointing.
 
@@ -114,6 +152,10 @@ def test_lora_gradients_match_with_and_without_checkpointing():
     recompute is exact and the gradients must be identical with ckpt ON vs OFF.
     Guards against a recompute-purity regression (e.g. a stream contextvar or
     hidden per-forward state creeping back in).
+
+    Run over both decoder execution orders: a topology whose taps are all served
+    by the interleaved forward, and one that selects the base-ahead forward. The
+    latter is a separate ~20-line body, so its purity is a separate claim.
     """
     from peft.tuners.lora.layer import LoraLayer
 
@@ -121,7 +163,7 @@ def test_lora_gradients_match_with_and_without_checkpointing():
 
     def grads(use_ckpt):
         torch.manual_seed(0)
-        model = _build_sr_peft_model()
+        model = _build_sr_peft_model(target_modules=_TOPOLOGIES[topology])
         _set_lora_b_nonzero(model)
         model.train()
         if use_ckpt:

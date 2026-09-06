@@ -1,0 +1,94 @@
+# W-cross ablation, arm 3 of 5: BOTH same-point cross-stream taps at once (the issue's
+# "Horizontal" configuration) — post-attention AND post-MLP, parameter-aligned
+# against the single-tap arms.
+#
+# Alignment arithmetic. A tap's trainable cost is the LoRA pair on a frozen
+# H x H linear: 2 * r * H per layer. Arms 1 and 2 spend 2 * 32 * H * L; this arm
+# spends 2 * (16 + 16) * H * L — identical. So the comparison isolates
+# "one tap of rank 32" vs "two taps of rank 16", at equal capacity.
+#
+# Why the per-module `alpha` dict is load-bearing: LoRA scales its delta by
+# alpha / r. Halving rank to 16 while leaving alpha at the file-level 64 would
+# DOUBLE each tap's effective scale (64/16 = 4.0 vs the baseline 64/32 = 2.0) and
+# confound the ablation with a scale change. Setting alpha=32 on the taps keeps
+# alpha / r == 2.0 everywhere, so capacity is the only variable. The dict must
+# list every targeted module (the schema enforces this) because PEFT resolves one
+# key across rank_pattern and alpha_pattern together.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ibm-granite/granite-4.1-3b
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream: 16
+    cross_stream_post_attn: 16
+  alpha:
+    q_proj: 64
+    o_proj: 64
+    gate_proj: 64
+    up_proj: 64
+    down_proj: 64
+    cross_stream: 32              # 32/16 == 2.0, same scaling as the r=32 arms
+    cross_stream_post_attn: 32
+  dropout: 0.05
+  # Adapter is always active. These two single-token markers shape the
+  # data/labels (validated/appended in train.py) and are recorded into
+  # adapter_config.json. last_context_token = the final prompt token (the
+  # supervised region must start right after it); last_token = end-of-completion
+  # marker (appended to rows lacking it).
+  last_context_token: "<|end_of_role|>"
+  last_token: "<|end_of_text|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4           # 1 GPU * 1 * 32 = effective batch 32
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

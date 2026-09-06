@@ -363,6 +363,78 @@ def test_materialize_rezeros_frozen_cross_stream(tiny_base_model, monkeypatch):
     assert n > 0, "expected at least one CrossStream site in the built model"
 
 
+def test_materialize_rezeros_every_configured_tap(tiny_base_model, monkeypatch):
+    """The to_empty-garbage re-zero must cover EVERY tap, not just the post-MLP one.
+
+    ``_materialize_and_transfer`` keys its re-zero off ``isinstance(module,
+    CrossStream)``, so this holds by construction — but the failure mode is
+    silent NaN logits on the adapter path only, so pin it explicitly with the
+    WHOLE registry built. Also asserts the tap COUNT: one CrossStream per tap per
+    layer, which catches a tap that was configured but never constructed (it would
+    look "all zero" trivially).
+    """
+    import torch
+    from peft import LoraConfig
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
+        get_shadow_residual_peft_model,
+    )
+    from shadow_residual.shadow_residual.cross_stream import (
+        CROSS_STREAM_TAPS,
+        CrossStream,
+    )
+
+    _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    taps = list(CROSS_STREAM_TAPS)
+    lora_config = LoraConfig(
+        r=2, lora_alpha=4, target_modules=["q_proj", "o_proj", *taps],
+    )
+    peft_model = get_shadow_residual_peft_model(
+        "ignored-path", lora_config, torch_dtype=None,
+    )
+
+    sr_inner = peft_model.base_model.model
+    n_layers = sr_inner.config.num_hidden_layers
+    sites = [m for m in peft_model.modules() if isinstance(m, CrossStream)]
+    assert len(sites) == len(taps) * n_layers, (
+        f"expected {len(taps)} taps x {n_layers} layers CrossStream sites; "
+        f"got {len(sites)}"
+    )
+    for w in (m.weight for m in sites):
+        assert torch.isfinite(w).all()
+        assert float(w.abs().sum()) == 0.0
+        assert w.requires_grad is False
+
+
+def test_unknown_cross_stream_tap_in_target_modules_is_rejected(
+    tiny_base_model, monkeypatch,
+):
+    """A typo'd tap name must fail at build time with a legible message.
+
+    Without the check the tap simply wouldn't be built, PEFT would report the far
+    less actionable "Target modules ... not found", and — worse — a config that
+    *looks* like it trains a post-attention tap would silently train the default
+    post-MLP topology, quietly invalidating the ablation.
+    """
+    import pytest
+    from peft import LoraConfig
+    from shadow_residual.training import factory as _factory_mod
+    from shadow_residual.training.factory import (
+        get_shadow_residual_peft_model,
+    )
+
+    _patch_auto(monkeypatch, _factory_mod, tiny_base_model)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    lora_config = LoraConfig(
+        r=2, lora_alpha=4, target_modules=["q_proj", "cross_stream_typo"],
+    )
+    with pytest.raises(ValueError, match="Unknown cross-stream tap"):
+        get_shadow_residual_peft_model("ignored-path", lora_config, torch_dtype=None)
+
+
 def test_materialize_reties_lm_head_to_embed_tokens(tiny_base_model, monkeypatch):
     """After meta-materialize, lm_head.weight must SHARE storage with embed_tokens.
 

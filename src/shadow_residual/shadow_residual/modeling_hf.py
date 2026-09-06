@@ -49,24 +49,25 @@ def _is_shadow_residual_enabled(config: ShadowResidualConfig) -> bool:
 
 
 def _any_cross_stream_wrapped(layers) -> bool:
-    """Has any decoder layer's ``cross_stream`` site been wrapped by PEFT?
+    """Has any decoder layer's cross-stream site been wrapped by PEFT?
 
     The bare :class:`CrossStream` site is a no-op (returns zeros). When
-    PEFT wraps it with a stock ``lora.Linear`` (because the user listed
-    ``"cross_stream"`` in ``target_modules``), it replaces the
-    ``cross_stream`` attribute with the wrapper. The wrapper is not a
-    :class:`CrossStream` instance — its ``base_layer`` is.
+    PEFT wraps it with a stock ``lora.Linear`` (because the user listed the
+    site's name — e.g. ``"cross_stream"`` — in ``target_modules``), it replaces
+    that attribute with the wrapper. The wrapper is not a :class:`CrossStream`
+    instance — its ``base_layer`` is.
 
-    This check decides whether the dual-stream forward runs. A bare
+    A layer may carry several sites (see
+    :data:`cross_stream.CROSS_STREAM_TAPS`); any one of them being wrapped is
+    enough. This check decides whether the dual-stream forward runs. Bare
     ``CrossStream`` everywhere → bare single-stream (unadapted base); any wrapped
     site → dual-stream forward.
     """
     for layer in layers:
-        cs = getattr(layer, "cross_stream", None)
-        if cs is None:
-            continue
-        if not isinstance(cs, CrossStream):
-            return True
+        for tap_name in getattr(layer, "cross_stream_tap_names", ()):
+            cs = getattr(layer, tap_name, None)
+            if cs is not None and not isinstance(cs, CrossStream):
+                return True
     return False
 
 

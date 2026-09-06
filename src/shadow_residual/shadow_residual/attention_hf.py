@@ -20,6 +20,12 @@ wrapped module so the LoRA delta fires (always active — plain LoRA, no gating)
 This is checkpoint-pure, so the same :meth:`forward` serves both training (under
 gradient checkpointing) and inference.
 
+:meth:`forward` is a thin composition of :meth:`forward_base` (which owns the K/V
+computation and the single cache update) and :meth:`forward_adapt` (Q only,
+against the base's shared K/V). The halves are exposed separately so the decoder
+can run the base stream's whole sublayer chain *ahead* of the adapter's when a
+cross-stream tap needs it — see ``decoder_hf``.
+
 Bare single-stream (no adapter attached)
 ----------------------------------------
 When the model runs without a PEFT adapter, :meth:`forward_bare` computes one
@@ -159,6 +165,65 @@ class ShadowResidualAttention(nn.Module):
             v = v.transpose(1, 2)
         return q, k, v, cos, sin
 
+    def forward_base(
+        self,
+        normed_base: torch.Tensor,
+        *,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Base-stream half of the dual-stream attention.
+
+        Owns the *only* K/V computation and the *only* cache update in the layer,
+        and returns the post-cache ``(k, v)`` so :meth:`forward_adapt` can attend
+        against exactly the same shared tensors. Every call goes through
+        ``base_layer`` (``_base_only``), so this is pure and bit-identical to the
+        unadapted base model.
+
+        Returns ``(o_base, k_shaped, v_shaped)``.
+        """
+        q_base = _base_only(self.q_proj, normed_base)
+        k = _base_only(self.k_proj, normed_base)
+        v = _base_only(self.v_proj, normed_base)
+
+        q_base, k_shaped, v_shaped, cos, sin = self._shape_qkv(
+            q_base, k, v, position_embeddings,
+        )
+
+        if use_cache and past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            k_shaped, v_shaped = past_key_values.update(
+                k_shaped, v_shaped, self.layer_idx, cache_kwargs,
+            )
+
+        attn_base = self._run_attention(q_base, k_shaped, v_shaped, attention_mask)
+        return _base_only(self.o_proj, attn_base), k_shaped, v_shaped
+
+    def forward_adapt(
+        self,
+        normed_adapt: torch.Tensor,
+        k_shaped: torch.Tensor,
+        v_shaped: Optional[torch.Tensor],
+        *,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Adapter-stream half — Q only, against the base stream's shared K/V.
+
+        ``k_shaped`` / ``v_shaped`` come from :meth:`forward_base` (post-cache).
+        The adapter skips the K/V projections entirely and touches no cache, so
+        calling this after the base half is what makes the shared-K/V topology
+        work in either execution order.
+        """
+        q_adapt = self.q_proj(normed_adapt)
+        # Q-only RoPE for the adapter stream (same positions as base).
+        q_adapt, _, _, _, _ = self._shape_qkv(q_adapt, None, None, position_embeddings)
+        attn_adapt = self._run_attention(q_adapt, k_shaped, v_shaped, attention_mask)
+        return self.o_proj(attn_adapt)
+
     def forward(
         self,
         normed_base: torch.Tensor,
@@ -170,7 +235,7 @@ class ShadowResidualAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Cache]]:
-        """Shared-base-K/V dual-stream attention.
+        """Shared-base-K/V dual-stream attention — both halves, base first.
 
         K/V are computed once from ``normed_base`` via ``base_layer`` (no delta).
         Q_base likewise via ``base_layer``; Q_adapt via the wrapped q_proj so the
@@ -181,28 +246,21 @@ class ShadowResidualAttention(nn.Module):
 
         Returns ``(o_base, o_adapt, present_kv)``.
         """
-        q_base = _base_only(self.q_proj, normed_base)
-        k = _base_only(self.k_proj, normed_base)
-        v = _base_only(self.v_proj, normed_base)
-        q_adapt = self.q_proj(normed_adapt)
-
-        q_base, k_shaped, v_shaped, cos, sin = self._shape_qkv(
-            q_base, k, v, position_embeddings,
+        o_base, k_shaped, v_shaped = self.forward_base(
+            normed_base,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
         )
-        # Q-only RoPE for the adapter stream (same positions as base).
-        q_adapt, _, _, _, _ = self._shape_qkv(q_adapt, None, None, position_embeddings)
-
-        if use_cache and past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            k_shaped, v_shaped = past_key_values.update(
-                k_shaped, v_shaped, self.layer_idx, cache_kwargs,
-            )
-
-        attn_base = self._run_attention(q_base, k_shaped, v_shaped, attention_mask)
-        attn_adapt = self._run_attention(q_adapt, k_shaped, v_shaped, attention_mask)
-
-        o_base = _base_only(self.o_proj, attn_base)
-        o_adapt = self.o_proj(attn_adapt)
+        o_adapt = self.forward_adapt(
+            normed_adapt,
+            k_shaped,
+            v_shaped,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+        )
         return o_base, o_adapt, past_key_values if use_cache else None
 
     def forward_bare(

@@ -27,6 +27,13 @@
               "type": "integer"
             },
             {
+              "additionalProperties": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            {
               "type": "null"
             }
           ],

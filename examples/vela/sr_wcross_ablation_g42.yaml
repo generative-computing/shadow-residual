@@ -1,0 +1,161 @@
+# W-cross ablation on the answerability data, Granite 4.2 3b — all five arms.
+#
+# Runs the five cross-stream wirings SEQUENTIALLY in one pod, so every arm shares
+# the same image, the same install, the same data files and the same GPUs. Only the
+# tap topology varies:
+#
+#   arm 1  cross_stream                        post-MLP   -> post-MLP   (baseline)
+#   arm 2  cross_stream_post_attn              post-attn  -> post-attn
+#   arm 3  cross_stream_pre_attn_to_post_mlp   pre-attn   -> post-MLP
+#   arm 4  cross_stream_post_mlp_to_pre_attn   post-MLP   -> pre-attn   (zero-lag,
+#                                                        runs the base-ahead forward)
+#   arm 5  cross_stream + cross_stream_post_attn          "horizontal", both taps
+#
+# Every arm is r=32 on every targeted module with alpha=64, so alpha/r == 2.0
+# throughout and effective LoRA scale is not a confound. NOTE that arm 5 therefore
+# carries DOUBLE the cross-stream parameters of arms 1-4 (two taps at full rank):
+# it varies multiplicity and capacity together. The parameter-aligned variant is
+# two taps at r=16 with alpha=32 on the taps — see
+# src/shadow_residual/config/sr-qo-mlp-r32-cboth16-sharedkv.yaml.
+#
+# To run ONE arm instead of all five (e.g. five pods in parallel), set ARMS to a
+# single filename and give the job a distinct jobName.
+#
+# BEFORE SUBMITTING, fill in every <changeme> / <YOUR_*> below, and make sure
+# REPO_BRANCH exists ON THE REMOTE — the pod clones it.
+
+namespace: security
+
+jobName: &jobName <YOUR_USER>-sr-wcross-ablation-g42
+queueName: default-queue
+priority: default-priority
+
+numPods: &numPodsVal 1
+numCpusPerPod: 8
+numGpusPerPod: &gpusPerPod 4
+totalMemoryPerPod: 400Gi
+
+containerImage: us.icr.io/cil15-shared-registry/sec-rl-neo:latest
+
+sshGitCloneConfig:
+  secretName: github-ssh-key
+  configMapName: github-known-hosts
+
+retryLimit: 1
+deletionOnFailureGracePeriodDuration: 24h
+failureGracePeriodDuration: 24h
+
+environmentVariables:
+  - name: NUM_PODS
+    value: *numPodsVal
+  - name: GPUS_PER_POD
+    value: *gpusPerPod
+  - name: JOB_NAME
+    value: *jobName
+  - name: HF_TOKEN
+    value: <changeme>
+  - name: HF_DATASETS_TRUST_REMOTE_CODE
+    value: "1"
+  - name: HF_HOME
+    value: /workspace/.cache/huggingface
+  - name: TORCH_HOME
+    value: /workspace/.cache/torch
+  - name: XDG_CACHE_HOME
+    value: /workspace/.cache
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: PYTORCH_CUDA_ALLOC_CONF
+    value: "expandable_segments:True"
+  - name: GHP_PERSONAL_TOKEN
+    value: <changeme>
+  - name: REPO_BRANCH
+    value: feature/multi-cross-stream-taps
+  - name: WANDB_BASE_URL
+    value: http://52.116.188.209:7689/
+  - name: WANDB_API_KEY
+    value: <changeme>
+  - name: WANDB_PROJECT
+    value: shadow-residual
+  # Per-arm W&B run names are derived from the config basename in the loop below,
+  # so WANDB_RUN_NAME is intentionally NOT set here — a single name would collapse
+  # all five arms into one run.
+  - name: WCROSS_TAG
+    value: wcross-g42-r32
+  # The five arms, in order. Space-separated basenames under
+  # src/shadow_residual/config/. Trim to one entry to run a single arm.
+  - name: ARMS
+    value: >-
+      sr-qo-mlp-r32-c32-sharedkv-g42.yaml
+      sr-qo-mlp-r32-cattn32-sharedkv-g42.yaml
+      sr-qo-mlp-r32-cpre2mlp32-sharedkv-g42.yaml
+      sr-qo-mlp-r32-cmlp2pre32-sharedkv-g42.yaml
+      sr-qo-mlp-r32-cboth32-sharedkv-g42.yaml
+  # Granite 4.2 3b. ${BASE_MODEL} is what model.base interpolates to in every arm
+  # config, so the same YAMLs serve any 4.2 checkpoint.
+  - name: BASE_MODEL
+    value: <PATH_TO_GRANITE_4_2_3B>
+  - name: DATA_ROOT
+    value: <YOUR_ANSWERABILITY_DATA_ROOT>
+  - name: EVAL_DATA
+    value: <YOUR_EVAL_DATA>
+  - name: OUTPUT_BASE
+    value: <YOUR_OUTPUT_BASE>
+
+imagePullSecrets:
+  - name: image-pull-secret-us
+
+volumes:
+  - name: danieloh-cos
+    claimName: danieloh-cos
+    mountPath: /danieloh_cos
+
+setupCommands:
+  - nvidia-smi
+  - export RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
+  - echo "Run timestamp ${RUN_TS}, tag ${WCROSS_TAG}"
+  - git clone https://${GHP_PERSONAL_TOKEN}@<YOUR_GIT_HOST>/<ORG>/shadow-residual.git   # TODO: set the shadow-residual remote
+  - cd shadow-residual
+  - git checkout ${REPO_BRANCH}
+  - git log --oneline -1
+  - python3 -m venv .venv
+  - . .venv/bin/activate
+  - pip install --upgrade pip
+  - pip install -e ".[train]"
+  - pip uninstall -y torchvision || true
+  - pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu124 "torch==2.6.0"
+  - python3 -c "import torch, transformers, peft, trl; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('transformers', transformers.__version__); print('peft', peft.__version__); print('trl', trl.__version__); print('cuda_available', torch.cuda.is_available(), 'devices', torch.cuda.device_count())"
+  - ls -la ${BASE_MODEL}
+  - ls -la ${DATA_ROOT}/train.jsonl ${DATA_ROOT}/val.jsonl
+  - wc -l ${DATA_ROOT}/train.jsonl ${DATA_ROOT}/val.jsonl
+  # Fail fast on a bad config BEFORE burning GPU hours on arm 1: every arm's YAML
+  # is loaded and its derived tap set printed, so a typo'd tap name or a rank slip
+  # surfaces in the first seconds of the job.
+  - 'for ARM in ${ARMS}; do echo "--- ${ARM}"; DATA_ROOT=${DATA_ROOT} RUN_DIR=/tmp/x EVAL_DATA=${EVAL_DATA} BASE_MODEL=${BASE_MODEL} python3 -c "import sys; from shadow_residual.config import load_training_config as L; from shadow_residual.shadow_residual.cross_stream import cross_stream_taps_from_target_modules as T; c = L(\"src/shadow_residual/config/\" + sys.argv[1]); tm = c.adapter.target_modules; print(\"  ranks:\", tm); print(\"  alpha:\", c.adapter.alpha); print(\"  taps :\", T(list(tm)))" ${ARM} || exit 1; done'
+  # One training run per arm, each with its own RUN_DIR (so checkpoints and
+  # predictions never collide) and its own W&B run name.
+  #
+  # --skip-post-train-generate is deliberate, for two reasons. (a) It is the
+  # documented pattern for multi-GPU runs: the in-job generate path gathers onto
+  # rank 0 while the other ranks wait at a collective barrier, and a full eval set
+  # outlives the default 30-minute timeout, so the idle ranks abort and kill the
+  # job AFTER training finished. (b) In a sequential 5-arm job that failure mode
+  # would take arms 2-5 down with arm 1. Generation runs below, single-GPU.
+  #
+  # A failing arm must not abort the remaining arms either, so the loop records
+  # failures and reports them at the end instead of exiting.
+  - 'set -o pipefail; FAILED=""; for ARM in ${ARMS}; do ARM_NAME=$(basename ${ARM} .yaml); export RUN_DIR=${OUTPUT_BASE}/${WCROSS_TAG}/${ARM_NAME}/run_${RUN_TS}; export WANDB_RUN_NAME=${WCROSS_TAG}-${ARM_NAME}; mkdir -p ${RUN_DIR}; echo "=== TRAIN ${ARM_NAME} -> ${RUN_DIR} ==="; cat src/shadow_residual/config/${ARM}; if accelerate launch --num_machines 1 --main_process_port 0 --num_processes ${GPUS_PER_POD} --mixed_precision bf16 -m shadow_residual.training.train --config src/shadow_residual/config/${ARM} --skip-post-train-generate --debug-collator 2>&1 | tee ${RUN_DIR}/train.log; then echo "=== TRAIN ${ARM_NAME} OK ==="; else echo "=== TRAIN ${ARM_NAME} FAILED ==="; FAILED="${FAILED} ${ARM_NAME}"; fi; done; echo "train failures:${FAILED:- none}"'
+  # Generation per arm as a SEPARATE single-GPU process — no distributed group, no
+  # barrier. Autoregressive decoding gains nothing from sharding. The final adapter
+  # is saved at ${RUN_DIR}/checkpoints by train.py, which is what --checkpoint wants.
+  - 'for ARM in ${ARMS}; do ARM_NAME=$(basename ${ARM} .yaml); RUN_DIR=${OUTPUT_BASE}/${WCROSS_TAG}/${ARM_NAME}/run_${RUN_TS}; CKPT=${RUN_DIR}/checkpoints; if [ ! -f ${CKPT}/adapter_config.json ]; then echo "=== GEN ${ARM_NAME} SKIPPED (no adapter at ${CKPT}) ==="; continue; fi; echo "=== GEN ${ARM_NAME} ==="; CUDA_VISIBLE_DEVICES=0 python3 -m shadow_residual.training.generate --config src/shadow_residual/config/${ARM} --checkpoint ${CKPT} --data ${EVAL_DATA} --out ${RUN_DIR}/predictions.jsonl 2>&1 | tee ${RUN_DIR}/generate.log || echo "=== GEN ${ARM_NAME} FAILED ==="; done'
+  # Per-arm summary, so the pod log alone tells you which arms produced usable
+  # artifacts. SCORING IS NOT DONE HERE: answerability accuracy comes from
+  # eval/answerability_eval.py --mode peft against each arm's saved adapter (see
+  # examples/vela/eval_answerability_vela.sh), run once the adapters exist.
+  # (Every branch is guarded and the step ends in `true`: a missing file must not
+  # make the summary itself the thing that fails the job.)
+  - 'echo "=== SUMMARY (tag ${WCROSS_TAG}, ts ${RUN_TS}) ==="; for ARM in ${ARMS}; do ARM_NAME=$(basename ${ARM} .yaml); RUN_DIR=${OUTPUT_BASE}/${WCROSS_TAG}/${ARM_NAME}/run_${RUN_TS}; PRED=${RUN_DIR}/predictions.jsonl; if [ -f ${PRED} ]; then N=$(wc -l < ${PRED}); else N=0; fi; if [ -f ${RUN_DIR}/checkpoints/adapter_config.json ]; then HAVE=yes; else HAVE=NO; fi; echo "  ${ARM_NAME}: adapter=${HAVE} predictions=${N} rows"; if [ -f ${RUN_DIR}/train.log ]; then grep -h "trainable params" ${RUN_DIR}/train.log | tail -1 | sed "s/^/      /" || true; fi; done; true'
+  - echo "=== all arms done; artifacts under ${OUTPUT_BASE}/${WCROSS_TAG}/ ==="
+  - sleep 1800
+
+mainProgram:

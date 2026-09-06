@@ -15,7 +15,7 @@ model for plain inference — no adapters involved.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -23,6 +23,7 @@ from transformers import AutoModelForCausalLM
 from .model_config import ShadowResidualConfig
 from . import ShadowResidualForCausalLM
 from .config_helpers import set_shadow_residual
+from .cross_stream import DEFAULT_CROSS_STREAM_TAPS
 from .weight_transfer import transfer_base_weights
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ def build_sr_config(
     torch_dtype: Optional[torch.dtype] = None,
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
+    cross_stream_taps: Optional[Sequence[str]] = None,
 ) -> ShadowResidualConfig:
     """Build the SR config by reading the upstream HF config (no weights).
 
@@ -85,6 +87,16 @@ def build_sr_config(
     ):
         config_dict["shared_intermediate_size"] = config_dict["intermediate_size"]
     sr_config = ShadowResidualConfig(**config_dict)
+    # Which cross-stream sites the decoder builds. Set BEFORE
+    # set_shadow_residual so its validation covers the names. None → the
+    # historical single post-MLP tap. Normally derived from the PEFT
+    # target_modules by training.factory (the tap set IS the set of
+    # cross_stream* LoRA targets), so train/serve cannot drift.
+    sr_config.cross_stream_taps = (
+        list(cross_stream_taps)
+        if cross_stream_taps is not None
+        else list(DEFAULT_CROSS_STREAM_TAPS)
+    )
     set_shadow_residual(sr_config, enabled=True)
     # MoE-only routing mode (no-op on dense bases). Not serialized — it is a
     # forward-path choice, not a weight, so a saved adapter carries no record of
@@ -103,6 +115,7 @@ def build_sr_base(
     torch_dtype: Optional[torch.dtype] = None,
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
+    cross_stream_taps: Optional[Sequence[str]] = None,
 ) -> ShadowResidualForCausalLM:
     """Single-process SR base build (no FSDP / meta machinery).
 
@@ -122,12 +135,22 @@ def build_sr_base(
     prefer sourcing it from the adapter itself via
     :func:`shadow_residual.training.generation_utils.read_share_moe_routing_from_adapter`
     (train.py records it in ``adapter_config.json``) rather than hand-passing.
+
+    ``cross_stream_taps`` selects which cross-stream sites the decoder builds
+    (names from :data:`cross_stream.CROSS_STREAM_TAPS`); ``None`` → the historical
+    single post-MLP ``cross_stream`` tap. It must match what the adapter was
+    trained with, or ``PeftModel.from_pretrained`` finds no module to attach the
+    saved LoRA tensors to. Source it from the adapter itself via
+    :func:`shadow_residual.training.generation_utils.read_cross_stream_taps_from_adapter`
+    — the saved ``adapter_config.json`` already lists the taps in its
+    ``target_modules``.
     """
     sr_config = build_sr_config(
         base_model_name_or_path,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         share_moe_routing=share_moe_routing,
+        cross_stream_taps=cross_stream_taps,
     )
     sr_model = ShadowResidualForCausalLM(sr_config)
     if torch_dtype is not None:

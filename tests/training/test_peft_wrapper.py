@@ -33,11 +33,13 @@ from shadow_residual.shadow_residual.config_helpers import (
     set_shadow_residual,
 )
 from peft.tuners.lora.layer import Linear as StockLoraLinear
-from shadow_residual.shadow_residual.cross_stream import CrossStream
+from shadow_residual.shadow_residual.cross_stream import (
+    CROSS_STREAM_TAPS,
+    CrossStream,
+)
 
 
-@pytest.fixture
-def tiny_sr_model():
+def _tiny_sr_model(cross_stream_taps=None):
     cfg = ShadowResidualConfig(
         vocab_size=300,
         hidden_size=64,
@@ -49,8 +51,27 @@ def tiny_sr_model():
         max_lora_rank=4,
         switch_head_dim=16,
     )
+    if cross_stream_taps is not None:
+        cfg.cross_stream_taps = list(cross_stream_taps)
     set_shadow_residual(config=cfg, enabled=True)
     return ShadowResidualForCausalLM(cfg)
+
+
+@pytest.fixture
+def tiny_sr_model():
+    return _tiny_sr_model()
+
+
+@pytest.fixture
+def tiny_sr_model_both_taps():
+    """Both same-point taps built — the "horizontal" ablation topology."""
+    return _tiny_sr_model(("cross_stream", "cross_stream_post_attn"))
+
+
+@pytest.fixture
+def tiny_sr_model_all_taps():
+    """Every registered tap built at once — the widest module tree PEFT sees."""
+    return _tiny_sr_model(tuple(CROSS_STREAM_TAPS))
 
 
 def _make_peft_sr_model(sr_model, **lora_kwargs):
@@ -65,11 +86,16 @@ def _make_peft_sr_model(sr_model, **lora_kwargs):
     return get_peft_model(sr_model, lora_cfg), lora_cfg
 
 
-def _cross_stream_wrappers(peft_model):
-    """Stock lora.Linear layers whose wrapped base is a CrossStream site."""
+def _cross_stream_wrappers(peft_model, suffix=None):
+    """Stock lora.Linear layers whose wrapped base is a CrossStream site.
+
+    ``suffix`` restricts to one tap's module name (e.g. ``"cross_stream_post_attn"``).
+    """
     return [
-        m for m in peft_model.modules()
-        if isinstance(m, StockLoraLinear) and isinstance(m.base_layer, CrossStream)
+        m for n, m in peft_model.named_modules()
+        if isinstance(m, StockLoraLinear)
+        and isinstance(m.base_layer, CrossStream)
+        and (suffix is None or n.endswith("." + suffix))
     ]
 
 
@@ -114,6 +140,91 @@ def test_alpha_pattern_overrides_cross_stream_alpha(tiny_sr_model):
     for w in wrappers:
         # scaling = alpha / r = 32 / 8 = 4.0 (vs default 16/8 = 2.0)
         assert w.scaling["default"] == pytest.approx(4.0)
+
+
+def test_peft_wraps_post_attn_tap_with_stock_layer(tiny_sr_model_both_taps):
+    """The post-attention tap is an ordinary stock LoRA target too — no custom
+    class, no registration, same as the post-MLP one."""
+    peft_model, _ = _make_peft_sr_model(
+        tiny_sr_model_both_taps, target_modules=["cross_stream_post_attn"],
+    )
+    wrappers = _cross_stream_wrappers(peft_model, "cross_stream_post_attn")
+    assert wrappers, "expected stock lora.Linear on every cross_stream_post_attn site"
+    for w in wrappers:
+        assert w.lora_A["default"].weight.shape == (8, 64)
+        assert w.lora_B["default"].weight.shape == (64, 8)
+
+
+@pytest.mark.parametrize(
+    "tap", ["cross_stream_pre_attn_to_post_mlp", "cross_stream_post_mlp_to_pre_attn"],
+)
+def test_peft_wraps_cross_position_taps_with_stock_layer(tiny_sr_model_all_taps, tap):
+    """The cross-position wirings are ordinary stock LoRA targets too.
+
+    They differ from the same-point taps only in WHERE the decoder reads and
+    writes; at the PEFT boundary they are indistinguishable frozen zero-init
+    linears, so no custom class or registration may creep in for them.
+    """
+    peft_model, _ = _make_peft_sr_model(tiny_sr_model_all_taps, target_modules=[tap])
+    wrappers = _cross_stream_wrappers(peft_model, tap)
+    assert wrappers, f"expected stock lora.Linear on every {tap} site"
+    assert len(wrappers) == 3  # one per decoder layer
+    for w in wrappers:
+        assert w.lora_A["default"].weight.shape == (8, 64)
+        assert w.lora_B["default"].weight.shape == (64, 8)
+
+
+@pytest.mark.parametrize("target", list(CROSS_STREAM_TAPS))
+def test_tap_names_are_separable_under_peft_suffix_matching(
+    tiny_sr_model_all_taps, target,
+):
+    """Naming one tap in ``target_modules`` must wrap that tap and NO other.
+
+    PEFT's list-form matching is ``key == target or key.endswith("." + target)``,
+    so every registry name is cleanly separable — but the whole ablation depends on
+    it (an accidental suffix collision would wrap two taps at once and make the
+    single-tap arms unreproducible), so assert the full cross product rather than
+    assume it. This is also the guard a future tap name must pass.
+    """
+    peft_model, _ = _make_peft_sr_model(tiny_sr_model_all_taps, target_modules=[target])
+    assert _cross_stream_wrappers(peft_model, target)
+    for other in CROSS_STREAM_TAPS:
+        if other == target:
+            continue
+        assert not _cross_stream_wrappers(peft_model, other), (
+            f"target_modules=[{target!r}] also wrapped {other!r}"
+        )
+
+
+def test_per_tap_rank_and_alpha_resolve_independently(tiny_sr_model_both_taps):
+    """Both taps at once with DIFFERENT rank and alpha per tap.
+
+    Guards the PEFT footgun behind the ``alpha_pattern`` support:
+    ``lora.model._create_and_replace`` resolves ONE ``target_name_key`` out of
+    ``chain(rank_pattern.keys(), alpha_pattern.keys())`` and indexes BOTH dicts
+    with it. Here the key sets match (as the config schema enforces), so each tap
+    must get its own rank AND its own alpha.
+    """
+    peft_model, _ = _make_peft_sr_model(
+        tiny_sr_model_both_taps,
+        r=8,
+        lora_alpha=16,
+        target_modules=["cross_stream", "cross_stream_post_attn"],
+        rank_pattern={"cross_stream": 16, "cross_stream_post_attn": 4},
+        alpha_pattern={"cross_stream": 32, "cross_stream_post_attn": 8},
+    )
+
+    post_mlp = _cross_stream_wrappers(peft_model, "cross_stream")
+    post_attn = _cross_stream_wrappers(peft_model, "cross_stream_post_attn")
+    assert post_mlp and post_attn
+    assert len(post_mlp) == len(post_attn) == 3  # one per decoder layer
+
+    for w in post_mlp:
+        assert w.lora_A["default"].weight.shape == (16, 64)
+        assert w.scaling["default"] == pytest.approx(32 / 16)
+    for w in post_attn:
+        assert w.lora_A["default"].weight.shape == (4, 64)
+        assert w.scaling["default"] == pytest.approx(8 / 4)
 
 
 def test_forward_through_peft_sr_model(tiny_sr_model):
