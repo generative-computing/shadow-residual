@@ -1,0 +1,86 @@
+# "linear" cross-stream variant of sr-qo-mlp-r32-c32-sharedkv.yaml.
+#
+# Identical SR setup (shared-base-K/V; LoRA on Q, O, MLP gate/up/down) EXCEPT the
+# cross-stream (w-cross) site: instead of the default frozen H×H linear made
+# trainable by stock LoRA (cross_stream_type: lora), this uses a DIRECTLY-TRAINABLE
+# single full H×H matrix (cross_stream_type: linear) — one matmul, full-rank, NOT
+# a low-rank bottleneck. The module is not LoRA-wrapped — PEFT persists it via
+# modules_to_save (see config/adapters.to_peft_config). The `cross_stream: 32`
+# entry is required by the schema but does NOT shape the (always H×H) matrix; it
+# is recorded for provenance only. This is the A/B partner to the lora config for
+# the answerability cross-stream-type comparison; everything else (base, ranks,
+# data markers, optimizer) matches.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ibm-granite/granite-4.1-3b
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+
+adapter:
+  # Directly-trainable single full H×H matrix cross-stream (not LoRA, one matmul).
+  # The cross_stream value below is required by the schema but does NOT shape the
+  # (always H×H) matrix — provenance only.
+  cross_stream_type: linear
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream: 32
+  alpha: 64
+  dropout: 0.05
+  # Adapter is always active. These two single-token markers shape the
+  # data/labels (validated/appended in train.py) and are recorded into
+  # adapter_config.json. last_context_token = the final prompt token (the
+  # supervised region must start right after it); last_token = end-of-completion
+  # marker (appended to rows lacking it).
+  last_context_token: "<|end_of_role|>"
+  last_token: "<|end_of_text|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4           # 1 GPU * 1 * 32 = effective batch 32
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

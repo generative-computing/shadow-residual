@@ -143,6 +143,68 @@ def test_target_modules_empty_dict_rejected():
         TrainingConfig.model_validate(_minimal(adapter={"target_modules": {}}))
 
 
+# --- adapter.cross_stream_type ------------------------------------------------
+
+def test_cross_stream_type_defaults_lora():
+    cfg = TrainingConfig.model_validate(_minimal(adapter={"target_modules": 32}))
+    assert cfg.adapter.cross_stream_type == "lora"
+
+
+def test_cross_stream_type_linear_accepts_dict_with_cross_stream():
+    cfg = TrainingConfig.model_validate(_minimal(adapter={
+        "cross_stream_type": "linear",
+        "target_modules": {"q_proj": 32, "cross_stream": 8},
+    }))
+    assert cfg.adapter.cross_stream_type == "linear"
+    assert cfg.adapter.target_modules["cross_stream"] == 8
+    # alpha excludes the linear d (=8): keyed only off the LoRA ranks (max=32).
+    assert cfg.adapter.alpha == 64
+
+
+def test_cross_stream_type_linear_requires_dict_form():
+    with pytest.raises(ValidationError, match="requires the dict form"):
+        TrainingConfig.model_validate(_minimal(adapter={
+            "cross_stream_type": "linear",
+            "target_modules": 32,
+        }))
+
+
+def test_cross_stream_type_linear_requires_cross_stream_entry():
+    with pytest.raises(ValidationError, match="cross_stream"):
+        TrainingConfig.model_validate(_minimal(adapter={
+            "cross_stream_type": "linear",
+            "target_modules": {"q_proj": 32},
+        }))
+
+
+def test_cross_stream_type_unknown_rejected():
+    with pytest.raises(ValidationError):
+        TrainingConfig.model_validate(_minimal(adapter={
+            "cross_stream_type": "monarch",
+            "target_modules": {"q_proj": 32, "cross_stream": 8},
+        }))
+
+
+def test_cross_stream_type_linear_rejects_extra_tap():
+    """linear is mutually exclusive with the multi-tap registry: an ADDITIONAL
+    cross_stream* tap alongside the default cross_stream must be rejected."""
+    with pytest.raises(ValidationError, match="single default 'cross_stream' tap"):
+        TrainingConfig.model_validate(_minimal(adapter={
+            "cross_stream_type": "linear",
+            "target_modules": {"q_proj": 32, "cross_stream": 8, "cross_stream_post_attn": 8},
+        }))
+
+
+def test_cross_stream_type_linear_rejects_non_default_tap():
+    """linear at a NON-default tap (without the default cross_stream) is rejected —
+    linear is only supported at the single default cross_stream site."""
+    with pytest.raises(ValidationError, match="single default 'cross_stream' tap"):
+        TrainingConfig.model_validate(_minimal(adapter={
+            "cross_stream_type": "linear",
+            "target_modules": {"q_proj": 32, "cross_stream_post_attn": 8},
+        }))
+
+
 def test_target_modules_negative_rank_rejected():
     with pytest.raises(ValidationError):
         TrainingConfig.model_validate(_minimal(adapter={"target_modules": -1}))
@@ -449,6 +511,39 @@ def test_dict_alpha_key_set_must_match_target_modules():
             "target_modules": {"q_proj": 32},
             "alpha": {"q_proj": 64, "o_proj": 64},
         }))
+
+
+def test_to_peft_config_lora_cross_stream_is_lora_target():
+    """Default (lora) cross-stream: it's a LoRA target, no modules_to_save."""
+    pytest.importorskip("peft")
+    from shadow_residual.config.adapters import to_peft_config
+
+    cfg = TrainingConfig.model_validate(_minimal(adapter={
+        "target_modules": {"q_proj": 32, "cross_stream": 32},
+    }))
+    pc = to_peft_config(cfg)
+    assert "cross_stream" in pc.target_modules
+    assert "cross_stream" in (pc.rank_pattern or {})
+    assert getattr(pc, "modules_to_save", None) in (None, [])
+
+
+def test_to_peft_config_linear_cross_stream_uses_modules_to_save():
+    """linear cross-stream: NOT a LoRA target — routed to modules_to_save, and
+    absent from target_modules / rank_pattern (its d is not a LoRA rank)."""
+    pytest.importorskip("peft")
+    from shadow_residual.config.adapters import to_peft_config
+
+    cfg = TrainingConfig.model_validate(_minimal(adapter={
+        "cross_stream_type": "linear",
+        "target_modules": {"q_proj": 32, "o_proj": 32, "cross_stream": 8},
+    }))
+    pc = to_peft_config(cfg)
+    assert pc.modules_to_save == ["cross_stream"]
+    assert "cross_stream" not in pc.target_modules
+    assert sorted(pc.target_modules) == ["o_proj", "q_proj"]
+    assert "cross_stream" not in (pc.rank_pattern or {})
+    # r/rank_pattern keyed only off genuine LoRA targets (both 32 here).
+    assert pc.r == 32
 
 
 def test_to_training_arguments_keeps_gc():

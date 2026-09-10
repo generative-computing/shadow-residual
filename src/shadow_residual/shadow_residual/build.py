@@ -36,6 +36,8 @@ def build_sr_config(
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
     cross_stream_taps: Optional[Sequence[str]] = None,
+    cross_stream_type: str = "lora",
+    cross_stream_dim: Optional[int] = None,
 ) -> ShadowResidualConfig:
     """Build the SR config by reading the upstream HF config (no weights).
 
@@ -102,6 +104,21 @@ def build_sr_config(
     # forward-path choice, not a weight, so a saved adapter carries no record of
     # it; train and serve must pass the same value (see build_sr_base).
     sr_config.share_moe_routing = bool(share_moe_routing)
+    # Cross-stream (w-cross) layer type. STRUCTURAL: it decides which module the
+    # decoder builds at the cross_stream site (CrossStream for "lora", a trainable
+    # full-H×H CrossStreamLinear for "linear"), so the base tree must be built the
+    # same way it was trained BEFORE PEFT attaches — otherwise from_pretrained
+    # can't bind the saved cross-stream weight. Unlike share_moe_routing, the
+    # "linear" type's weight IS saved in the adapter (via PEFT modules_to_save);
+    # train.py records the type (+ the provenance dim) into adapter_config.json and
+    # the serving path reads them back (see training.generation_utils.
+    # read_cross_stream_type_from_adapter) to rebuild a matching base. cross_stream_dim
+    # is provenance only — it does NOT shape the always-H×H matrix. Set on every
+    # rank so the FSDP meta-init tree is identical.
+    sr_config.cross_stream_type = str(cross_stream_type)
+    sr_config.cross_stream_dim = (
+        int(cross_stream_dim) if cross_stream_dim is not None else None
+    )
     if torch_dtype is not None:
         sr_config.torch_dtype = torch_dtype
     if attn_implementation is not None:
@@ -116,6 +133,8 @@ def build_sr_base(
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
     cross_stream_taps: Optional[Sequence[str]] = None,
+    cross_stream_type: str = "lora",
+    cross_stream_dim: Optional[int] = None,
 ) -> ShadowResidualForCausalLM:
     """Single-process SR base build (no FSDP / meta machinery).
 
@@ -138,12 +157,19 @@ def build_sr_base(
 
     ``cross_stream_taps`` selects which cross-stream sites the decoder builds
     (names from :data:`cross_stream.CROSS_STREAM_TAPS`); ``None`` → the historical
-    single post-MLP ``cross_stream`` tap. It must match what the adapter was
-    trained with, or ``PeftModel.from_pretrained`` finds no module to attach the
-    saved LoRA tensors to. Source it from the adapter itself via
+    single post-MLP ``cross_stream`` tap. ``cross_stream_type`` /
+    ``cross_stream_dim`` select WHAT KIND of module sits at the site — ``"lora"``
+    (frozen H×H, LoRA-wrapped) or ``"linear"`` (directly-trainable single full
+    ``H×H`` matrix, single ``cross_stream`` tap only — mutually exclusive with
+    multi-tap; ``cross_stream_dim`` is recorded for provenance but does not shape
+    the always-H×H matrix). All of these MUST match what the adapter was trained with, or
+    ``PeftModel.from_pretrained`` finds no matching module to bind the saved
+    tensors to. Source them from the adapter itself via
     :func:`shadow_residual.training.generation_utils.read_cross_stream_taps_from_adapter`
-    — the saved ``adapter_config.json`` already lists the taps in its
-    ``target_modules``.
+    and
+    :func:`shadow_residual.training.generation_utils.read_cross_stream_type_from_adapter`
+    — the saved ``adapter_config.json`` records the taps (in ``target_modules`` /
+    ``modules_to_save``), the type, and the dim.
     """
     sr_config = build_sr_config(
         base_model_name_or_path,
@@ -151,6 +177,8 @@ def build_sr_base(
         attn_implementation=attn_implementation,
         share_moe_routing=share_moe_routing,
         cross_stream_taps=cross_stream_taps,
+        cross_stream_type=cross_stream_type,
+        cross_stream_dim=cross_stream_dim,
     )
     sr_model = ShadowResidualForCausalLM(sr_config)
     if torch_dtype is not None:

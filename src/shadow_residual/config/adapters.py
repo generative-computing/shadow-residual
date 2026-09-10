@@ -95,21 +95,39 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
 
     a = cfg.adapter
 
+    # A "linear" cross-stream is a directly-trainable full H×H matrix, NOT a LoRA
+    # target: PEFT persists it via `modules_to_save` (which wraps the whole
+    # module as trainable and round-trips its weight through save/from_pretrained).
+    # Its `cross_stream` value is not a LoRA rank (and doesn't shape the H×H
+    # matrix), so it must be kept out of the LoRA surface (`r`, `target_modules`,
+    # `rank_pattern`) entirely. Strip the single `cross_stream` site from the LoRA
+    # view up front (linear is single-tap-only — mutually exclusive with the
+    # multi-tap registry, enforced in the config schema) so `r`/rank_pattern are
+    # derived only from genuine LoRA targets.
+    linear_cross_stream = a.cross_stream_type == "linear"
+    modules_to_save: list[str] | None = ["cross_stream"] if linear_cross_stream else None
+
     if isinstance(a.target_modules, dict):
         # Per-module: PEFT wants a scalar default in `r` plus a list of
         # module names in `target_modules` and per-name overrides in
         # `rank_pattern`. Use the smallest rank as the default and list every
         # explicit module (including ones equal to the default — harmless,
         # avoids surprises if PEFT changes how it merges).
-        target_names = list(a.target_modules.keys())
-        r_scalar = min(a.target_modules.values())
-        rank_pattern: dict[str, int] | None = dict(a.target_modules)
+        lora_targets = {
+            name: rank for name, rank in a.target_modules.items()
+            if not (linear_cross_stream and name == "cross_stream")
+        }
+        target_names = list(lora_targets.keys())
+        r_scalar = min(lora_targets.values()) if lora_targets else 1
+        rank_pattern: dict[str, int] | None = dict(lora_targets) or None
     else:
         # Uniform scalar: apply the same rank to the fixed SR-safe module set.
         # NOT "all-linear" — that would wrap the forbidden K/V projections
         # (rejected in factory._reject_kv_lora). Listing modules explicitly keeps
         # K/V out and engages the dual-stream forward via "cross_stream".
-        target_names = _SR_SCALAR_TARGETS
+        # (The scalar form can't carry a linear cross-stream — the schema
+        # requires the dict form for cross_stream_type="linear".)
+        target_names = list(_SR_SCALAR_TARGETS)
         r_scalar = a.target_modules
         rank_pattern = None
 
@@ -138,6 +156,8 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
         kwargs["rank_pattern"] = rank_pattern
     if alpha_pattern is not None:
         kwargs["alpha_pattern"] = alpha_pattern
+    if modules_to_save is not None:
+        kwargs["modules_to_save"] = modules_to_save
 
     return LoraConfig(**kwargs)
 

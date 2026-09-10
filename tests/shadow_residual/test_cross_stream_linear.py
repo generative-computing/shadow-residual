@@ -14,7 +14,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from shadow_residual.shadow_residual.cross_stream import CrossStream
+from shadow_residual.shadow_residual.cross_stream import (
+    CrossStream,
+    CrossStreamLinear,
+)
 
 
 def _build_tiny_sr_config(cross_stream_taps=None):
@@ -236,3 +239,83 @@ def test_stock_lora_on_zero_linear_is_pure_delta():
     scaling = stock.scaling["default"]
     expected = B(A(x)) * scaling
     torch.testing.assert_close(out_stock, expected, atol=1e-6, rtol=1e-5)
+
+
+# --- "linear" cross-stream type (CrossStreamLinear) --------------------------
+
+
+def test_cross_stream_linear_is_single_full_matrix():
+    """A single full H×H matmul — NOT a low-rank bottleneck. The `dim` arg does
+    not shape the weight (cross-stream is H→H); the matrix is always H×H."""
+    cs = CrossStreamLinear(64, 8)
+    assert not isinstance(cs, nn.Linear), (
+        "CrossStreamLinear must be a plain nn.Module (not a LoRA target, immune "
+        "to target_modules='all-linear')"
+    )
+    # One projection, square H×H — no up/down sublayers.
+    assert not hasattr(cs, "up") and not hasattr(cs, "down")
+    assert cs.proj.in_features == 64 and cs.proj.out_features == 64
+    assert cs.proj.weight.shape == (64, 64)
+    assert cs.proj.weight.requires_grad is True
+    x = torch.randn(2, 5, 64)
+    assert cs(x).shape == x.shape
+
+
+def test_cross_stream_linear_dim_does_not_shape_matrix():
+    """`dim` is provenance only — the weight is H×H regardless of dim, and dim
+    may even be omitted."""
+    cs = CrossStreamLinear(48, dim=8)
+    assert cs.proj.weight.shape == (48, 48)
+    assert cs.dim == 8
+    cs_no_dim = CrossStreamLinear(48)
+    assert cs_no_dim.proj.weight.shape == (48, 48)
+
+
+def test_cross_stream_linear_zero_at_init():
+    """The H×H weight is zero-init, so the injection is exactly zero at step 0
+    (adapter stream starts base-identical)."""
+    cs = CrossStreamLinear(32, 4)
+    assert bool((cs.proj.weight == 0).all()), "proj weight must be zero-init"
+    x = torch.randn(3, 7, 32)
+    out = cs(x)
+    assert torch.equal(out, torch.zeros_like(out)), (
+        "CrossStreamLinear must contribute exactly zero at init (zero-init weight)"
+    )
+
+
+def test_cross_stream_linear_nonzero_after_perturbed():
+    cs = CrossStreamLinear(16, 4)
+    with torch.no_grad():
+        cs.proj.weight.normal_(std=0.1)
+    x = torch.randn(1, 3, 16)
+    out = cs(x)
+    assert not torch.equal(out, torch.zeros_like(out))
+    # A single matmul: out == proj(x) exactly.
+    torch.testing.assert_close(out, cs.proj(x), atol=1e-6, rtol=1e-5)
+
+
+def test_cross_stream_linear_ignores_extra_args():
+    """Same call contract as CrossStream: extra args are tolerated + ignored."""
+    cs = CrossStreamLinear(8, 2)
+    x = torch.randn(1, 3, 8)
+    out = cs(x, some_variant_kwarg=[1], some_future_kwarg=True)
+    assert out.shape == x.shape
+
+
+def test_linear_cross_stream_survives_full_model_post_init():
+    """A "linear" SR model builds CrossStreamLinear sites that stay trainable
+    after post_init(); the H×H weight must be re-zeroed (parent _init_weights
+    randomizes every nn.Linear) so the injection is zero at init."""
+    from shadow_residual.shadow_residual import ShadowResidualForCausalLM
+
+    cfg = _build_tiny_sr_config()
+    cfg.cross_stream_type = "linear"
+    cfg.cross_stream_dim = 8
+    model = ShadowResidualForCausalLM(cfg)
+    for i, layer in enumerate(model.model.layers):
+        cs = layer.cross_stream
+        assert isinstance(cs, CrossStreamLinear), f"layer {i} not CrossStreamLinear"
+        assert cs.proj.weight.requires_grad is True, f"layer {i} proj not trainable"
+        assert float(cs.proj.weight.detach().abs().sum()) == 0.0, (
+            f"layer {i} proj not re-zeroed after post_init (injection must start at 0)"
+        )

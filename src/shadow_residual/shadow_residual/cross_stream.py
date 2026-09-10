@@ -27,11 +27,30 @@ The frozen ``H×H`` matrix is dead weight (never trained, never nonzero) — the
 accepted cost of the stock-PEFT path, and it is paid **per tap**. On a bare
 (never-wrapped) model it makes the cross-stream contribution exactly zero, so
 the decoder's single-stream fallback is unaffected.
+
+Selectable cross-stream type
+----------------------------
+Two axes compose. **Which** sites exist is the tap registry (:data:`CROSS_STREAM_TAPS`,
+derived from ``target_modules``). **What kind of module** sits at each tapped site
+is the cross-stream *type*, chosen in the training config
+(``adapter.cross_stream_type``) and threaded onto the SR config so the decoder
+builds the matching module at every tap (see ``decoder_hf``):
+
+* ``"lora"`` (default) — :class:`CrossStream`, the frozen H×H site above; stock
+  PEFT LoRA supplies the trainable rank-R delta.
+* ``"linear"`` — :class:`CrossStreamLinear`, a *directly trainable* single full
+  ``H×H`` matrix (one matmul, full-rank — NOT a low-rank bottleneck; that is what
+  ``"lora"`` already gives). No LoRA; PEFT persists it via ``modules_to_save``.
+  Single-tap-only — mutually exclusive with the multi-tap registry.
+
+A future ``"monarch"`` type would slot in here as a third class (a structured
+d-rank factorization); it is intentionally absent — no Monarch primitive ships
+in the pinned HF stack.
 """
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, Optional
 
 import torch
 import torch.nn as nn
@@ -185,8 +204,52 @@ class CrossStream(nn.Linear):
         return super().forward(h_base)
 
 
+class CrossStreamLinear(nn.Module):
+    """Trainable full ``H×H`` matrix cross-stream site — ONE matmul.
+
+    Unlike :class:`CrossStream` (a frozen H×H no-op that stock LoRA makes
+    trainable via a low-rank delta), this module *is itself* the trainable
+    cross-stream: a single dense ``nn.Linear(H, H, bias=False)`` applied directly
+    to ``h_base``. Full-rank — NOT a bottleneck / low-rank factorization (that is
+    what the ``"lora"`` type already provides). It is not a LoRA target; PEFT
+    persists it via ``modules_to_save`` (each built tap name — a stock mechanism,
+    no custom LoRA class), which wraps it, marks it trainable, and round-trips its
+    weight through ``save_pretrained`` / ``from_pretrained``.
+
+    The ``dim`` argument (the config's ``cross_stream: d`` value) does NOT shape
+    the matrix: the cross-stream maps ``H→H``, so a ``d×d`` matrix only fits when
+    ``d == H``. It is accepted for a uniform construction signature with
+    :class:`CrossStreamLinear`-style types and recorded for provenance, but the
+    weight is always ``H×H``. (See ``decoder_hf`` / ``build.build_sr_config``.)
+
+    The weight is zero-initialised (mirroring LoRA's zero-init ``B``) so the
+    injection ``W(h_base)`` is exactly zero at step 0 — the adapter stream starts
+    base-identical and the contribution grows only as training moves the weight.
+    """
+
+    def __init__(self, hidden_size: int, dim: Optional[int] = None):
+        super().__init__()
+        self.hidden_size = hidden_size
+        # Recorded for provenance only; does not shape the (always H×H) matrix.
+        self.dim = dim
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        # Zero-init: the injection starts at zero. Trainable (requires_grad=True).
+        nn.init.zeros_(self.proj.weight)
+
+    def forward(self, h_base: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Return ``W(h_base)`` — a single full H×H matmul, zero at init.
+
+        Extra positional / keyword args are accepted and ignored to keep the
+        call signature identical to :class:`CrossStream` (the decoder calls the
+        cross-stream site the same way regardless of type).
+        """
+        del args, kwargs
+        return self.proj(h_base)
+
+
 __all__ = [
     "CrossStream",
+    "CrossStreamLinear",
     "CROSS_STREAM_POINT_ORDER",
     "CROSS_STREAM_TAPS",
     "DEFAULT_CROSS_STREAM_TAPS",

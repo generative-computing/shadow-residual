@@ -1,0 +1,95 @@
+# Granite 4.2 + "linear" cross-stream variant.
+#
+# Combines the Granite 4.2 essentials from sr-qo-mlp-r32-c32-sharedkv-g42.yaml
+# (ChatML assistant_marker, </think> / <|im_end|> markers, ${BASE_MODEL}, untied
+# lm_head handled automatically by the SR factory) with the DIRECTLY-TRAINABLE
+# single full H×H matrix cross-stream (cross_stream_type: linear) — one matmul,
+# full-rank, NOT a low-rank bottleneck; the module is not LoRA-wrapped — PEFT
+# persists it via modules_to_save. The `cross_stream: 32` entry is required by the
+# schema but does NOT shape the (always H×H) matrix (provenance only). linear is
+# single-tap-only (mutually exclusive with the multi-tap cross-stream registry),
+# so only the default `cross_stream` (post-MLP) site is used. This is the 4.2
+# partner to sr-qo-mlp-r32-c32-sharedkv-linear.yaml (4.1); everything else matches
+# the g42 lora config for a clean type comparison.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  # Granite 4.2 uses ChatML. The trainer falls back to ResponseOnlyCollator
+  # (the standalone chat_template.jinja isn't detected as having {% generation %}
+  # tags), which masks THROUGH this marker and supervises the tokens after it.
+  # The ChatML template renders the assistant opener as
+  #   <|im_start|>assistant\n<think></think>   (thinking OFF, our case)
+  # so the marker must include the empty think block: generation begins right
+  # after </think>, making </think> the last context token.
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  # Directly-trainable single full H×H matrix cross-stream (not LoRA, one matmul).
+  # The cross_stream value below is required by the schema but does NOT shape the
+  # (always H×H) matrix — provenance only. Single-tap only (mutually exclusive
+  # with multi-tap).
+  cross_stream_type: linear
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream: 32
+  alpha: 64
+  dropout: 0.05
+  # last_context_token = the final context token before generation. For 4.2
+  # thinking-OFF the assistant opener ends in <think></think>, so generation
+  # starts right after </think>. last_token = end-of-completion marker (ChatML
+  # turn terminator <|im_end|>), appended to rows that don't already end with it.
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4           # 1 GPU * 1 * 32 = effective batch 32
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

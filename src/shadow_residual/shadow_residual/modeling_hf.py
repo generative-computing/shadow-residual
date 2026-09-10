@@ -40,7 +40,7 @@ _TRANSFORMERS_GE_5_9 = _parse_version(transformers.__version__) >= _parse_versio
 
 from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
-from .cross_stream import CrossStream
+from .cross_stream import CrossStream, CrossStreamLinear
 from .decoder_hf import ShadowResidualDecoderLayer
 
 
@@ -51,22 +51,27 @@ def _is_shadow_residual_enabled(config: ShadowResidualConfig) -> bool:
 def _any_cross_stream_wrapped(layers) -> bool:
     """Has any decoder layer's cross-stream site been wrapped by PEFT?
 
-    The bare :class:`CrossStream` site is a no-op (returns zeros). When
-    PEFT wraps it with a stock ``lora.Linear`` (because the user listed the
-    site's name — e.g. ``"cross_stream"`` — in ``target_modules``), it replaces
-    that attribute with the wrapper. The wrapper is not a :class:`CrossStream`
-    instance — its ``base_layer`` is.
+    A bare (unwrapped) cross-stream site is a no-op (returns zeros): both the
+    ``"lora"``-type :class:`CrossStream` (frozen zero-init linear) and the
+    ``"linear"``-type :class:`CrossStreamLinear` (zero-init H×H matrix). When
+    an adapter is attached, PEFT replaces the tap attribute with a wrapper — a
+    stock ``lora.Linear`` (lora type, via ``target_modules``) or a
+    ``ModulesToSaveWrapper`` (linear type, via ``modules_to_save``). Neither
+    wrapper is a :class:`CrossStream` / :class:`CrossStreamLinear` instance (each
+    holds the original module underneath).
 
-    A layer may carry several sites (see
-    :data:`cross_stream.CROSS_STREAM_TAPS`); any one of them being wrapped is
-    enough. This check decides whether the dual-stream forward runs. Bare
-    ``CrossStream`` everywhere → bare single-stream (unadapted base); any wrapped
-    site → dual-stream forward.
+    A layer may carry several tapped sites (see
+    :data:`cross_stream.CROSS_STREAM_TAPS`); any one being wrapped is enough. This
+    check decides whether the dual-stream forward runs. Bare sites everywhere →
+    bare single-stream (unadapted base); any wrapped site → dual-stream forward.
+    Crucially, an unwrapped ``CrossStreamLinear`` on a bare base must NOT be
+    mistaken for an active adapter, or a no-adapter model would wrongly take the
+    dual-stream path — so both bare types are excluded here.
     """
     for layer in layers:
         for tap_name in getattr(layer, "cross_stream_tap_names", ()):
             cs = getattr(layer, tap_name, None)
-            if cs is not None and not isinstance(cs, CrossStream):
+            if cs is not None and not isinstance(cs, (CrossStream, CrossStreamLinear)):
                 return True
     return False
 
@@ -99,15 +104,24 @@ class ShadowResidualPreTrainedModel(GraniteMoeHybridPreTrainedModel):
     @torch.no_grad()
     def _init_weights(self, module):
         super()._init_weights(module)
-        # The cross-stream site is a frozen zero-init nn.Linear. The parent's
-        # _init_weights treats it as a generic linear and fills it with a normal
-        # distribution — which would make base_layer(h_base) nonzero and pollute
-        # the adapter stream (breaking the frozen-base invariant and the
+        # The "lora"-type cross-stream site is a frozen zero-init nn.Linear. The
+        # parent's _init_weights treats it as a generic linear and fills it with a
+        # normal distribution — which would make base_layer(h_base) nonzero and
+        # pollute the adapter stream (breaking the frozen-base invariant and the
         # cross-stream "pure B·A" semantics). Re-zero it after the parent runs so
         # post_init() leaves it as an exact no-op. Kept frozen.
+        #
         if isinstance(module, CrossStream):
             nn.init.zeros_(module.weight)
             module.weight.requires_grad_(False)
+        # The "linear"-type site (CrossStreamLinear) stays trainable, but the
+        # parent's _init_weights re-fills its inner `proj` nn.Linear with a normal
+        # distribution, clobbering the zero-init done in CrossStreamLinear.__init__.
+        # Re-zero the H×H weight so the injection is again exactly zero at
+        # post_init() (adapter stream starts base-identical); leave it trainable
+        # (no requires_grad flip — unlike the frozen CrossStream above).
+        elif isinstance(module, CrossStreamLinear):
+            nn.init.zeros_(module.proj.weight)
 
 
 class ShadowResidualModel(ShadowResidualPreTrainedModel):

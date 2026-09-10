@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Optional
 
 
 def read_share_moe_routing_from_adapter(adapter_path: str) -> bool:
@@ -49,10 +50,11 @@ def read_cross_stream_taps_from_adapter(adapter_path: str) -> tuple[str, ...]:
     """Read which cross-stream sites an adapter was trained with.
 
     The tap set is not a separate saved field — it *is* the set of
-    ``cross_stream*`` entries in the adapter's ``target_modules`` (see
-    :func:`shadow_residual.shadow_residual.cross_stream.cross_stream_taps_from_target_modules`).
-    Building the SR base with a different tap set leaves the saved LoRA tensors
-    with no module to attach to, so source it from the adapter::
+    ``cross_stream*`` entries the adapter references. For a ``"lora"`` cross-stream
+    those live in ``target_modules``; for a ``"linear"`` cross-stream they are in
+    ``modules_to_save`` (not LoRA targets). Deriving from the union covers both.
+    Building the SR base with a different tap set leaves the saved tensors with no
+    module to attach to, so source it from the adapter::
 
         from shadow_residual.shadow_residual.build import build_sr_base
         from shadow_residual.training.generation_utils import (
@@ -75,13 +77,59 @@ def read_cross_stream_taps_from_adapter(adapter_path: str) -> tuple[str, ...]:
     cfg_path = os.path.join(adapter_path, "adapter_config.json")
     try:
         with open(cfg_path) as f:
-            targets = json.load(f).get("target_modules")
+            cfg = json.load(f)
     except (FileNotFoundError, ValueError):
         return DEFAULT_CROSS_STREAM_TAPS
-    return cross_stream_taps_from_target_modules(targets)
+    sources = list(cfg.get("target_modules") or [])
+    sources += list(cfg.get("modules_to_save") or [])
+    return cross_stream_taps_from_target_modules(sources)
+
+
+def read_cross_stream_type_from_adapter(
+    adapter_path: str,
+) -> tuple[str, Optional[int]]:
+    """Read the cross-stream (w-cross) layer type (+ provenance dim) of an adapter.
+
+    The cross-stream type is STRUCTURAL: it decides which module the SR base
+    builds at the cross_stream site (``CrossStream`` for ``"lora"``, a trainable
+    full-H×H ``CrossStreamLinear`` for ``"linear"``; ``"linear"`` is single-tap-only,
+    mutually exclusive with the multi-tap registry). The dim is provenance only —
+    it does not shape the H×H matrix. The base must be built with the same type
+    the adapter was trained under BEFORE PEFT attaches, or
+    ``PeftModel.from_pretrained`` can't bind the saved cross-stream weights.
+    ``train.py`` records both as extra keys in ``adapter_config.json``; source
+    them from the adapter itself rather than hand-passing::
+
+        from shadow_residual.shadow_residual.build import build_sr_base
+        from shadow_residual.training.generation_utils import (
+            read_cross_stream_taps_from_adapter,
+            read_cross_stream_type_from_adapter,
+        )
+
+        taps = read_cross_stream_taps_from_adapter(adapter_path)
+        cs_type, cs_dim = read_cross_stream_type_from_adapter(adapter_path)
+        base = build_sr_base(
+            base_id, torch_dtype=..., cross_stream_taps=taps,
+            cross_stream_type=cs_type, cross_stream_dim=cs_dim,
+        )
+        model = PeftModel.from_pretrained(base, adapter_path)
+
+    Returns ``("lora", None)`` when the keys are absent (older adapters, which
+    predate the selectable type and are always the frozen ``"lora"`` site).
+    """
+    cfg_path = os.path.join(adapter_path, "adapter_config.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return "lora", None
+    cs_type = str(cfg.get("cross_stream_type", "lora"))
+    cs_dim = cfg.get("cross_stream_dim")
+    return cs_type, (int(cs_dim) if cs_dim is not None else None)
 
 
 __all__ = [
     "read_share_moe_routing_from_adapter",
     "read_cross_stream_taps_from_adapter",
+    "read_cross_stream_type_from_adapter",
 ]

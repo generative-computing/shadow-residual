@@ -128,6 +128,30 @@ class TestShadowResidualForward:
                 disabled = peft_model(input_ids=input_ids).logits
         torch.testing.assert_close(bare, disabled, atol=1e-5, rtol=1e-4)
 
+    def test_bare_linear_cross_stream_takes_single_stream_path(self, tiny_config):
+        """A bare "linear" SR model (CrossStreamLinear site, no adapter) must be
+        treated as NOT wrapped → single-stream forward_bare path. Guards against
+        the regression where any non-CrossStream site would force the dual-stream
+        path even with no adapter attached (see modeling_hf._any_cross_stream_wrapped)."""
+        from shadow_residual.shadow_residual.modeling_hf import (
+            _any_cross_stream_wrapped,
+        )
+
+        cfg = ShadowResidualConfig(**tiny_config.to_dict())
+        set_shadow_residual(cfg, enabled=True)
+        cfg.cross_stream_type = "linear"
+        cfg.cross_stream_dim = 8
+        sr = ShadowResidualForCausalLM(cfg)
+        sr.eval()
+
+        assert _any_cross_stream_wrapped(sr.model.layers) is False, (
+            "bare CrossStreamLinear must NOT count as an active adapter"
+        )
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+        with torch.no_grad():
+            out = sr(input_ids=input_ids)
+        assert out.logits.shape == (1, 6, cfg.vocab_size)
+
 
 class TestCrossStreamTaps:
     """The cross-stream site is a registry of taps, not a single hard-coded one.

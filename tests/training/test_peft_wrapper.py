@@ -36,6 +36,7 @@ from peft.tuners.lora.layer import Linear as StockLoraLinear
 from shadow_residual.shadow_residual.cross_stream import (
     CROSS_STREAM_TAPS,
     CrossStream,
+    CrossStreamLinear,
 )
 
 
@@ -265,3 +266,97 @@ def test_save_pretrained_writes_standard_peft_layout(tiny_sr_model):
         # No SR-specific sidecar (cross_stream LoRA rides in the safetensors).
         assert "shadow_residual_cross_stream.bin" not in files
         assert "shadow_residual_config.json" not in files
+
+
+# --- "linear" cross-stream type (modules_to_save round-trip) ------------------
+
+
+def _tiny_linear_sr_config(dim=8):
+    cfg = ShadowResidualConfig(
+        vocab_size=300,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_adapters=0,
+        max_lora_rank=4,
+        switch_head_dim=16,
+    )
+    set_shadow_residual(config=cfg, enabled=True)
+    cfg.cross_stream_type = "linear"
+    cfg.cross_stream_dim = dim
+    return cfg
+
+
+def test_linear_cross_stream_built_on_sr_model():
+    """A "linear" SR config builds CrossStreamLinear sites (not CrossStream)."""
+    model = ShadowResidualForCausalLM(_tiny_linear_sr_config())
+    linear_sites = [m for m in model.modules() if isinstance(m, CrossStreamLinear)]
+    frozen_sites = [m for m in model.modules() if isinstance(m, CrossStream)]
+    assert len(linear_sites) == model.config.num_hidden_layers
+    assert not frozen_sites, "linear config must not build any frozen CrossStream"
+
+
+def _active_cross_stream_modules(peft_model):
+    """The ACTIVE cross-stream module at each site.
+
+    PEFT wraps a modules_to_save target in a ModulesToSaveWrapper holding two
+    copies: `original_module` (frozen, base) and `modules_to_save[<adapter>]`
+    (trainable, used in forward when the adapter is active). We want the latter —
+    that is what trains and what save/from_pretrained round-trips. Selecting by a
+    bare `isinstance(CrossStreamLinear)` walk would ambiguously match both copies.
+    """
+    from peft.utils.other import ModulesToSaveWrapper
+
+    out = []
+    for m in peft_model.modules():
+        if isinstance(m, ModulesToSaveWrapper):
+            active = m.active_adapter
+            active = active[0] if isinstance(active, (list, tuple)) else active
+            sub = m.modules_to_save[active]
+            assert isinstance(sub, CrossStreamLinear)
+            out.append(sub)
+    return out
+
+
+def test_linear_cross_stream_modules_to_save_roundtrip():
+    """The linear cross-stream trains via PEFT modules_to_save, and its weights
+    survive save_pretrained -> from_pretrained onto a fresh matching base."""
+    from peft import PeftModel
+
+    model = ShadowResidualForCausalLM(_tiny_linear_sr_config(dim=8))
+    lora_cfg = LoraConfig(
+        r=8, lora_alpha=16, lora_dropout=0.0,
+        target_modules=["q_proj", "o_proj"],
+        modules_to_save=["cross_stream"],
+    )
+    peft_model = get_peft_model(model, lora_cfg)
+
+    # The active cross-stream copy trains (via modules_to_save), NOT LoRA-wrapped.
+    cs_active = _active_cross_stream_modules(peft_model)
+    assert len(cs_active) == model.config.num_hidden_layers
+    trainable_cs = [
+        p for m in cs_active for p in m.parameters() if p.requires_grad
+    ]
+    assert trainable_cs, "linear cross-stream params must be trainable pre-save"
+    # No cross_stream LoRA layer was created.
+    assert not _cross_stream_wrappers(peft_model)
+
+    # Perturb the trainable cross-stream weight so the round-trip is meaningful.
+    with torch.no_grad():
+        for m in cs_active:
+            m.proj.weight.normal_(std=0.1)
+    saved = [m.proj.weight.detach().clone() for m in cs_active]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        peft_model.save_pretrained(tmp)
+        assert "adapter_model.safetensors" in set(os.listdir(tmp))
+
+        fresh_base = ShadowResidualForCausalLM(_tiny_linear_sr_config(dim=8))
+        reloaded = PeftModel.from_pretrained(fresh_base, tmp)
+
+    reloaded_cs = _active_cross_stream_modules(reloaded)
+    assert len(reloaded_cs) == len(cs_active)
+    for i, m in enumerate(reloaded_cs):
+        torch.testing.assert_close(m.proj.weight, saved[i], atol=1e-5, rtol=1e-4)

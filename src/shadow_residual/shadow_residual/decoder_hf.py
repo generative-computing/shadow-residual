@@ -59,6 +59,7 @@ from .cross_stream import (
     CROSS_STREAM_TAPS,
     DEFAULT_CROSS_STREAM_TAPS,
     CrossStream,
+    CrossStreamLinear,
     cross_stream_taps_need_base_ahead,
 )
 
@@ -248,10 +249,7 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
             config.hidden_size, eps=config.rms_norm_eps,
         )
 
-        # Cross-stream sites — the per-layer base→adapter merge points. Each is a
-        # frozen zero-init nn.Linear (no-op) until PEFT wraps it with stock LoRA
-        # when its name is in target_modules. On a bare model each contributes
-        # zero to h_adapt.
+        # Cross-stream sites — the per-layer base→adapter merge points.
         #
         # Which sites exist is config-driven (``cross_stream_taps``, a list of
         # names from cross_stream.CROSS_STREAM_TAPS, normally derived from
@@ -259,11 +257,38 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         # post-MLP tap named ``cross_stream``. Order follows the config list, so
         # module insertion order is identical on every rank — required by the
         # FSDP meta-init path in training.factory.
+        #
+        # WHAT KIND of module sits at the cross-stream site is config-selectable
+        # (``cross_stream_type``, threaded onto the SR config by
+        # build.build_sr_config):
+        #   - "lora" (default): a frozen zero-init nn.Linear (no-op) until PEFT
+        #     wraps it with stock LoRA when its name is in target_modules. Works
+        #     with any/all taps.
+        #   - "linear": a directly-trainable single full H×H matrix
+        #     (CrossStreamLinear) — one matmul, NOT a low-rank bottleneck (that is
+        #     the "lora" type). Persisted via PEFT modules_to_save rather than
+        #     LoRA-wrapped. Supported ONLY at the single default ``cross_stream``
+        #     tap — mutually exclusive with the multi-tap registry (enforced in the
+        #     config schema), so the loop meets exactly one tap in that case. The
+        #     config's ``cross_stream_dim`` is recorded for provenance but does NOT
+        #     shape the (always H×H) matrix.
+        # Both types start as an exact zero contribution to h_adapt, and both
+        # leave the bare (no-adapter) model base-identical (see modeling_hf.
+        # _any_cross_stream_wrapped, which treats an unwrapped site of either type
+        # as "no adapter" → single-stream forward_bare).
         self.cross_stream_tap_names = tuple(
             getattr(config, "cross_stream_taps", None) or DEFAULT_CROSS_STREAM_TAPS
         )
+        cross_stream_type = getattr(config, "cross_stream_type", "lora")
+        cross_stream_dim = getattr(config, "cross_stream_dim", None)
         for tap_name in self.cross_stream_tap_names:
-            setattr(self, tap_name, CrossStream(config.hidden_size))
+            if cross_stream_type == "linear":
+                setattr(
+                    self, tap_name,
+                    CrossStreamLinear(config.hidden_size, cross_stream_dim),
+                )
+            else:
+                setattr(self, tap_name, CrossStream(config.hidden_size))
 
         # A tap whose destination PRECEDES its source cannot be served by the
         # interleaved forward — see :meth:`_forward_base_ahead`. Decided once
@@ -272,6 +297,56 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         self._base_ahead = cross_stream_taps_need_base_ahead(
             self.cross_stream_tap_names
         )
+
+    def _inject(
+        self, h_adapt: torch.Tensor, dst: str, base_pts: dict,
+    ) -> torch.Tensor:
+        """Add every configured tap whose destination is ``dst`` into ``h_adapt``.
+
+        ``base_pts`` maps a base-stream point name (``pre_attn`` / ``post_attn`` /
+        ``post_mlp``) to the base hidden state there; a tap reads the entry for
+        its own source point. The caller only populates points the base stream
+        has actually reached, so a tap wired to a not-yet-computed source would
+        raise ``KeyError`` rather than silently read the wrong state — which is
+        what ``_base_ahead`` exists to prevent.
+
+        Pure (reads ``base_pts``, returns a new ``h_adapt``) — never mutates the
+        base stream, and safe under gradient-checkpoint recompute.
+        """
+        for tap_name in self.cross_stream_tap_names:
+            src, tap_dst = CROSS_STREAM_TAPS[tap_name]
+            if tap_dst == dst:
+                h_adapt = h_adapt + getattr(self, tap_name)(base_pts[src])
+        return h_adapt
+
+    def _mlp_base(
+        self, normed_base: torch.Tensor, bsz: int,
+    ) -> Tuple[torch.Tensor, Optional[tuple]]:
+        """Base-stream MLP. Returns ``(mlp_base, routing)``.
+
+        ``routing`` is the MoE partition to reuse for the adapter stream under
+        ``share_moe_routing`` (routed on ``normed_base``, so the base stream stays
+        bit-identical to stock), and ``None`` otherwise.
+        """
+        if self.mlp.is_moe and self.share_moe_routing:
+            length, emb = normed_base.shape[1], normed_base.shape[2]
+            routing = self.mlp._route(normed_base)
+            mlp_base = self.mlp._apply_experts(
+                normed_base.reshape(-1, emb), *routing, bsz=bsz, length=length,
+            )
+            return mlp_base, routing
+        return self.mlp.forward_base_only(normed_base), None
+
+    def _mlp_adapt(
+        self, normed_adapt: torch.Tensor, bsz: int, routing: Optional[tuple],
+    ) -> torch.Tensor:
+        """Adapter-stream MLP, reusing ``routing`` from :meth:`_mlp_base` if given."""
+        if routing is not None:
+            length, emb = normed_adapt.shape[1], normed_adapt.shape[2]
+            return self.mlp._apply_experts(
+                normed_adapt.reshape(-1, emb), *routing, bsz=bsz, length=length,
+            )
+        return self.mlp(normed_adapt)
 
     def _inject(
         self, h_adapt: torch.Tensor, dst: str, base_pts: dict,
