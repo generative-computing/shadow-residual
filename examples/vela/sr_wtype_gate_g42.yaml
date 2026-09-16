@@ -1,0 +1,253 @@
+# LAYER-TYPE trio on Granite 4.2 3b — the MERGE GATE for the unified cross-stream
+# type/wiring surface (feature/monarch-linear-merge).
+#
+# THIS IS NOT AN ABLATION AND NOT A TYPE COMPARISON. It is a REGRESSION GATE: each
+# of the three arms already has a known PRE-MERGE accuracy on this exact eval and
+# these exact 2499 filtered rows, so every arm is read against ITSELF. The question
+# is only "did the refactor change any arm's behavior", never "which type wins".
+#
+#   arm            config                                type / wiring         params/layer   pre-merge
+#   cboth32        sr-qo-mlp-r32-cboth32-sharedkv-g42     LoRA r=32, TWO taps       327,680   on the PVC
+#   cmonarch40     sr-qo-mlp-r32-cmonarch40-sharedkv-g42  Monarch b=40, mcp only    266,240   0.9120
+#   g42-linear     sr-qo-mlp-r32-c32-sharedkv-g42-linear  Linear HxH,  mcp only   6,553,600   Anton's run
+#
+# The wirings, from cross_stream.py::CROSS_STREAM_TAPS:
+#   cross_stream            post-MLP  -> post-MLP   (default / legacy site)
+#   cross_stream_post_attn  post-attn -> post-attn   (cboth32 only)
+#
+# ON THE PARAMETER SPREAD. The linear arm is 24.6x the monarch arm and there is NO
+# knob to shrink it: a linear tap is a dense HxH map, so it IS H^2 entries — its
+# `cross_stream: 32` is provenance only. The two ways to make a dense map smaller
+# are already the other two types: rank factorization (lora) and a constrained
+# sparsity pattern (monarch, which is full-rank at 4.06% of dense). Monarch already
+# IS the small linear; there is no third slot to fill. The spread confounds nothing
+# because no cross-arm comparison is being read off this job.
+#
+# WHY THESE THREE.
+#   * cboth32 is the BACK-COMPAT REFERENCE — the wiring ablation's arm 5, config
+#     byte-unchanged by the merge. Every gate and tap-derivation change must be a
+#     no-op for an all-lora topology; if this arm moves, the merge must not land.
+#     It is also the only arm here with two taps, so it covers the multi-tap
+#     derivation path.
+#   * cmonarch40 and g42-linear share the whole ModulesToSaveWrapper path but differ
+#     in the tap MODULE. If only one fails, the fault is in that type's class; if
+#     both fail the same way, it is the shared plumbing. That split is the
+#     diagnostic value of running both rather than picking one.
+#
+# WHAT THIS JOB DOES *NOT* COVER — be honest about it. The substance of the merge is
+# lifting Anton's restriction that a non-lora type was single-tap-only and pinned to
+# the default site. This GPU trio does NOT exercise that: both non-lora arms sit at
+# the default tap. The lifted restriction is covered on CPU (round-trip of a uniform
+# non-lora type at two taps, and of a mixed monarch+linear pair) and by the
+# checked-in sr-qo-mlp-r32-cmixed-sharedkv-g42.yaml config, which is preflighted but
+# not trained here. If the CPU coverage is not enough for you, add cmixed to ARMS.
+#
+# WHAT "WORKED AS INTENDED" MEANS — the gate, in order of what it catches:
+#   1. PREFLIGHT prints each arm's resolved tap types, both PEFT selections, the
+#      derived tap set and the per-layer parameter count, then ASSERTS the three
+#      totals above. A tap that silently landed in the wrong selection, or an alpha
+#      that drifted, dies here in the first seconds instead of after GPU hours.
+#   2. TRAINING completes for all three under 4-GPU FSDP with no NaN. The two
+#      non-lora arms put a 3-D / full-HxH module per layer through meta-init +
+#      to_empty() + reset_parameters(), which is the one path that cannot be
+#      checked on CPU.
+#   3. RECOVERY reads the tap set AND each non-lora tap's numeric parameter back out
+#      of the saved tensor SHAPES alone. This is what the serving path does.
+#   4. EVAL loads each adapter via stock PeftModel.from_pretrained and scores. Each
+#      arm must reproduce its own pre-merge number above.
+#
+# Arms run SEQUENTIALLY in one pod so they share the image, the install, the data and
+# the GPUs. To run them in parallel, submit three times with ARMS set to one
+# filename and distinct jobNames.
+#
+# SCORING is done IN-JOB, single-GPU, with eval/answerability_eval.py — the metric of
+# record. `generate.py` is deliberately NOT run: its predictions.jsonl is not the
+# metric and producing it only invites scoring the wrong file. No McNemar either —
+# the arms are not parameter-matched, so a paired test across them would dress a
+# confound up as a result.
+#
+# BEFORE SUBMITTING: fill in every <changeme>, and make sure REPO_BRANCH exists ON
+# THE REMOTE — the pod clones it. feature/monarch-linear-merge is currently LOCAL
+# ONLY; push it first or this job cannot start.
+
+namespace: security
+
+jobName: &jobName itzikv-sr-wtype-gate-g42
+queueName: default-queue
+priority: default-priority
+
+numPods: &numPodsVal 1
+numCpusPerPod: 8
+numGpusPerPod: &gpusPerPod 4
+totalMemoryPerPod: 400Gi
+
+containerImage: us.icr.io/cil15-shared-registry/sec-rl-neo:latest
+
+sshGitCloneConfig:
+  secretName: github-ssh-key
+  configMapName: github-known-hosts
+
+retryLimit: 1
+deletionOnFailureGracePeriodDuration: 24h
+failureGracePeriodDuration: 24h
+
+environmentVariables:
+  - name: NUM_PODS
+    value: *numPodsVal
+  - name: GPUS_PER_POD
+    value: *gpusPerPod
+  - name: JOB_NAME
+    value: *jobName
+  - name: HF_TOKEN
+    value: <changeme>
+  - name: HF_DATASETS_TRUST_REMOTE_CODE
+    value: "1"
+  - name: HF_HOME
+    value: /workspace/.cache/huggingface
+  - name: TORCH_HOME
+    value: /workspace/.cache/torch
+  - name: XDG_CACHE_HOME
+    value: /workspace/.cache
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: PYTORCH_CUDA_ALLOC_CONF
+    value: "expandable_segments:True"
+  - name: GHP_PERSONAL_TOKEN
+    value: <changeme>
+  # The merged branch. This job CANNOT run until it is pushed to the remote.
+  - name: REPO_BRANCH
+    value: feature/monarch-linear-merge
+  # W&B off. The arm configs say report_to: [wandb] to stay byte-identical to the
+  # wiring arms; THIS env var is what actually decides. Set to "online" and fill
+  # WANDB_API_KEY to enable.
+  - name: WANDB_MODE
+    value: disabled
+  - name: WANDB_BASE_URL
+    value: http://52.116.188.209:7689/
+  - name: WANDB_API_KEY
+    value: <changeme>
+  - name: WANDB_PROJECT
+    value: shadow-residual
+  - name: WCROSS_TAG
+    value: wtype-gate-g42
+  # The three arms, in order: the all-lora back-compat reference FIRST, so a
+  # regression shows up before the two non-lora arms burn GPU hours.
+  # Space-separated basenames under src/shadow_residual/config/.
+  - name: ARMS
+    value: >-
+      sr-qo-mlp-r32-cboth32-sharedkv-g42.yaml
+      sr-qo-mlp-r32-cmonarch40-sharedkv-g42.yaml
+      sr-qo-mlp-r32-c32-sharedkv-g42-linear.yaml
+  # Granite 4.2 3b. ${BASE_MODEL} is what model.base interpolates to in every arm
+  # config, so the same YAMLs serve any 4.2 checkpoint.
+  - name: BASE_MODEL
+    value: <PATH_TO_GRANITE_4_2_3B>
+  - name: DATA_ROOT
+    value: <YOUR_ANSWERABILITY_DATA_ROOT>
+  # A JSONL. Only used to satisfy ${EVAL_DATA} interpolation in the arm configs'
+  # `generation:` block — generate.py is NOT run by this job (see header).
+  - name: EVAL_DATA
+    value: <YOUR_EVAL_JSONL>
+  - name: OUTPUT_BASE
+    value: <YOUR_OUTPUT_BASE>
+  # The answerability dataset DIRECTORY for answerability_eval --dataset-path. NOT
+  # the same thing as EVAL_DATA above. The eval applies its own row filter
+  # (3565 raw -> 2499 scored) and scores the `prediction` column.
+  - name: ANSWERABILITY_DATASET
+    value: /danieloh_cos/granite-switch/datasets/answerability
+  # Greedy decoding, so batch size should not move the score — but it does affect
+  # padding, so keep it FIXED across arms and match it to the pre-merge runs these
+  # arms are being read against.
+  - name: EVAL_BATCH_SIZE
+    value: "16"
+
+imagePullSecrets:
+  - name: image-pull-secret-us
+
+volumes:
+  - name: danieloh-cos
+    claimName: danieloh-cos
+    mountPath: /danieloh_cos
+
+setupCommands:
+  - nvidia-smi
+  - export RUN_TS=$(date -u +%Y%m%dT%H%M%SZ)
+  - echo "Run timestamp ${RUN_TS}, tag ${WCROSS_TAG}"
+  - git clone https://${GHP_PERSONAL_TOKEN}@github.ibm.com/generative-computing/shadow-residual.git
+  - cd shadow-residual
+  - git checkout ${REPO_BRANCH}
+  - git log --oneline -1
+  - python3 -m venv .venv
+  - . .venv/bin/activate
+  - pip install --upgrade pip
+  - pip install -e ".[train]"
+  - pip uninstall -y torchvision || true
+  - pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu124 "torch==2.6.0"
+  - python3 -c "import torch, transformers, peft, trl; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('transformers', transformers.__version__); print('peft', peft.__version__); print('trl', trl.__version__); print('cuda_available', torch.cuda.is_available(), 'devices', torch.cuda.device_count())"
+  - ls -la ${BASE_MODEL}
+  - ls -la ${DATA_ROOT}/train.jsonl ${DATA_ROOT}/val.jsonl
+  - wc -l ${DATA_ROOT}/train.jsonl ${DATA_ROOT}/val.jsonl
+  - ls -la ${ANSWERABILITY_DATASET}
+  # PREFLIGHT. Fail fast on a bad config BEFORE burning GPU hours. Goes through the
+  # real load_training_config + to_peft_config, so it shows both axes of the merged
+  # surface: the resolved per-tap TYPE map, and WHICH PEFT selection each tap landed
+  # in (target_modules = lora, modules_to_save = linear/monarch). A monarch tap that
+  # silently stayed a LoRA target, a tap missing from the derived set, or an alpha
+  # that drifted off alpha/r == 2.0 is all visible here in the first seconds.
+  - 'for ARM in ${ARMS}; do echo "--- ${ARM}"; DATA_ROOT=${DATA_ROOT} RUN_DIR=/tmp/x EVAL_DATA=${EVAL_DATA} BASE_MODEL=${BASE_MODEL} python3 -c "import sys; from shadow_residual.config import load_training_config as L; from shadow_residual.config.adapters import to_peft_config; from shadow_residual.shadow_residual.cross_stream import cross_stream_taps_from_target_modules as T, monarch_param_count as MP; H = 2560; c = L(\"src/shadow_residual/config/\" + sys.argv[1]); a = c.adapter; p = to_peft_config(c); tt = a.cross_stream_tap_types_map(); print(\"  nums (target_modules) :\", a.target_modules); print(\"  cross_stream_type     :\", a.cross_stream_type); print(\"  resolved tap types    :\", tt); print(\"  alpha                 :\", a.alpha); print(\"  peft target_modules   :\", p.target_modules); print(\"  peft modules_to_save  :\", getattr(p, \"modules_to_save\", None)); print(\"  taps built            :\", T(p.target_modules, getattr(p, \"modules_to_save\", None))); F = {\"lora\": lambda n: 2*n*H, \"linear\": lambda n: H*H, \"monarch\": lambda n: MP(H, n)}; per = [(k, F[v[\"type\"]](v[\"num\"])) for k, v in tt.items()]; print(\"  xstream params/layer  :\", sum(n for _, n in per), dict(per))" ${ARM} || exit 1; done'
+  # ASSERT the three per-layer parameter counts. This is what pins each arm to the
+  # pre-merge run it is being read against: if a total changed, the arm is no longer
+  # the arm whose accuracy is in the header table, and the comparison is void. The
+  # 1x / 0.8x / 20x spread is BY CONSTRUCTION (266,240 is a FLOOR per Monarch tap; a
+  # linear tap is always HxH), not something to fix.
+  - 'DATA_ROOT=${DATA_ROOT} RUN_DIR=/tmp/x EVAL_DATA=${EVAL_DATA} BASE_MODEL=${BASE_MODEL} python3 -c "from shadow_residual.config import load_training_config as L; from shadow_residual.shadow_residual.cross_stream import monarch_param_count as MP; H = 2560; F = {\"lora\": lambda n: 2*n*H, \"linear\": lambda n: H*H, \"monarch\": lambda n: MP(H, n)}; tot = lambda k: sum(F[s[\"type\"]](s[\"num\"]) for s in L(\"src/shadow_residual/config/\" + k).adapter.cross_stream_tap_types_map().values()); exp = {\"sr-qo-mlp-r32-cboth32-sharedkv-g42.yaml\": 327680, \"sr-qo-mlp-r32-cmonarch40-sharedkv-g42.yaml\": 266240, \"sr-qo-mlp-r32-c32-sharedkv-g42-linear.yaml\": 6553600}; got = {k: tot(k) for k in exp}; [print(\"  \", k, \"->\", got[k], \"expected\", exp[k], \"OK\" if got[k] == exp[k] else \"MISMATCH\") for k in exp]; bad = [k for k in exp if got[k] != exp[k]]; assert not bad, bad; assert MP(H, 40) == 266240 == 2*52*H; print(\"COUNTS OK (monarch b=40 per tap == lora r=52 per tap == 266240)\")"'
+  # One training run per arm, each with its own RUN_DIR (so checkpoints never
+  # collide).
+  #
+  # --skip-post-train-generate is deliberate: the in-job generate path gathers onto
+  # rank 0 while the other ranks wait at a collective barrier, and a full eval set
+  # outlives the default 30-minute timeout, so the idle ranks abort and kill the job
+  # AFTER training finished — which in a sequential job would take the later arms down
+  # with the earlier one. Scoring happens below, single-GPU.
+  #
+  # A failing arm must not abort the others, so the loop records failures and reports
+  # them at the end instead of exiting.
+  #
+  # The pod's shell is dash, NOT bash: `set -o pipefail` is an invalid option there,
+  # and `set` is a POSIX special builtin, so failing it EXITS the script — silently
+  # skipping every step below, including the training. Hence the exit code is captured
+  # into an `rc` file inside the group that feeds `tee`, which is portable and gives
+  # the same "did this arm fail" answer that pipefail would have.
+  - 'FAILED=""; for ARM in ${ARMS}; do ARM_NAME=$(basename ${ARM} .yaml); export RUN_DIR=${OUTPUT_BASE}/${WCROSS_TAG}/${ARM_NAME}/run_${RUN_TS}; export WANDB_RUN_NAME=${WCROSS_TAG}-${ARM_NAME}; mkdir -p ${RUN_DIR}; echo "=== TRAIN ${ARM_NAME} -> ${RUN_DIR} ==="; cat src/shadow_residual/config/${ARM}; { accelerate launch --num_machines 1 --main_process_port 0 --num_processes ${GPUS_PER_POD} --mixed_precision bf16 -m shadow_residual.training.train --config src/shadow_residual/config/${ARM} --skip-post-train-generate --debug-collator; echo $? > ${RUN_DIR}/rc; } 2>&1 | tee ${RUN_DIR}/train.log; if [ "$(cat ${RUN_DIR}/rc)" = "0" ]; then echo "=== TRAIN ${ARM_NAME} OK ==="; else echo "=== TRAIN ${ARM_NAME} FAILED (rc=$(cat ${RUN_DIR}/rc)) ==="; FAILED="${FAILED} ${ARM_NAME}"; fi; done; echo "train failures:${FAILED:- none}"'
+  # NaN WATCH. Word-boundary match: a plain `grep -i nan` false-positives on the word
+  # "unanswerable" all over this data and on the `stop_on_nan: true` config line the
+  # step above echoes into the log.
+  - 'for ARM in ${ARMS}; do ARM_NAME=$(basename ${ARM} .yaml); LOG=${OUTPUT_BASE}/${WCROSS_TAG}/${ARM_NAME}/run_${RUN_TS}/train.log; if [ -f ${LOG} ]; then echo "--- ${ARM_NAME} nan/inf hits: $(grep -Eic "\bnan\b|\binf\b" ${LOG} || true)"; grep -Ei "\bnan\b|\binf\b" ${LOG} | head -5 | sed "s/^/      /" || true; fi; done; true'
+  # POST-TRAIN STRUCTURAL CHECK — the recovery gate. Everything the serving path needs
+  # has to come back out of the ADAPTER: the tap set from target_modules +
+  # modules_to_save, and each non-lora tap's TYPE and numeric parameter from the saved
+  # tensor SHAPES (a 3-D .f_in is monarch with b = shape[0]; a 2-D .proj.weight is
+  # linear). Deliberately not from adapter_config.json, which only receives its SR
+  # extras at the FINAL save — a mid-training checkpoint-N/ has none. This prints
+  # exactly what the eval is about to read, so a topology that cannot round-trip is
+  # caught here rather than as an opaque shape mismatch inside PeftModel.from_pretrained.
+  - 'for ARM in ${ARMS}; do ARM_NAME=$(basename ${ARM} .yaml); CKPT=${OUTPUT_BASE}/${WCROSS_TAG}/${ARM_NAME}/run_${RUN_TS}/checkpoints; if [ ! -f ${CKPT}/adapter_config.json ]; then echo "--- ${ARM_NAME}: no adapter, skipping"; continue; fi; echo "--- ${ARM_NAME} ${CKPT}"; python3 -c "import sys; from shadow_residual.training.generation_utils import read_cross_stream_taps_from_adapter as RT, read_cross_stream_tap_types_from_adapter as RTT; p = sys.argv[1]; print(\"  taps recovered :\", RT(p)); print(\"  types recovered:\", RTT(p))" ${CKPT} || echo "  RECOVERY FAILED"; done'
+  # SCORING — the metric of record, single-GPU, no distributed group. Loads each
+  # adapter with stock PeftModel.from_pretrained on an SR base rebuilt from the
+  # recovered taps/types. --adapter-sub-path "" because the adapter dir is passed
+  # directly. The eval applies its own row filter (3565 -> 2499) and scores the
+  # `prediction` column.
+  - 'for ARM in ${ARMS}; do ARM_NAME=$(basename ${ARM} .yaml); RUN_DIR=${OUTPUT_BASE}/${WCROSS_TAG}/${ARM_NAME}/run_${RUN_TS}; CKPT=${RUN_DIR}/checkpoints; if [ ! -f ${CKPT}/adapter_config.json ]; then echo "=== EVAL ${ARM_NAME} SKIPPED (no adapter) ==="; continue; fi; echo "=== EVAL ${ARM_NAME} ==="; mkdir -p ${RUN_DIR}/eval; CUDA_VISIBLE_DEVICES=0 python3 -m shadow_residual.eval.answerability_eval --mode peft --base-model ${BASE_MODEL} --adapter-path ${CKPT} --adapter-sub-path "" --dataset-path ${ANSWERABILITY_DATASET} --output-path ${RUN_DIR}/eval --device cuda --batch-size ${EVAL_BATCH_SIZE} 2>&1 | tee ${RUN_DIR}/eval.log || echo "=== EVAL ${ARM_NAME} FAILED ==="; done'
+  # SUMMARY. One line per arm with the four gate outcomes, so the pod log alone
+  # answers "can we merge". Every branch is guarded and the step ends in `true`: a
+  # missing file must not make the summary itself the thing that fails the job.
+  - 'echo "=== SUMMARY (tag ${WCROSS_TAG}, ts ${RUN_TS}) ==="; for ARM in ${ARMS}; do ARM_NAME=$(basename ${ARM} .yaml); RUN_DIR=${OUTPUT_BASE}/${WCROSS_TAG}/${ARM_NAME}/run_${RUN_TS}; if [ -f ${RUN_DIR}/checkpoints/adapter_config.json ]; then HAVE=yes; else HAVE=NO; fi; echo "  ${ARM_NAME}: adapter=${HAVE}"; if [ -f ${RUN_DIR}/train.log ]; then grep -h "trainable params" ${RUN_DIR}/train.log | tail -1 | sed "s/^/      params: /" || true; fi; if [ -f ${RUN_DIR}/eval.log ]; then grep -hE "^\| accuracy \|" ${RUN_DIR}/eval.log | tail -1 | sed "s/^/      /" || true; grep -h "Filtered dataset" ${RUN_DIR}/eval.log | tail -1 | sed "s/^/      /" || true; fi; done; true'
+  - echo "=== GATE READING ==="
+  - echo "  cboth32 must reproduce its pre-merge PVC accuracy -> back-compat intact."
+  - echo "  cmonarch40 must reproduce 0.9120 (b=40 per-block init, seed 2, same 2499 rows)."
+  - echo "  g42-linear must reproduce its pre-merge run; it is 24.6x monarch on params."
+  - echo "  Read each arm against ITSELF. This is a regression gate, NOT a type comparison."
+  - echo "=== all arms done; artifacts under ${OUTPUT_BASE}/${WCROSS_TAG}/ ==="
+  - sleep 1800
+
+mainProgram:

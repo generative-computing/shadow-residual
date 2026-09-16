@@ -16,22 +16,26 @@ single-stream early-exit path with compute equivalent to plain Granite +
 the wrapped LoRA deltas. This is why there is no factory-level branch: one
 architecture, two forward paths.
 
-Which cross-stream sites exist is derived from ``target_modules`` — see
-``cross_stream.cross_stream_taps_from_target_modules``.
+Which cross-stream sites exist is derived from the LoRA config's two selections
+(``target_modules`` ∪ ``modules_to_save``) — see
+``cross_stream.cross_stream_taps_from_target_modules``. WHICH selection a tap
+lands in is its layer TYPE: ``target_modules`` → a frozen-zero ``CrossStream``
+that stock ``lora.Linear`` wraps; ``modules_to_save`` → a directly-trainable
+``CrossStreamLinear`` / ``MonarchCrossStream`` that ``ModulesToSaveWrapper``
+persists whole (``cross_stream_tap_types`` selects which).
 
-There is no custom PEFT code: each cross-stream site is a real frozen
-zero-init ``nn.Linear`` (see ``cross_stream.py``) that stock
-``peft.tuners.lora.layer.Linear`` wraps like any other target. The adapter is
-plain LoRA and always active — the delta fires on every position, in both
-streams' Q/O/MLP and the cross-stream injections. There is no gated/aLoRA
-activation.
+There is no custom PEFT code either way: no custom LoRA classes and no
+``_register_custom_module``. The adapter is plain LoRA and always active — the
+delta fires on every position, in both streams' Q/O/MLP and the cross-stream
+injections. There is no gated/aLoRA activation.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from collections.abc import Mapping
+from typing import Any, Optional
 
 import torch
 from peft import LoraConfig, get_peft_model
@@ -42,8 +46,10 @@ from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
 from shadow_residual.shadow_residual.cross_stream import (
-    CrossStream,
+    CROSS_STREAM_TAPS,
+    CrossStreamTap,
     cross_stream_taps_from_target_modules,
+    normalize_cross_stream_tap_types,
 )
 from shadow_residual.shadow_residual.weight_transfer import (
     transfer_base_weights,
@@ -136,51 +142,33 @@ def _materialize_and_transfer(
                     adapter_name, init_lora_weights=True,
                 )
 
-    # Re-zero the frozen cross-stream nn.Linear weights (every configured tap —
-    # the isinstance walk below covers them all). CrossStream is a real
-    # nn.Linear(H, H) that must be exactly zero (so base_layer(h_base)=0 and the
-    # layer output is the pure B·A cross-stream injection). ``to_empty(cpu)``
-    # above rewrote it to uninitialized GARBAGE, and neither transfer_base_weights
-    # (it's not an upstream weight) nor the LoRA reset touches it — so without this
-    # it stays garbage (observed abs_sum ~1e28 / inf / nan per layer), and
-    # cross_stream(h_base) injects inf/nan into the adapter stream → NaN logits on
-    # the adapter path (base stream stays finite). The model's _init_weights
-    # re-zeros it on plain construction, but that does not run after to_empty on
-    # this meta-materialize path. Same bug class as the RoPE-buffer reinit below.
-    from shadow_residual.shadow_residual.cross_stream import (
-        CrossStream,
-        CrossStreamLinear,
+    # Re-initialize every cross-stream tap, of every type, at every configured site.
+    # LOAD-BEARING: ``to_empty(cpu)`` above rewrote each tap's tensors to
+    # uninitialized GARBAGE (observed abs_sum ~1e28 / inf / nan per layer), and
+    # nothing else repopulates them — they are not upstream weights, so
+    # transfer_base_weights skips them, and the LoRA reset only touches LoraLayer.
+    # A garbage tap injects inf/nan into the adapter stream → NaN logits on the
+    # adapter path (the base stream stays finite), and under FSDP
+    # sync_module_states broadcasts that garbage to every rank. The model's
+    # _init_weights does this on plain construction, but it does not run after
+    # to_empty on this meta-materialize path. Same bug class as the RoPE-buffer
+    # reinit below.
+    #
+    # ONE walk covers all types (the CrossStreamTap marker mixin), and it is correct
+    # for both halves of a ModulesToSaveWrapper — the frozen ``original_module`` and
+    # the trainable copy — precisely because ``reset_parameters()`` is numerics-only
+    # and never touches requires_grad (which to_empty preserves).
+    n_taps: dict[str, int] = {}
+    for module in peft_model.modules():
+        if isinstance(module, CrossStreamTap):
+            module.reset_parameters()
+            kind = type(module).__name__
+            n_taps[kind] = n_taps.get(kind, 0) + 1
+    logger.info(
+        "Re-initialized %d cross-stream tap module(s) after materialize: %s",
+        sum(n_taps.values()),
+        ", ".join(f"{k}={v}" for k, v in sorted(n_taps.items())) or "none",
     )
-
-    n_cross = 0
-    for module in peft_model.modules():
-        if isinstance(module, CrossStream):
-            torch.nn.init.zeros_(module.weight)
-            module.weight.requires_grad_(False)
-            n_cross += 1
-    logger.info("Re-zeroed %d frozen CrossStream weight(s) after materialize.", n_cross)
-
-    # Re-zero the "linear"-type cross-stream (CrossStreamLinear) after to_empty for
-    # exactly the same reason as CrossStream / RoPE above: to_empty rewrote its
-    # weight to uninitialized garbage, and nothing else repopulates it (it is a
-    # trainable adapter module, not an upstream weight; the LoRA reset only touches
-    # LoraLayer; the CrossStream re-zero skips it). Under FSDP that garbage would
-    # be broadcast to every rank. Restore the __init__ recipe: the single H×H
-    # weight is zero (injection is exactly zero at step 0, adapter stream starts
-    # base-identical, mirroring LoRA's zero-init B) but STAYS trainable — unlike
-    # the frozen CrossStream, we do not clear requires_grad. Iterating over every
-    # module catches the copy inside PEFT's ModulesToSaveWrapper as well as any
-    # bare instance.
-    n_cross_linear = 0
-    for module in peft_model.modules():
-        if isinstance(module, CrossStreamLinear):
-            torch.nn.init.zeros_(module.proj.weight)
-            n_cross_linear += 1
-    if n_cross_linear:
-        logger.info(
-            "Re-zeroed %d trainable CrossStreamLinear weight(s) after materialize.",
-            n_cross_linear,
-        )
 
     # Re-initialize non-persistent RoPE buffers. The rotary embedding
     # registers ``inv_freq`` (and ``original_inv_freq``) with
@@ -304,6 +292,31 @@ def _reject_kv_lora(lora_config: LoraConfig) -> None:
         )
 
 
+def _reject_tap_in_both_selections(lora_config: LoraConfig) -> None:
+    """Forbid a cross-stream tap appearing in BOTH PEFT selections.
+
+    A tap's PEFT list IS its type: ``target_modules`` → a frozen-zero
+    :class:`CrossStream` made trainable by stock ``lora.Linear``;
+    ``modules_to_save`` → a directly-trainable non-LoRA module (``linear`` /
+    ``monarch``) wrapped by ``ModulesToSaveWrapper``. Naming the same site in both
+    asks for two mutually exclusive types at one address. PEFT would apply both
+    wrappers and the resulting module is neither what the config says nor
+    reloadable, so reject it here rather than let it surface as an opaque shape
+    error inside ``PeftModel.from_pretrained``.
+    """
+    targets = lora_config.target_modules
+    if targets is None or isinstance(targets, str):
+        return
+    saved = set(getattr(lora_config, "modules_to_save", None) or [])
+    both = [n for n in CROSS_STREAM_TAPS if n in set(targets) and n in saved]
+    if both:
+        raise ValueError(
+            "A cross-stream tap must appear in exactly ONE of target_modules "
+            "(cross_stream_type='lora') or modules_to_save "
+            f"(cross_stream_type='linear'/'monarch'), not both: {both}."
+        )
+
+
 def get_shadow_residual_peft_model(
     base_model_name_or_path: str,
     lora_config: LoraConfig,
@@ -312,7 +325,8 @@ def get_shadow_residual_peft_model(
     adapter_name: str = "default",
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
-    cross_stream_type: str = "lora",
+    cross_stream_tap_types: Optional["Mapping[str, Any]"] = None,
+    cross_stream_type: Optional[str] = None,
     cross_stream_dim: Optional[int] = None,
 ):
     """Build a :class:`peft.PeftModel` for shadow-residual + LoRA.
@@ -335,20 +349,29 @@ def get_shadow_residual_peft_model(
             * ``rank_pattern`` / ``alpha_pattern`` — per-module rank / alpha
               overrides, e.g. ``rank_pattern={"cross_stream": R}`` (``"lora"``-type
               taps only).
-            * ``modules_to_save=["cross_stream"]`` when
-              ``cross_stream_type="linear"``: the single ``cross_stream`` site is a
-              trainable full-H×H matrix, persisted whole, not LoRA-wrapped (see
+            * ``modules_to_save`` — cross-stream taps whose type is NOT ``"lora"``
+              (``"linear"`` / ``"monarch"``): each is a directly-trainable module
+              persisted whole, not LoRA-wrapped (see
               config.adapters.to_peft_config). The taps BUILT on the model are
               derived from the union of ``target_modules`` (lora type) and
-              ``modules_to_save`` (linear type).
+              ``modules_to_save`` (non-lora types); a tap in BOTH is rejected.
             The adapter is plain LoRA (always active); there is no gated activation.
         torch_dtype: dtype for the base model construction.
-        cross_stream_type: ``"lora"`` (default) or ``"linear"`` — which module
-            the SR base builds at the cross-stream site. Threaded onto the SR
-            config so every rank builds the same tree (FSDP-symmetric).
-        cross_stream_dim: the ``cross_stream`` value for ``cross_stream_type="linear"``
-            (single tap only — mutually exclusive with multi-tap). Recorded for
-            provenance; does NOT shape the always-H×H matrix.
+        cross_stream_tap_types: the cross-stream layer TYPE per tap — the axis
+            ORTHOGONAL to the wiring (the tap NAME is the wiring). A
+            ``{tap -> "lora" | "linear" | "monarch"}`` or
+            ``{tap -> {"type", "num"}}`` map, so one model can MIX types across
+            taps. STRUCTURAL: it decides which module the SR base builds at each
+            site, so it is threaded onto the SR config and every rank builds the
+            same tree (FSDP-symmetric). Taps omitted from the map default to
+            ``"lora"``. ``num`` is the tap's numeric parameter and its meaning is
+            type-dependent: unused for ``"lora"`` (the rank comes from
+            ``rank_pattern``), provenance-only for ``"linear"`` (the matrix is
+            always H×H), and the block count ``b`` for ``"monarch"``.
+        cross_stream_type: legacy scalar form of the above — one type applied to
+            EVERY built tap. Ignored when ``cross_stream_tap_types`` is given.
+        cross_stream_dim: legacy scalar ``num`` paired with ``cross_stream_type``,
+            applied to every built non-lora tap.
         adapter_name: PEFT adapter name (default: ``"default"``).
         share_moe_routing: MoE bases only — route once on the base stream and
             reuse that expert partition for the adapter stream (vs. independent
@@ -360,24 +383,38 @@ def get_shadow_residual_peft_model(
         :class:`peft.PeftModel`.
     """
     _reject_kv_lora(lora_config)
+    _reject_tap_in_both_selections(lora_config)
     # Which cross-stream sites to build is DERIVED from the LoRA config: the tap
-    # set is exactly the set of cross_stream* sites the adapter references. For
-    # the "lora" cross-stream type those are LoRA targets (in ``target_modules``);
-    # for the "linear" type they are trainable modules persisted whole (in
-    # ``modules_to_save``). Deriving from the union means there is no second
-    # config field to drift, and the saved adapter_config.json already records
-    # everything the serving path needs (target_modules + modules_to_save).
-    _tap_sources = list(lora_config.target_modules or [])
-    _tap_sources += list(getattr(lora_config, "modules_to_save", None) or [])
-    cross_stream_taps = cross_stream_taps_from_target_modules(_tap_sources)
+    # set is exactly the set of cross_stream* sites the adapter references, taken
+    # from BOTH PEFT selections. For the "lora" type those are LoRA targets (in
+    # ``target_modules``); for the non-lora types ("linear" / "monarch") they are
+    # trainable modules persisted whole (in ``modules_to_save``). Deriving from the
+    # union means there is no second config field to drift, and the saved
+    # adapter_config.json already records everything the serving path needs
+    # (target_modules + modules_to_save).
+    cross_stream_taps = cross_stream_taps_from_target_modules(
+        lora_config.target_modules,
+        getattr(lora_config, "modules_to_save", None),
+    )
+    # Resolve the TYPE axis once, here, so the log line and the SR config agree.
+    tap_types = normalize_cross_stream_tap_types(
+        cross_stream_taps,
+        cross_stream_tap_types if cross_stream_tap_types is not None else cross_stream_type,
+        cross_stream_dim,
+    )
+    # A tap engages the dual-stream forward once PEFT WRAPS it — as a lora.Linear
+    # (target_modules) or a ModulesToSaveWrapper (modules_to_save). An unreferenced
+    # tap is a bare frozen zero and stays on the single-stream path, so test both
+    # selections here, not just target_modules.
+    _referenced = set(lora_config.target_modules or []) | set(
+        getattr(lora_config, "modules_to_save", None) or []
+    )
     logger.info(
         "Building SR base from upstream HF Granite. target_modules=%s "
         "cross_stream_taps=%s (dual-stream forward %s engage).",
         lora_config.target_modules,
-        cross_stream_taps,
-        "will"
-        if any(t in (lora_config.target_modules or []) for t in cross_stream_taps)
-        else "will not",
+        {t: tap_types[t]["type"] for t in cross_stream_taps},
+        "will" if _referenced & set(cross_stream_taps) else "will not",
     )
 
     # Path-D pipeline: every rank builds SR + PEFT-wrap on meta with an
@@ -391,8 +428,7 @@ def get_shadow_residual_peft_model(
         attn_implementation=attn_implementation,
         share_moe_routing=share_moe_routing,
         cross_stream_taps=cross_stream_taps,
-        cross_stream_type=cross_stream_type,
-        cross_stream_dim=cross_stream_dim,
+        cross_stream_tap_types=tap_types,
     )
 
     peft_model = _build_sr_peft_model_meta(

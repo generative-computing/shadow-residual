@@ -64,6 +64,13 @@ class Bias(str, Enum):
     LORA_ONLY = "lora_only"
 
 
+#: The cross-stream layer TYPE axis — see `AdapterConfig.cross_stream_type`. Kept a
+#: Literal rather than an Enum so YAML values stay plain strings both here and in the
+#: saved adapter_config.json. Adding a type here also needs a row in
+#: `cross_stream.CROSS_STREAM_TAP_TYPES` (the module dispatch).
+CrossStreamType = Literal["lora", "linear", "monarch"]
+
+
 # --- Sub-models ---------------------------------------------------------------
 
 
@@ -118,22 +125,38 @@ class AdapterConfig(_Strict):
     # The dict form is concise (no separate `rank` field, no risk of the
     # names-and-ranks lists drifting out of sync).
     target_modules: PositiveInt | dict[str, PositiveInt] = 32
-    # Cross-stream (w-cross) layer TYPE — what kind of module sits at the tapped
-    # cross-stream site (the taps themselves are derived from target_modules; see
-    # cross_stream.CROSS_STREAM_TAPS). Interpreted per type:
-    #   - "lora" (default): each tapped site is a frozen H×H linear made trainable
-    #     by stock PEFT LoRA; the `cross_stream*` value is the LoRA rank R. Works
-    #     with any/all taps in the multi-tap registry.
-    #   - "linear": the single default `cross_stream` site is a directly-trainable
-    #     full H×H matrix (one matmul, NOT a low-rank bottleneck); not LoRA — PEFT
-    #     persists it via `modules_to_save` (see config/adapters.to_peft_config).
-    #     Its `cross_stream` value is required by the schema but does NOT shape the
-    #     (always H×H) matrix — provenance only. Single-tap-only: MUTUALLY EXCLUSIVE
-    #     with the multi-tap registry (validated in _validate_cross_stream_type).
-    # Recorded into the saved adapter_config.json and read back by the serving path
-    # so the SR base is rebuilt with the matching module before PEFT attaches (see
-    # training.generation_utils.read_cross_stream_type_from_adapter).
-    cross_stream_type: Literal["lora", "linear"] = "lora"
+    # Cross-stream (w-cross) layer TYPE — what kind of module sits at each tapped
+    # cross-stream site. ORTHOGONAL to the wiring: the tap NAME is the wiring (see
+    # cross_stream.CROSS_STREAM_TAPS, and note the taps themselves are derived from
+    # target_modules — there is no separate tap field). Two shapes, mirroring
+    # `target_modules` / `alpha`:
+    #
+    #   - scalar (e.g. `monarch`)  → that type at EVERY built cross-stream tap
+    #   - dict[tap, type]          → per-tap, so one model can MIX types
+    #                                (e.g. {cross_stream: monarch,
+    #                                       cross_stream_post_attn: linear})
+    #
+    # The tap's numeric parameter always rides in `target_modules[tap]`, and its
+    # meaning is type-dependent:
+    #   - "lora" (default): the site is a frozen H×H linear made trainable by stock
+    #     PEFT LoRA; `target_modules[tap]` is the LoRA rank R.
+    #   - "linear": the site is a directly-trainable full H×H matrix (one matmul,
+    #     NOT a low-rank bottleneck); `target_modules[tap]` is required by the schema
+    #     but does NOT shape the (always H×H) matrix — provenance only.
+    #   - "monarch": the site is a two-factor block-diagonal butterfly — FULL RANK
+    #     at H·(b + H/b) params, where `target_modules[tap]` is the block count b.
+    #     Minimized at b ≈ √H; at H=2560, b=40 gives 266,240 params/layer, which is
+    #     exactly LoRA r=52 — the parameter-matched control. That count is a FLOOR,
+    #     so parity with an r=32 arm is unreachable.
+    #
+    # "linear" and "monarch" are NOT LoRA targets (a 3-D block factor cannot be one,
+    # and CLAUDE.md forbids _register_custom_module) — they are routed to PEFT's
+    # `modules_to_save` (see config/adapters.to_peft_config), which requires the dict
+    # form of `target_modules` since that slot carries the per-tap number. Recorded
+    # into the saved adapter_config.json; the serving path recovers each non-lora
+    # tap's type AND number from the saved tensor SHAPES (see
+    # training.generation_utils.read_cross_stream_tap_types_from_adapter).
+    cross_stream_type: CrossStreamType | dict[str, CrossStreamType] = "lora"
     # LoRA scaling is `alpha / r`, so per-module RANK alone is not enough to run a
     # parameter-aligned ablation: halving a module's rank doubles its effective
     # scale. Two shapes, mirroring `target_modules`:
@@ -174,52 +197,106 @@ class AdapterConfig(_Strict):
             raise ValueError("target_modules dict cannot be empty")
         return v
 
+    def cross_stream_type_for(self, tap: str) -> str:
+        """The layer TYPE of one cross-stream tap — scalar or per-tap form.
+
+        Taps absent from a dict ``cross_stream_type`` are ``"lora"`` (the default),
+        so a dict only has to name the taps that differ.
+        """
+        if isinstance(self.cross_stream_type, str):
+            return self.cross_stream_type
+        return self.cross_stream_type.get(tap, "lora")
+
+    def cross_stream_taps(self) -> list[str]:
+        """The ``cross_stream*`` keys of a dict ``target_modules``, in config order.
+
+        Empty for the scalar form — which cannot express a non-lora type (see
+        :meth:`_validate_cross_stream_type`), so the LoRA-only projection in
+        ``config.adapters`` is correct there by construction.
+        """
+        if not isinstance(self.target_modules, dict):
+            return []
+        return [k for k in self.target_modules if k.startswith("cross_stream")]
+
+    def cross_stream_tap_types_map(self) -> dict[str, dict[str, Any]]:
+        """The per-tap ``{"type", "num"}`` map the SR model builder consumes.
+
+        Joins this schema's two axes into the single shape
+        :func:`shadow_residual.shadow_residual.cross_stream.build_cross_stream_tap`
+        takes: the TYPE from ``cross_stream_type`` and the tap's numeric parameter
+        from its ``target_modules`` entry (whose meaning is type-dependent — a LoRA
+        rank for ``"lora"``, provenance for ``"linear"``, the block count ``b`` for
+        ``"monarch"``). Empty for the scalar ``target_modules`` form, which cannot
+        express a non-lora type — the builder then defaults every tap to ``"lora"``.
+        """
+        return {
+            t: {"type": self.cross_stream_type_for(t), "num": self.target_modules[t]}
+            for t in self.cross_stream_taps()
+        }
+
+    def non_lora_cross_stream_taps(self) -> list[str]:
+        """Taps whose type is NOT ``"lora"`` — i.e. PEFT ``modules_to_save`` targets.
+
+        The single computation behind every "this is not a LoRA target" decision:
+        `alpha` must not cover them (there is no ``α/r`` off a non-LoRA layer), and
+        ``to_peft_config`` must keep them out of ``r`` / ``target_modules`` /
+        ``rank_pattern`` and route them to ``modules_to_save`` instead.
+        """
+        return [t for t in self.cross_stream_taps() if self.cross_stream_type_for(t) != "lora"]
+
     @model_validator(mode="after")
     def _validate_cross_stream_type(self):
-        # A "linear" cross-stream is mutually exclusive with the multi-tap
-        # cross-stream registry: it is supported ONLY at the single default
-        # ``cross_stream`` (post-MLP) site, where it is a full trainable H×H matrix.
-        # The dict form of target_modules must carry a ``cross_stream`` entry (its
-        # value is recorded for provenance but does not shape the H×H matrix).
-        # Reject any other/additional cross_stream* tap alongside linear so the two
-        # features don't compose (linear stays single-site; multi-tap stays lora).
-        if self.cross_stream_type == "linear":
-            if not isinstance(self.target_modules, dict):
+        is_lora_only = self.cross_stream_type == "lora"
+        if isinstance(self.cross_stream_type, dict) and not self.cross_stream_type:
+            raise ValueError("cross_stream_type dict cannot be empty")
+        # A non-lora type needs the DICT form of target_modules with a cross_stream*
+        # entry: that slot carries the tap's numeric parameter (a provenance dim for
+        # "linear", the block count b for "monarch"), and the tap set itself is derived
+        # from target_modules — a type for a tap that is not built there has no effect.
+        if not is_lora_only and not isinstance(self.target_modules, dict):
+            raise ValueError(
+                f"cross_stream_type={self.cross_stream_type!r} requires the dict form "
+                "of target_modules with a 'cross_stream' entry "
+                "(e.g. {cross_stream: 32, q_proj: 32, ...})."
+            )
+        if not is_lora_only and not self.cross_stream_taps():
+            raise ValueError(
+                f"cross_stream_type={self.cross_stream_type!r} requires at least one "
+                "cross_stream* entry in target_modules (the tap set is derived from "
+                "target_modules, and that entry carries the tap's numeric parameter)."
+            )
+        # A dict may only name taps that actually exist, or the type would be silently
+        # ignored. (No tap-NAME registry check here — cross_stream.py raises on any
+        # unregistered cross_stream* name in target_modules, which this is a subset of.)
+        if isinstance(self.cross_stream_type, dict):
+            known = set(self.cross_stream_taps())
+            unknown = sorted(set(self.cross_stream_type) - known)
+            if unknown:
                 raise ValueError(
-                    "cross_stream_type='linear' requires the dict form of "
-                    "target_modules with a 'cross_stream' entry "
-                    "(e.g. {cross_stream: 32, q_proj: 32, ...})."
-                )
-            cross_taps = [k for k in self.target_modules if k.startswith("cross_stream")]
-            if cross_taps != ["cross_stream"]:
-                raise ValueError(
-                    "cross_stream_type='linear' is supported only at the single "
-                    "default 'cross_stream' tap (it is mutually exclusive with the "
-                    f"multi-tap cross-stream registry); got taps {cross_taps}. Use "
-                    "cross_stream_type='lora' for multi-tap / non-default taps."
+                    "a per-tap `cross_stream_type` dict may only name cross-stream "
+                    "taps present in `target_modules` (that is where the tap set and "
+                    f"each tap's numeric parameter come from); unexpected={unknown} "
+                    f"known={sorted(known)}"
                 )
         return self
 
     @model_validator(mode="after")
     def _default_alpha(self):
-        # Default alpha to 2 * (max) LoRA rank. alpha is a LoRA-only concept, so
-        # for a "linear" cross-stream the `cross_stream` entry is not a LoRA rank
-        # and must not inflate alpha — exclude it from the max. (Linear is
-        # single-tap-only, so the one literal "cross_stream" key covers it; see
-        # _validate_cross_stream_type.)
+        # Default alpha to 2 * (max) LoRA rank. alpha is a LoRA-only concept, so a
+        # non-lora tap's target_modules value is not a rank (it is a provenance dim or
+        # a Monarch block count) and must not inflate alpha — exclude every such tap.
         if self.alpha is None:
             r = self.target_modules
             if isinstance(r, int):
                 max_rank = r
             else:
+                non_lora = set(self.non_lora_cross_stream_taps())
                 ranks = {
-                    name: rank for name, rank in r.items()
-                    if not (self.cross_stream_type == "linear"
-                            and name == "cross_stream")
+                    name: rank for name, rank in r.items() if name not in non_lora
                 }
-                # Fall back to the full dict if the only entry was the linear
-                # cross_stream (a degenerate but valid "linear-only" config), so
-                # alpha still has a rank to key off.
+                # Fall back to the full dict when EVERY entry was a non-lora tap (a
+                # degenerate but valid "no LoRA targets" config), so alpha still has
+                # a number to key off.
                 max_rank = max((ranks or dict(r)).values())
             self.alpha = 2 * max_rank
         return self
@@ -243,13 +320,12 @@ class AdapterConfig(_Strict):
             )
         alpha_keys = set(self.alpha)
         target_keys = set(self.target_modules)
-        # A "linear" cross-stream is not a LoRA target (it rides in
-        # modules_to_save, not rank_pattern/alpha_pattern), so alpha must NOT
-        # carry an entry for it — exclude the single "cross_stream" key from the
-        # required LoRA-target key set. (For "lora" type the taps ARE LoRA targets
-        # and must be covered like any other module.)
-        if self.cross_stream_type == "linear":
-            target_keys = target_keys - {"cross_stream"}
+        # A non-lora cross-stream tap is not a LoRA target (it rides in
+        # modules_to_save, not rank_pattern/alpha_pattern), so alpha must NOT carry an
+        # entry for it — exclude every such tap from the required LoRA-target key set.
+        # (For the "lora" type the taps ARE LoRA targets and must be covered like any
+        # other module.)
+        target_keys = target_keys - set(self.non_lora_cross_stream_taps())
         if alpha_keys != target_keys:
             missing = sorted(target_keys - alpha_keys)
             extra = sorted(alpha_keys - target_keys)

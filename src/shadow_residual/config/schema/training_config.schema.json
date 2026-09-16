@@ -20,6 +20,31 @@
           "default": 32,
           "title": "Target Modules"
         },
+        "cross_stream_type": {
+          "anyOf": [
+            {
+              "enum": [
+                "lora",
+                "linear",
+                "monarch"
+              ],
+              "type": "string"
+            },
+            {
+              "additionalProperties": {
+                "enum": [
+                  "lora",
+                  "linear",
+                  "monarch"
+                ],
+                "type": "string"
+              },
+              "type": "object"
+            }
+          ],
+          "default": "lora",
+          "title": "Cross Stream Type"
+        },
         "alpha": {
           "anyOf": [
             {
@@ -57,7 +82,7 @@
           "title": "Task Type",
           "type": "string"
         },
-        "invocation_tokens": {
+        "last_context_token": {
           "anyOf": [
             {
               "type": "string"
@@ -67,7 +92,24 @@
             }
           ],
           "default": null,
-          "title": "Invocation Tokens"
+          "title": "Last Context Token"
+        },
+        "last_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Token"
+        },
+        "share_moe_routing": {
+          "default": true,
+          "title": "Share Moe Routing",
+          "type": "boolean"
         }
       },
       "title": "AdapterConfig",
@@ -145,6 +187,11 @@
           ],
           "default": null,
           "title": "Assistant Marker"
+        },
+        "enable_thinking": {
+          "default": false,
+          "title": "Enable Thinking",
+          "type": "boolean"
         }
       },
       "required": [
@@ -156,7 +203,7 @@
     },
     "GenerationConfig": {
       "additionalProperties": false,
-      "description": "Post-training generation parameters.\n\nUsed by both the standalone ``generate`` entry point and by ``train.py``\nwhen this block is present in the YAML \u2014 its **presence** opts the\ntraining run into a follow-up generation pass on ``input_path``.",
+      "description": "Post-training generation parameters.\n\nThe block is optional at the YAML level (``cfg.generation`` may be\n``None`` \u2014 see :class:`TrainingConfig`); when present, ``input_path``\nis the trigger field and is required. Used by the standalone\n``generate`` entry point and by ``train.py`` for post-training\nevaluation.",
       "properties": {
         "input_path": {
           "title": "Input Path",
@@ -196,6 +243,13 @@
           "default": "predictions.jsonl",
           "title": "Output Filename",
           "type": "string"
+        },
+        "debug_probability": {
+          "default": 0.0,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Debug Probability",
+          "type": "number"
         }
       },
       "required": [
@@ -233,18 +287,14 @@
           "default": null,
           "title": "Attn Implementation"
         },
-        "shared_base_kv": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "null"
-            }
+        "param_dtype": {
+          "default": "bf16",
+          "enum": [
+            "bf16",
+            "fp32"
           ],
-          "default": null,
-          "description": "SR-architecture knob: when True, the adapter stream attends to a single base-only K/V (one cache, K/V computed once from normed_base); when False, disjoint per-stream K/V. None (default) = auto: True when 'cross_stream' is in target_modules (SR production default), else False (LoRA/aLoRA; warning logged). Explicit True/False always wins.",
-          "title": "Shared Base Kv"
+          "title": "Param Dtype",
+          "type": "string"
         }
       },
       "required": [
@@ -399,6 +449,11 @@
         "packing": {
           "default": false,
           "title": "Packing",
+          "type": "boolean"
+        },
+        "debug_collator": {
+          "default": false,
+          "title": "Debug Collator",
           "type": "boolean"
         }
       },

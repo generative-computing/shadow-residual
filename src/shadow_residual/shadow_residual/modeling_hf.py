@@ -40,7 +40,7 @@ _TRANSFORMERS_GE_5_9 = _parse_version(transformers.__version__) >= _parse_versio
 
 from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
-from .cross_stream import CrossStream, CrossStreamLinear
+from .cross_stream import CrossStreamTap
 from .decoder_hf import ShadowResidualDecoderLayer
 
 
@@ -51,27 +51,27 @@ def _is_shadow_residual_enabled(config: ShadowResidualConfig) -> bool:
 def _any_cross_stream_wrapped(layers) -> bool:
     """Has any decoder layer's cross-stream site been wrapped by PEFT?
 
-    A bare (unwrapped) cross-stream site is a no-op (returns zeros): both the
-    ``"lora"``-type :class:`CrossStream` (frozen zero-init linear) and the
-    ``"linear"``-type :class:`CrossStreamLinear` (zero-init H×H matrix). When
-    an adapter is attached, PEFT replaces the tap attribute with a wrapper — a
-    stock ``lora.Linear`` (lora type, via ``target_modules``) or a
-    ``ModulesToSaveWrapper`` (linear type, via ``modules_to_save``). Neither
-    wrapper is a :class:`CrossStream` / :class:`CrossStreamLinear` instance (each
-    holds the original module underneath).
+    A bare (unwrapped) cross-stream site is a no-op (returns zeros) whatever its
+    type — every type is a :class:`CrossStreamTap`. When an adapter is attached,
+    PEFT replaces the tap attribute with a wrapper: a stock ``lora.Linear``
+    (``"lora"`` type, via ``target_modules``) or a ``ModulesToSaveWrapper``
+    (``"linear"`` / ``"monarch"``, via ``modules_to_save``). Neither wrapper is a
+    :class:`CrossStreamTap` instance (each holds the original module underneath),
+    so ONE ``isinstance`` test on the marker mixin covers every type — including
+    types added later.
 
     A layer may carry several tapped sites (see
     :data:`cross_stream.CROSS_STREAM_TAPS`); any one being wrapped is enough. This
     check decides whether the dual-stream forward runs. Bare sites everywhere →
     bare single-stream (unadapted base); any wrapped site → dual-stream forward.
-    Crucially, an unwrapped ``CrossStreamLinear`` on a bare base must NOT be
-    mistaken for an active adapter, or a no-adapter model would wrongly take the
-    dual-stream path — so both bare types are excluded here.
+    Crucially, a bare tap of ANY type must NOT be mistaken for an active adapter,
+    or a no-adapter model would wrongly take the dual-stream path — which is
+    exactly why the mixin exists rather than a hand-maintained type tuple.
     """
     for layer in layers:
         for tap_name in getattr(layer, "cross_stream_tap_names", ()):
             cs = getattr(layer, tap_name, None)
-            if cs is not None and not isinstance(cs, (CrossStream, CrossStreamLinear)):
+            if cs is not None and not isinstance(cs, CrossStreamTap):
                 return True
     return False
 
@@ -80,15 +80,23 @@ def _adapters_globally_disabled(modules) -> bool:
     """True iff a top-level ``disable_adapter()`` is currently in effect.
 
     When the user wraps a forward in ``with peft_model.disable_adapter():`` every
-    LoRA layer's ``disable_adapters`` flag is set; the SR model then takes the
-    bare single-stream path (the unadapted base) instead of dual-stream. On a bare
-    (unwrapped) model there are no LoRA layers, so this returns False (and the
-    absence of a wrapped cross_stream selects the bare path anyway).
+    LoRA layer's ``disable_adapters`` flag is set, and so is every
+    ``ModulesToSaveWrapper``'s; the SR model then takes the bare single-stream path
+    (the unadapted base) instead of dual-stream. On a bare (unwrapped) model there
+    are neither, so this returns False (and the absence of a wrapped cross_stream
+    selects the bare path anyway).
+
+    BOTH wrapper kinds are inspected: a topology whose only trainable cross-stream
+    is a ``"linear"`` / ``"monarch"`` tap has no ``LoraLayer`` at the tap at all, so
+    a LoRA-only check would miss its ``disable_adapter()``. Such a model still
+    produces base-identical logits (the wrapper switches back to the frozen zero
+    original), but via the dual-stream path — the right answer down the wrong road.
     """
     from peft.tuners.lora.layer import LoraLayer
+    from peft.utils.other import ModulesToSaveWrapper
 
     for m in modules:
-        if isinstance(m, LoraLayer):
+        if isinstance(m, (LoraLayer, ModulesToSaveWrapper)):
             return bool(getattr(m, "disable_adapters", False))
     return False
 
@@ -104,24 +112,20 @@ class ShadowResidualPreTrainedModel(GraniteMoeHybridPreTrainedModel):
     @torch.no_grad()
     def _init_weights(self, module):
         super()._init_weights(module)
-        # The "lora"-type cross-stream site is a frozen zero-init nn.Linear. The
-        # parent's _init_weights treats it as a generic linear and fills it with a
-        # normal distribution — which would make base_layer(h_base) nonzero and
+        # A cross-stream site of ANY type must be an exact no-op after post_init().
+        # The parent's _init_weights sees a tap's nn.Linear (the "lora" type's own
+        # weight, or the "linear" type's inner `proj`) as a generic linear and fills
+        # it with a normal distribution — which would make the injection nonzero and
         # pollute the adapter stream (breaking the frozen-base invariant and the
-        # cross-stream "pure B·A" semantics). Re-zero it after the parent runs so
-        # post_init() leaves it as an exact no-op. Kept frozen.
-        #
-        if isinstance(module, CrossStream):
-            nn.init.zeros_(module.weight)
-            module.weight.requires_grad_(False)
-        # The "linear"-type site (CrossStreamLinear) stays trainable, but the
-        # parent's _init_weights re-fills its inner `proj` nn.Linear with a normal
-        # distribution, clobbering the zero-init done in CrossStreamLinear.__init__.
-        # Re-zero the H×H weight so the injection is again exactly zero at
-        # post_init() (adapter stream starts base-identical); leave it trainable
-        # (no requires_grad flip — unlike the frozen CrossStream above).
-        elif isinstance(module, CrossStreamLinear):
-            nn.init.zeros_(module.proj.weight)
+        # cross-stream "pure B·A" semantics) — and skips a raw nn.Parameter (the
+        # "monarch" type's factors) entirely, leaving whatever torch.empty gave.
+        # Each type's reset_parameters() restores its own initial numerics; per the
+        # CrossStreamTap contract it does NOT touch requires_grad, so the frozen
+        # "lora"/"monarch" taps stay frozen (set in __init__) and the trainable
+        # "linear" tap stays trainable. `apply()` is post-order, so this runs after
+        # the parent has clobbered any child linear.
+        if isinstance(module, CrossStreamTap):
+            module.reset_parameters()
 
 
 class ShadowResidualModel(ShadowResidualPreTrainedModel):

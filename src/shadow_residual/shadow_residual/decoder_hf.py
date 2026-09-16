@@ -58,9 +58,9 @@ from .attention_hf import ShadowResidualAttention
 from .cross_stream import (
     CROSS_STREAM_TAPS,
     DEFAULT_CROSS_STREAM_TAPS,
-    CrossStream,
-    CrossStreamLinear,
+    build_cross_stream_tap,
     cross_stream_taps_need_base_ahead,
+    normalize_cross_stream_tap_types,
 )
 
 
@@ -258,37 +258,42 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         # module insertion order is identical on every rank — required by the
         # FSDP meta-init path in training.factory.
         #
-        # WHAT KIND of module sits at the cross-stream site is config-selectable
-        # (``cross_stream_type``, threaded onto the SR config by
-        # build.build_sr_config):
+        # WHAT KIND of module sits at each tapped site is a SECOND, ORTHOGONAL axis
+        # (``cross_stream_tap_types``, a ``{tap -> {"type", "num"}}`` map threaded
+        # onto the SR config by build.build_sr_config). Any type is available at any
+        # tap, and one layer may mix types:
         #   - "lora" (default): a frozen zero-init nn.Linear (no-op) until PEFT
-        #     wraps it with stock LoRA when its name is in target_modules. Works
-        #     with any/all taps.
+        #     wraps it with stock LoRA when its name is in target_modules.
         #   - "linear": a directly-trainable single full H×H matrix
         #     (CrossStreamLinear) — one matmul, NOT a low-rank bottleneck (that is
-        #     the "lora" type). Persisted via PEFT modules_to_save rather than
-        #     LoRA-wrapped. Supported ONLY at the single default ``cross_stream``
-        #     tap — mutually exclusive with the multi-tap registry (enforced in the
-        #     config schema), so the loop meets exactly one tap in that case. The
-        #     config's ``cross_stream_dim`` is recorded for provenance but does NOT
-        #     shape the (always H×H) matrix.
-        # Both types start as an exact zero contribution to h_adapt, and both
-        # leave the bare (no-adapter) model base-identical (see modeling_hf.
-        # _any_cross_stream_wrapped, which treats an unwrapped site of either type
-        # as "no adapter" → single-stream forward_bare).
+        #     the "lora" type).
+        #   - "monarch": a two-factor block-diagonal butterfly
+        #     (MonarchCrossStream) — FULL rank at H·(b + H/b) params, ``num`` = b.
+        # "linear" and "monarch" are persisted via PEFT modules_to_save rather than
+        # LoRA-wrapped. Every type starts as an exact zero contribution to h_adapt,
+        # and every type leaves the bare (no-adapter) model base-identical (see
+        # modeling_hf._any_cross_stream_wrapped, which treats an unwrapped site of
+        # ANY type as "no adapter" → single-stream forward_bare).
         self.cross_stream_tap_names = tuple(
             getattr(config, "cross_stream_taps", None) or DEFAULT_CROSS_STREAM_TAPS
         )
-        cross_stream_type = getattr(config, "cross_stream_type", "lora")
-        cross_stream_dim = getattr(config, "cross_stream_dim", None)
+        # Legacy scalar attrs: a config built outside build_sr_config (or an older
+        # one) may carry only ``cross_stream_type`` / ``cross_stream_dim``. The
+        # shared normalizer folds either form into the per-tap dict.
+        self.cross_stream_tap_types = normalize_cross_stream_tap_types(
+            self.cross_stream_tap_names,
+            getattr(config, "cross_stream_tap_types", None)
+            or getattr(config, "cross_stream_type", None),
+            getattr(config, "cross_stream_dim", None),
+        )
         for tap_name in self.cross_stream_tap_names:
-            if cross_stream_type == "linear":
-                setattr(
-                    self, tap_name,
-                    CrossStreamLinear(config.hidden_size, cross_stream_dim),
-                )
-            else:
-                setattr(self, tap_name, CrossStream(config.hidden_size))
+            spec = self.cross_stream_tap_types[tap_name]
+            setattr(
+                self, tap_name,
+                build_cross_stream_tap(
+                    tap_name, config.hidden_size, spec["type"], spec["num"],
+                ),
+            )
 
         # A tap whose destination PRECEDES its source cannot be served by the
         # interleaved forward — see :meth:`_forward_base_ahead`. Decided once

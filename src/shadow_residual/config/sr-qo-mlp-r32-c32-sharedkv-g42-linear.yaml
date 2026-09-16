@@ -6,11 +6,14 @@
 # single full H×H matrix cross-stream (cross_stream_type: linear) — one matmul,
 # full-rank, NOT a low-rank bottleneck; the module is not LoRA-wrapped — PEFT
 # persists it via modules_to_save. The `cross_stream: 32` entry is required by the
-# schema but does NOT shape the (always H×H) matrix (provenance only). linear is
-# single-tap-only (mutually exclusive with the multi-tap cross-stream registry),
-# so only the default `cross_stream` (post-MLP) site is used. This is the 4.2
-# partner to sr-qo-mlp-r32-c32-sharedkv-linear.yaml (4.1); everything else matches
-# the g42 lora config for a clean type comparison.
+# schema but does NOT shape the (always H×H) matrix (provenance only). This arm
+# uses only the default `cross_stream` (post-MLP) site — by choice, so the type is
+# the single variable against the g42 lora config, NOT by restriction: the type
+# axis is orthogonal to the wiring registry, so any type works at any tap and one
+# model may mix types (see sr-qo-mlp-r32-cmixed-sharedkv-g42.yaml for this same
+# type at a NON-default tap, alongside monarch at the default one). This is the 4.2 partner to
+# sr-qo-mlp-r32-c32-sharedkv-linear.yaml (4.1); everything else matches the g42
+# lora config for a clean type comparison.
 
 # yaml-language-server: $schema=./schema/training_config.schema.json
 
@@ -33,8 +36,8 @@ data:
 adapter:
   # Directly-trainable single full H×H matrix cross-stream (not LoRA, one matmul).
   # The cross_stream value below is required by the schema but does NOT shape the
-  # (always H×H) matrix — provenance only. Single-tap only (mutually exclusive
-  # with multi-tap).
+  # (always H×H) matrix — provenance only. Scalar form: applies to every built
+  # cross-stream tap, which here is just the default one.
   cross_stream_type: linear
   target_modules:
     q_proj: 32

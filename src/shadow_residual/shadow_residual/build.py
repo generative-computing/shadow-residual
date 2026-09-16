@@ -15,7 +15,8 @@ model for plain inference — no adapters involved.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Sequence
+from collections.abc import Mapping
+from typing import Any, Optional, Sequence
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -23,7 +24,11 @@ from transformers import AutoModelForCausalLM
 from .model_config import ShadowResidualConfig
 from . import ShadowResidualForCausalLM
 from .config_helpers import set_shadow_residual
-from .cross_stream import DEFAULT_CROSS_STREAM_TAPS
+from .cross_stream import (
+    DEFAULT_CROSS_STREAM_TAPS,
+    is_cross_stream_tap,
+    normalize_cross_stream_tap_types,
+)
 from .weight_transfer import transfer_base_weights
 
 logger = logging.getLogger(__name__)
@@ -36,7 +41,8 @@ def build_sr_config(
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
     cross_stream_taps: Optional[Sequence[str]] = None,
-    cross_stream_type: str = "lora",
+    cross_stream_tap_types: Optional[Mapping[str, Any]] = None,
+    cross_stream_type: Optional[str] = None,
     cross_stream_dim: Optional[int] = None,
 ) -> ShadowResidualConfig:
     """Build the SR config by reading the upstream HF config (no weights).
@@ -99,26 +105,31 @@ def build_sr_config(
         if cross_stream_taps is not None
         else list(DEFAULT_CROSS_STREAM_TAPS)
     )
+    # Cross-stream layer TYPE per tap — the second, ORTHOGONAL axis (the tap NAME is
+    # the wiring). STRUCTURAL: it decides which module the decoder builds at each
+    # site (CrossStream for "lora", a trainable full-H×H CrossStreamLinear for
+    # "linear", a full-rank MonarchCrossStream for "monarch"), so the base tree must
+    # be built the way it was trained BEFORE PEFT attaches — otherwise
+    # from_pretrained can't bind the saved cross-stream weights. Unlike
+    # share_moe_routing, a non-lora tap's weights ARE saved in the adapter (via PEFT
+    # modules_to_save), and the serving path recovers type + numeric parameter from
+    # those saved tensor SHAPES (see
+    # training.generation_utils.read_cross_stream_tap_types_from_adapter).
+    #
+    # Normalized here (and set BEFORE set_shadow_residual so validation covers it)
+    # from either the per-tap map or the legacy scalar cross_stream_type /
+    # cross_stream_dim pair. Set on every rank so the FSDP meta-init tree is
+    # identical.
+    sr_config.cross_stream_tap_types = normalize_cross_stream_tap_types(
+        sr_config.cross_stream_taps,
+        cross_stream_tap_types if cross_stream_tap_types is not None else cross_stream_type,
+        cross_stream_dim,
+    )
     set_shadow_residual(sr_config, enabled=True)
     # MoE-only routing mode (no-op on dense bases). Not serialized — it is a
     # forward-path choice, not a weight, so a saved adapter carries no record of
     # it; train and serve must pass the same value (see build_sr_base).
     sr_config.share_moe_routing = bool(share_moe_routing)
-    # Cross-stream (w-cross) layer type. STRUCTURAL: it decides which module the
-    # decoder builds at the cross_stream site (CrossStream for "lora", a trainable
-    # full-H×H CrossStreamLinear for "linear"), so the base tree must be built the
-    # same way it was trained BEFORE PEFT attaches — otherwise from_pretrained
-    # can't bind the saved cross-stream weight. Unlike share_moe_routing, the
-    # "linear" type's weight IS saved in the adapter (via PEFT modules_to_save);
-    # train.py records the type (+ the provenance dim) into adapter_config.json and
-    # the serving path reads them back (see training.generation_utils.
-    # read_cross_stream_type_from_adapter) to rebuild a matching base. cross_stream_dim
-    # is provenance only — it does NOT shape the always-H×H matrix. Set on every
-    # rank so the FSDP meta-init tree is identical.
-    sr_config.cross_stream_type = str(cross_stream_type)
-    sr_config.cross_stream_dim = (
-        int(cross_stream_dim) if cross_stream_dim is not None else None
-    )
     if torch_dtype is not None:
         sr_config.torch_dtype = torch_dtype
     if attn_implementation is not None:
@@ -133,7 +144,8 @@ def build_sr_base(
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
     cross_stream_taps: Optional[Sequence[str]] = None,
-    cross_stream_type: str = "lora",
+    cross_stream_tap_types: Optional[Mapping[str, Any]] = None,
+    cross_stream_type: Optional[str] = None,
     cross_stream_dim: Optional[int] = None,
 ) -> ShadowResidualForCausalLM:
     """Single-process SR base build (no FSDP / meta machinery).
@@ -157,19 +169,22 @@ def build_sr_base(
 
     ``cross_stream_taps`` selects which cross-stream sites the decoder builds
     (names from :data:`cross_stream.CROSS_STREAM_TAPS`); ``None`` → the historical
-    single post-MLP ``cross_stream`` tap. ``cross_stream_type`` /
-    ``cross_stream_dim`` select WHAT KIND of module sits at the site — ``"lora"``
-    (frozen H×H, LoRA-wrapped) or ``"linear"`` (directly-trainable single full
-    ``H×H`` matrix, single ``cross_stream`` tap only — mutually exclusive with
-    multi-tap; ``cross_stream_dim`` is recorded for provenance but does not shape
-    the always-H×H matrix). All of these MUST match what the adapter was trained with, or
-    ``PeftModel.from_pretrained`` finds no matching module to bind the saved
+    single post-MLP ``cross_stream`` tap. ``cross_stream_tap_types`` selects WHAT
+    KIND of module sits at each site — the orthogonal TYPE axis, a
+    ``{tap -> "lora" | "linear" | "monarch"}`` or ``{tap -> {"type", "num"}}`` map
+    (``"lora"``: frozen H×H, LoRA-wrapped; ``"linear"``: directly-trainable full
+    ``H×H``, ``num`` is provenance only; ``"monarch"``: full-rank two-factor
+    butterfly, ``num`` is the block count ``b``). The legacy scalar
+    ``cross_stream_type`` / ``cross_stream_dim`` pair is still accepted and applies
+    to every built tap. All of these MUST match what the adapter was trained with,
+    or ``PeftModel.from_pretrained`` finds no matching module to bind the saved
     tensors to. Source them from the adapter itself via
     :func:`shadow_residual.training.generation_utils.read_cross_stream_taps_from_adapter`
     and
-    :func:`shadow_residual.training.generation_utils.read_cross_stream_type_from_adapter`
+    :func:`shadow_residual.training.generation_utils.read_cross_stream_tap_types_from_adapter`
     — the saved ``adapter_config.json`` records the taps (in ``target_modules`` /
-    ``modules_to_save``), the type, and the dim.
+    ``modules_to_save``) and the saved tensor SHAPES identify each non-lora tap's
+    type and numeric parameter.
     """
     sr_config = build_sr_config(
         base_model_name_or_path,
@@ -177,6 +192,7 @@ def build_sr_base(
         attn_implementation=attn_implementation,
         share_moe_routing=share_moe_routing,
         cross_stream_taps=cross_stream_taps,
+        cross_stream_tap_types=cross_stream_tap_types,
         cross_stream_type=cross_stream_type,
         cross_stream_dim=cross_stream_dim,
     )
@@ -256,11 +272,22 @@ def diagnose_materialized(model) -> None:
     for name, why in nonfinite[:60]:
         logger.info("[SR-DIAG]   NONFINITE %-70s %s", name, why)
     logger.info(
-        "[SR-DIAG] all-zero tensors: %d (expected: lora_B.*, biases; "
-        "suspicious: any weight/norm/embedding).", len(allzero),
+        "[SR-DIAG] all-zero tensors: %d (expected: lora_B.*, biases, and every "
+        "cross-stream tap's zero-init output factor; suspicious: any other "
+        "weight/norm/embedding).", len(allzero),
     )
+    # Every cross-stream tap type starts as an exact ZERO injection, so a tensor
+    # under a tap is legitimately all-zero post-materialize: the frozen H×H weight
+    # for "lora", `proj.weight` for "linear", `f_out` for "monarch". `f_in` is the
+    # one exception (per-block Kaiming), so it stays in the suspicious set.
     for name, why in allzero[:60]:
-        suspicious = not ("lora_B" in name or name.endswith(".bias"))
+        parts = name.split(".")
+        under_tap = any(is_cross_stream_tap(p) for p in parts)
+        suspicious = not (
+            "lora_B" in name
+            or name.endswith(".bias")
+            or (under_tap and not name.endswith(".f_in"))
+        )
         logger.info("[SR-DIAG]   %s %-66s %s",
                     "SUSPECT-ZERO" if suspicious else "ok-zero", name, why)
 

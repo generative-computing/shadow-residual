@@ -21,9 +21,10 @@ adapter destination) pair — `cross_stream` = post-MLP → post-MLP (the defaul
 the legacy name kept for back-compat), `cross_stream_post_attn` = post-attention →
 post-attention, plus the two cross-position wirings
 `cross_stream_pre_attn_to_post_mlp` and `cross_stream_post_mlp_to_pre_attn`. The
-taps *built* on the model are **derived from `target_modules`** (an untargeted tap
-is a frozen-zero no-op, so building one is pure dead weight); there is no separate
-config field. A tap whose destination *precedes* its source (only
+taps *built* on the model are **derived from the PEFT selections** — the
+`cross_stream*` names in the union of `target_modules` and `modules_to_save` (an
+unselected tap is a frozen-zero no-op, so building one is pure dead weight); there
+is no separate config field. A tap whose destination *precedes* its source (only
 `cross_stream_post_mlp_to_pre_attn` today) makes the decoder select
 `_forward_base_ahead` — the base stream's whole layer runs before the adapter's —
 decided once at construction so it is identical on every FSDP rank. It is
@@ -33,6 +34,25 @@ bit-for-bit. Each tap costs a frozen, permanently-zero `H×H` per layer. For
 parameter-aligned ablations `adapter.alpha` accepts a per-module dict (→ PEFT
 `alpha_pattern`) over exactly the `target_modules` keys, so `alpha/r` can be held
 constant while rank varies. See §1.4b of the explainer.
+
+**Taps also vary along a layer-TYPE axis, orthogonal to the wiring.** The tap
+*name* is the wiring; `adapter.cross_stream_type` is what the tap computes —
+scalar (every built tap) or a per-tap dict (so one model can mix types).
+`"lora"` (default) is the frozen-zero `nn.Linear` above, selected via
+`target_modules`; `"linear"` (a directly-trainable full `H×H`) and `"monarch"` (a
+two-factor block-diagonal butterfly — **full rank** at `H·(b + H/b)` params)
+cannot be LoRA targets, so they route to PEFT's `modules_to_save` and train
+through a `ModulesToSaveWrapper`. That wrapper is a switch, not a sum: its frozen
+original is the zero-output twin, so **invariant 3 holds for every type**. A tap's
+`target_modules` entry carries its numeric parameter and the meaning is
+type-dependent (LoRA rank `r` / provenance only / block count `b`), which is why
+the dict form is required for any non-lora type; `alpha` covers LoRA targets only.
+At `H=2560`, `b=40` → 266,240/layer, exactly LoRA `r=52` — and that is a **floor**,
+so parity with an `r=32` arm is unreachable. Any type works at any wiring, and a
+tap may not appear in both PEFT lists. At serve time the type and `b` are recovered
+from the saved tensor **shapes** (`generation_utils.read_cross_stream_tap_types_from_adapter`),
+not `adapter_config.json` — that file only gets the SR extras at the final save.
+See §1.4c of the explainer.
 
 **Single topology: shared base-only K/V.** K and V are computed once from the
 base stream and shared with both streams' Q; there is one KV cache. LoRA on
@@ -47,7 +67,7 @@ src/shadow_residual/
 │   ├── modeling_hf.py          ShadowResidualModel / ForCausalLM; dual-stream vs bare gate
 │   ├── decoder_hf.py           GradientCheckpointingLayer; dual-stream forward + forward_bare
 │   ├── attention_hf.py         shared-base-K/V attention (+ forward_bare)
-│   ├── cross_stream.py         frozen zero-init nn.Linear cross-stream site
+│   ├── cross_stream.py         cross-stream tap registry (wiring) + the 3 layer types
 │   ├── model_config.py         vendored ShadowResidualConfig
 │   ├── config_helpers.py       validate / set_shadow_residual
 │   ├── build.py                SR config/model construction + RoPE reinit (no PEFT)

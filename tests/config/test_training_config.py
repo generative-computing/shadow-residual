@@ -180,29 +180,34 @@ def test_cross_stream_type_linear_requires_cross_stream_entry():
 def test_cross_stream_type_unknown_rejected():
     with pytest.raises(ValidationError):
         TrainingConfig.model_validate(_minimal(adapter={
-            "cross_stream_type": "monarch",
+            "cross_stream_type": "butterfly",
             "target_modules": {"q_proj": 32, "cross_stream": 8},
         }))
 
 
-def test_cross_stream_type_linear_rejects_extra_tap():
-    """linear is mutually exclusive with the multi-tap registry: an ADDITIONAL
-    cross_stream* tap alongside the default cross_stream must be rejected."""
-    with pytest.raises(ValidationError, match="single default 'cross_stream' tap"):
-        TrainingConfig.model_validate(_minimal(adapter={
-            "cross_stream_type": "linear",
-            "target_modules": {"q_proj": 32, "cross_stream": 8, "cross_stream_post_attn": 8},
-        }))
+def test_cross_stream_type_accepts_extra_tap():
+    """The TYPE axis is orthogonal to the WIRING axis: a non-lora type at the
+    default tap alongside an ADDITIONAL cross_stream* tap is legal, and each tap
+    gets its own type (taps omitted from a dict default to 'lora')."""
+    cfg = TrainingConfig.model_validate(_minimal(adapter={
+        "cross_stream_type": {"cross_stream": "linear"},
+        "target_modules": {"q_proj": 32, "cross_stream": 8, "cross_stream_post_attn": 8},
+    }))
+    assert cfg.adapter.non_lora_cross_stream_taps() == ["cross_stream"]
+    assert cfg.adapter.cross_stream_type_for("cross_stream_post_attn") == "lora"
 
 
-def test_cross_stream_type_linear_rejects_non_default_tap():
-    """linear at a NON-default tap (without the default cross_stream) is rejected —
-    linear is only supported at the single default cross_stream site."""
-    with pytest.raises(ValidationError, match="single default 'cross_stream' tap"):
-        TrainingConfig.model_validate(_minimal(adapter={
-            "cross_stream_type": "linear",
-            "target_modules": {"q_proj": 32, "cross_stream_post_attn": 8},
-        }))
+def test_cross_stream_type_accepts_non_default_tap():
+    """A non-lora type at a NON-default tap, with no default cross_stream at all —
+    every type is supported at every wiring."""
+    cfg = TrainingConfig.model_validate(_minimal(adapter={
+        "cross_stream_type": "monarch",
+        "target_modules": {"q_proj": 32, "cross_stream_post_attn": 40},
+    }))
+    assert cfg.adapter.non_lora_cross_stream_taps() == ["cross_stream_post_attn"]
+    assert cfg.adapter.cross_stream_tap_types_map() == {
+        "cross_stream_post_attn": {"type": "monarch", "num": 40},
+    }
 
 
 def test_target_modules_negative_rank_rejected():

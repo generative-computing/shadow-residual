@@ -576,31 +576,26 @@ def run_generation_under_fsdp(
         logger.info("[FSDP-generate] rebuilding non-FSDP SR+PEFT model on rank 0 (meta init)...")
         # The rebuilt module tree must carry the SAME cross-stream topology the
         # trained model had — both WHICH sites (taps) and WHAT KIND of module
-        # (type + dim) — or the gathered cross-stream tensors land in
+        # (the per-tap type) — or the gathered cross-stream tensors land in
         # load_state_dict's `missing` list and the taps silently stay zero. Derive
         # taps from the in-memory peft_config (union of target_modules and
-        # modules_to_save, same rule training.factory uses); the type + dim come
-        # from the training config (this runs pre-save). Linear is single-tap-only,
-        # so its d is the one `cross_stream` entry.
+        # modules_to_save, same rule training.factory uses); the per-tap types come
+        # from the training config, since this runs pre-save (the saved-shape reader
+        # in generation_utils has no file to read yet).
         from shadow_residual.shadow_residual.cross_stream import (
             cross_stream_taps_from_target_modules,
         )
 
-        _tap_sources = list(peft_config.target_modules or [])
-        _tap_sources += list(getattr(peft_config, "modules_to_save", None) or [])
-        _cs_dim = (
-            cfg.adapter.target_modules["cross_stream"]
-            if cfg.adapter.cross_stream_type == "linear"
-            else None
-        )
         sr_config = _build_sr_config(
             cfg.model.base,
             torch_dtype=torch.bfloat16,
             attn_implementation=cfg.model.attn_implementation,
             share_moe_routing=cfg.adapter.share_moe_routing,
-            cross_stream_taps=cross_stream_taps_from_target_modules(_tap_sources),
-            cross_stream_type=cfg.adapter.cross_stream_type,
-            cross_stream_dim=_cs_dim,
+            cross_stream_taps=cross_stream_taps_from_target_modules(
+                peft_config.target_modules,
+                getattr(peft_config, "modules_to_save", None),
+            ),
+            cross_stream_tap_types=cfg.adapter.cross_stream_tap_types_map(),
         )
         rebuilt = _build_sr_peft_model_meta(
             sr_config,
@@ -696,8 +691,8 @@ def main(argv: list[str] | None = None) -> int:
 
     from shadow_residual.shadow_residual.build import build_sr_base
     from shadow_residual.training.generation_utils import (
+        read_cross_stream_tap_types_from_adapter,
         read_cross_stream_taps_from_adapter,
-        read_cross_stream_type_from_adapter,
         read_share_moe_routing_from_adapter,
     )
 
@@ -722,15 +717,18 @@ def main(argv: list[str] | None = None) -> int:
     share_moe_routing = read_share_moe_routing_from_adapter(str(checkpoint_path))
     logger.info("share_moe_routing (from adapter_config.json): %s", share_moe_routing)
     # Build exactly the cross-stream topology the adapter was trained with — WHICH
-    # sites (taps) and WHAT KIND of module (type + dim) — or its saved tensors have
-    # nothing to bind to. Both axes sourced from the saved adapter_config.json.
+    # sites (the taps, from adapter_config.json) and WHAT KIND of module sits at each
+    # (the per-tap type, from the saved tensor SHAPES — which also works on a
+    # mid-training checkpoint-N/, where the config's SR extras were never written).
+    # Get either wrong and the saved tensors have nothing to bind to.
     cross_stream_taps = read_cross_stream_taps_from_adapter(str(checkpoint_path))
-    cross_stream_type, cross_stream_dim = read_cross_stream_type_from_adapter(
+    cross_stream_tap_types = read_cross_stream_tap_types_from_adapter(
         str(checkpoint_path)
     )
     logger.info(
-        "cross_stream_taps=%s type=%s dim=%s (from adapter_config.json)",
-        cross_stream_taps, cross_stream_type, cross_stream_dim,
+        "cross_stream_taps=%s tap_types=%s (taps from adapter_config.json, "
+        "types from the saved tensor shapes; taps absent from tap_types are 'lora')",
+        cross_stream_taps, cross_stream_tap_types,
     )
     base_model = build_sr_base(
         cfg.model.base,
@@ -738,8 +736,7 @@ def main(argv: list[str] | None = None) -> int:
         attn_implementation=cfg.model.attn_implementation,
         share_moe_routing=share_moe_routing,
         cross_stream_taps=cross_stream_taps,
-        cross_stream_type=cross_stream_type,
-        cross_stream_dim=cross_stream_dim,
+        cross_stream_tap_types=cross_stream_tap_types,
     )
     model = PeftModel.from_pretrained(base_model, str(checkpoint_path))
     if torch.cuda.is_available():

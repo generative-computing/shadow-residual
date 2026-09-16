@@ -193,7 +193,7 @@ CROSS_STREAM_POINT_ORDER = {"pre_attn": 0, "post_attn": 1, "post_mlp": 2}
 
 Three rules make this work without a second config field and without any custom PEFT code:
 
-- **The tap set is derived from `target_modules`, not configured separately.** An unwrapped tap is a frozen zero-init `nn.Linear` — a guaranteed no-op — so building one that no LoRA targets would be pure dead weight. Therefore the taps *built* on the model are exactly the `cross_stream*` names present in `target_modules` (`cross_stream_taps_from_target_modules`). One source of truth, nothing to drift, and the saved `adapter_config.json` already records everything the serving path needs to rebuild the same tree (`training/generation_utils.py::read_cross_stream_taps_from_adapter`).
+- **The tap set is derived from the PEFT selections, not configured separately.** An untrained tap is a guaranteed no-op (a frozen zero-init site), so building one nothing selects would be pure dead weight. Therefore the taps *built* on the model are exactly the `cross_stream*` names in the **union** of `target_modules` and `modules_to_save` (`cross_stream_taps_from_target_modules`) — which of the two a name lands in is that tap's layer *type*, the orthogonal axis of §1.4c. A name may not appear in both. One source of truth, nothing to drift, and the saved `adapter_config.json` already records everything the serving path needs to rebuild the same tree (`training/generation_utils.py::read_cross_stream_taps_from_adapter`).
 - **Taps are direct attributes of the decoder layer, in registry order.** Not an `nn.ModuleDict` — that inserts a path segment and would force PEFT to target an ambiguous leaf name. Registry order (rather than, say, set order) gives every rank an identical module insertion order, which the FSDP meta-init path in `training/factory.py` depends on.
 - **Injection is a sum, resolved by destination.** `ShadowResidualDecoderLayer._inject(h_adapt, dst, base_pts)` adds every configured tap whose destination is `dst`, reading its source out of `base_pts` — a `point → tensor` map the forward fills in as the base stream reaches each point. Multiple taps at the same destination simply accumulate. A tap whose source is not yet in `base_pts` raises `KeyError` rather than silently reading the wrong state.
 
@@ -209,9 +209,47 @@ Base-ahead is a **reordering of pure ops**, not extra compute — `ShadowResidua
 
 **Parameter-aligned comparisons.** LoRA scales its delta by `alpha / r`, so an N-tap run at `r/N` is *not* comparable to the 1-tap baseline unless alpha follows: halving rank doubles effective scale. `adapter.alpha` therefore accepts a per-module dict alongside the per-module `target_modules` dict and projects to PEFT's `alpha_pattern`. The schema requires the two dicts to carry **exactly the same key set** — partly so no module silently falls back to the scalar default (the confound), and partly because PEFT's `lora.model._create_and_replace` resolves a *single* `target_name_key` out of `chain(rank_pattern.keys(), alpha_pattern.keys())` and then indexes **both** dicts with it. See `config/sr-qo-mlp-r32-cboth16-sharedkv.yaml` for the aligned two-tap run (`2·(16+16)·H·L == 2·32·H·L`, `alpha/r == 2.0` throughout).
 
+### 1.4c The cross-stream layer type — *what* the tap computes
+
+§1.4b is the **wiring** axis: a tap's *name* fixes which (base source, adapter destination) pair it realizes. Orthogonal to it is the **type** axis: what linear map the tap applies. `adapter.cross_stream_type` selects it, and the two axes compose freely — any type at any wiring, and one model may mix types across taps.
+
+```yaml
+adapter:
+  target_modules: {q_proj: 32, o_proj: 32, gate_proj: 32, up_proj: 32, down_proj: 32,
+                   cross_stream: 40}
+  cross_stream_type: monarch          # scalar → every built cross-stream tap
+  alpha: 64
+```
+```yaml
+  # or per-tap, one dict entry per tap that differs (omitted taps default to "lora")
+  cross_stream_type: {cross_stream: monarch, cross_stream_post_attn: linear}
+```
+
+| type | module | trained via | params / layer (H=2560) |
+|---|---|---|---|
+| `lora` (default) | `CrossStream` — frozen zero `nn.Linear(H, H)` | stock `lora.Linear` in `target_modules` | `2·r·H` (r=32 → 163,840) |
+| `linear` | `CrossStreamLinear` — one trainable `H×H` matmul | `modules_to_save` | `H²` = 6,553,600 |
+| `monarch` | `MonarchCrossStream` — two-factor block-diagonal butterfly | `modules_to_save` | `H·(b + H/b)` (b=40 → 266,240) |
+
+**The mechanism is which PEFT list the name lands in.** A `lora` tap is a real frozen zero-init `nn.Linear`, so stock `lora.Linear` wraps it like any other target and its output is a pure `B·A` injection — no custom LoRA class, no `_register_custom_module`. The other two cannot be LoRA targets at all (a Monarch factor is a 3-D `nn.Parameter`), so they are routed to PEFT's `modules_to_save` and train through a `ModulesToSaveWrapper`. That wrapper is a **switch, not a sum**: it keeps the frozen original alongside the trainable copy, and the original is the zero-output twin — so a bare or `disable_adapter()` model still falls back to an exact no-op and **invariant 3 holds for every type**. `config/adapters.py::to_peft_config` computes the non-lora tap set once and strips it out of `target_modules` / `rank_pattern`, emitting `modules_to_save` in registry order (module insertion order must match on every FSDP rank).
+
+**One numeric channel.** A tap's entry in `target_modules` carries its numeric parameter, and the meaning is **type-dependent**: the LoRA rank `r` for `lora`, provenance only for `linear` (the matrix is always `H×H`), and the block count `b` for `monarch`. That is why the dict form of `target_modules` is required for any non-lora type. `alpha` is a LoRA-only concept — `alpha/r` has no analogue when there is no `r` — so the schema excludes every non-lora tap from both `alpha`'s default and its key-set check.
+
+**Why Monarch.** LoRA's cross-stream delta is hard-capped at rank `r`. A two-factor Monarch (butterfly) product — block-diagonal `f_in: (b, p, p)` → grid transpose → block-diagonal `f_out: (p, b, b)`, with `p = H/b` — is **full rank** with a **full receptive field** for any `b`, at comparable parameter cost. It constrains the sparsity *pattern* instead of the rank: a different hypothesis about what the base→adapter injection needs, not reachable by any LoRA rank. (Dao et al., *Monarch: Expressive Structured Matrices for Efficient and Accurate Training*, ICML 2022. Our form is `f_out · P · f_in`; the paper's canonical `P_out · L · P · R` also applies a trailing output permutation, which we omit — it would only relabel output coordinates, and the consumer of the tap is a learned residual add.)
+
+**The arithmetic.** Params are `H·(b + H/b)`, minimized at `b ≈ √H`. At `H = 2560` (`√H ≈ 50.6`) the bracketing divisors 40 and 64 both give `2560 · 104 = 266,240` per layer — which is *exactly* LoRA's `2·r·H` at **r=52**, so `sr-qo-mlp-r32-c52-sharedkv-g42.yaml` is the parameter-matched control arm. Note this optimum and floor are for **our** `H(b + H/b)` two-factor form; the reference paper's `2H²/b` accounting gives a different curve. 266,240 is a **floor** — no `b` makes a Monarch tap cheaper — so cost parity with an `r=32` arm (163,840) is unreachable, and comparing a Monarch arm against `c32` is confounded by 1.6× the cross-stream parameters. `monarch_param_count` / `monarch_blocks_for_hidden_size` in `cross_stream.py` compute both.
+
+**Initialization.** `f_out` is zero-init (the `lora_B` analogue) so the whole tap is exactly zero at construction; `f_in` carries the initial scale. It gets a **per-block** Kaiming bound, `√3·gain/√p`, computed from the block width `p` rather than the `p²` that `kaiming_uniform_` would infer from a 3-D tensor's trailing dims — a block-diagonal factor's output coordinate sums over only `p` inputs. At `H=2560, b=40` that is 8× the stock value. This matters more here than it would for LoRA because a Monarch tap has **no `α/r` knob**: `f_in`'s variance *is* the tap's effective initial scale. Empirically it is the one lever found so far, and the result is **suggestive, not established** — one seed each, +0.600 pts over the stock 3-D init at p=0.1006 against a Bonferroni bar of 0.0083.
+
+**One marker, three chokepoints.** `CrossStream` subclasses `nn.Linear` (so stock PEFT dispatches it) while the other two subclass `nn.Module`, so the shared supertype is a plain marker mixin, `CrossStreamTap`, not an `nn.Module` base. It exists so that the three places which must treat "a tap of any type" uniformly need one `isinstance` test that also covers types added later: the dual-stream gate `_any_cross_stream_wrapped` (a *bare* tap of any type is a no-op and must not force the dual-stream path — invariant 3), `_init_weights` (HF `post_init` would otherwise randomize a tap), and `factory._materialize_and_transfer` (FSDP `to_empty()` leaves garbage that neither `transfer_base_weights` nor PEFT's LoRA reset touches). Its contract is that `reset_parameters()` restores the site's initial **numerics and nothing else** — never `requires_grad` — so a single walk fixes both halves of a `ModulesToSaveWrapper` without collapsing the frozen/trainable distinction. Adding a fourth type is one class plus one row in the `CROSS_STREAM_TAP_TYPES` dispatch dict; no other file changes.
+
+**Serving recovers the type from tensor shapes.** `training/generation_utils.py::read_cross_stream_tap_types_from_adapter` reads only the safetensors *header*: a 2-D `…proj.weight` under a tap name is `linear`, a 3-D `…f_in` is `monarch` with `b = shape[0]`. Deliberately not from `adapter_config.json` — `train.py` patches the SR extras into that file only at the **final** save, so a mid-training `checkpoint-N/` has none, and shapes cannot disagree with the weights they describe. Recovery is per-tap, so the mixed-type arm round-trips as such.
+
+**Cost side benefit.** A `lora` tap drags a frozen, permanently-zero `H×H` twin (§1.4b, "Cost"). A Monarch tap's dead twin is `H·(b + H/b)` instead — 25× smaller at b=40 — which weakens, but does not remove, the case for eliminating the dead weight before scaling to the full wiring grid.
+
 ### 1.5 Adapter-only early-exit
 
-When no `cross_stream*` tap is in `target_modules`, no `CrossStream` site has been wrapped — the model gate `_any_cross_stream_wrapped(self.layers)` in `modeling_hf.py` returns `False` and the decoder takes a **single-stream path**: only `h_adapt` is computed, with one Q/K/V/O pass per layer under the default `"adapter"` context. Compute is equivalent to plain LoRA on Granite (modulo unfused QKV / gate-up reduction order).
+When no `cross_stream*` tap is in either PEFT selection, no cross-stream site has been wrapped — the model gate `_any_cross_stream_wrapped(self.layers)` in `modeling_hf.py` returns `False` and the decoder takes a **single-stream path**: only `h_adapt` is computed, with one Q/K/V/O pass per layer under the default `"adapter"` context. Compute is equivalent to plain LoRA on Granite (modulo unfused QKV / gate-up reduction order).
 
 ```
    adapter-only early-exit (no cross_stream wrapped)

@@ -14,7 +14,10 @@ This module reproduces that validation as a free function. Call
 
 from typing import Iterable
 
-from shadow_residual.shadow_residual.cross_stream import CROSS_STREAM_TAPS
+from shadow_residual.shadow_residual.cross_stream import (
+    CROSS_STREAM_TAPS,
+    validate_cross_stream_tap_types,
+)
 from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
 
@@ -41,6 +44,11 @@ def validate_shadow_residual_config(config: ShadowResidualConfig) -> None:
       :data:`shadow_residual.shadow_residual.cross_stream.CROSS_STREAM_TAPS`.
       An unknown name would only surface as a ``KeyError`` deep inside the decoder
       forward, so catch it here.
+    - ``cross_stream_tap_types``, when set, must name only registered taps that are
+      actually BUILT (a type for an unbuilt tap has no effect and is almost always a
+      typo), with a known type name, and — for ``"monarch"`` — a block count that
+      divides ``hidden_size``. See
+      :func:`shadow_residual.shadow_residual.cross_stream.validate_cross_stream_tap_types`.
 
     SR uses a single K/V topology (shared base-only K/V), so there is no
     ``shared_base_kv`` toggle to validate.
@@ -77,6 +85,12 @@ def validate_shadow_residual_config(config: ShadowResidualConfig) -> None:
                 f"Unknown cross_stream_taps entries: {unknown}. "
                 f"Valid names: {sorted(CROSS_STREAM_TAPS)}."
             )
+
+    validate_cross_stream_tap_types(
+        int(getattr(config, "hidden_size", 0) or 0),
+        getattr(config, "cross_stream_tap_types", None),
+        taps,
+    )
 
     num_local_experts = int(getattr(config, "num_local_experts", 0) or 0)
     if num_local_experts > 0:

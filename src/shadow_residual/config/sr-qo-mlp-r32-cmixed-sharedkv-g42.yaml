@@ -1,0 +1,104 @@
+# MIXED-TYPE cross-stream arm — proves the two W_cross axes are independent.
+#
+# Not a controlled ablation arm: it varies wiring AND type at once, so it cannot
+# attribute a delta to either. It exists to exercise the full surface end to end —
+# two taps, two different non-LoRA types, one of them at a non-default site —
+# because every earlier arm held one of those fixed. Read the number, but score
+# claims off the single-variable arms.
+#
+# WHAT IS BEING MIXED:
+#   cross_stream            (post-MLP  -> post-MLP)  = monarch, b=40
+#   cross_stream_post_attn  (post-attn -> post-attn) = linear, full H x H
+#
+# Both land in PEFT's `modules_to_save` (neither is a LoRA target), so both train
+# through a ModulesToSaveWrapper whose frozen zero-output twin keeps a bare /
+# disable_adapter() model base-identical. The tap NAME is the wiring; the per-tap
+# `cross_stream_type` dict is the layer type. Taps omitted from that dict default
+# to `lora`, so a dict only has to name the taps that differ.
+#
+# COST (H = 2560, 40 layers) — deliberately NOT parameter-matched to anything:
+#   monarch b=40           :    266,240 / layer  (full rank, min over divisors)
+#   linear (full H x H)    :  6,553,600 / layer  (24.6x the Monarch tap)
+#   total cross-stream     :  6,819,840 / layer  ->  272,793,600 over 40 layers
+# The linear tap dominates by an order of magnitude, which is the other reason
+# this is a surface test rather than a comparison: any delta is mostly "25x more
+# cross-stream parameters", not "mixed types".
+#
+# The `target_modules` entry for each tap carries its numeric parameter, and the
+# meaning is type-dependent — 40 is the Monarch BLOCK COUNT (must divide 2560),
+# while 32 on the linear tap is provenance only: a `linear` tap is always the full
+# H x H matrix and that number does not shape it. `alpha` covers the LoRA targets
+# only; the schema excludes both non-lora taps, since neither has an r to scale.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  # See sr-qo-mlp-r32-c32-sharedkv-g42.yaml — Granite 4.2 is ChatML and the
+  # thinking-OFF assistant opener ends in an empty <think></think> block, so the
+  # marker must include it or the collator supervises the opener itself.
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream: 40            # monarch: the block count b (must divide 2560)
+    cross_stream_post_attn: 32  # linear: provenance only (the matrix is H x H)
+  cross_stream_type:
+    cross_stream: monarch
+    cross_stream_post_attn: linear
+  alpha: 64
+  dropout: 0.05
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4           # 1 GPU * 1 * 32 = effective batch 32
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

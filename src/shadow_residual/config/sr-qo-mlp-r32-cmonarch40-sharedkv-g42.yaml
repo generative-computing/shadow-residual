@@ -1,0 +1,132 @@
+# MONARCH cross-stream arm — the LAYER-TYPE axis of the W_cross ablation.
+#
+# Identical to sr-qo-mlp-r32-c32-sharedkv-g42.yaml except for the cross-stream
+# site, which is realized as a full-rank Monarch layer instead of a frozen-zero
+# CrossStream driven by stock LoRA. Everything else (Q, O, MLP gate/up/down at
+# r=32, alpha 64, shared-base-K/V, data, optimizer, schedule, seed) is held
+# constant, so the only moving part is W_cross's layer type.
+#
+# THE SURFACE. Two orthogonal axes: the tap NAME is the wiring, `cross_stream_type`
+# is the layer type. `cross_stream` stays in `target_modules` — that slot carries
+# the tap's numeric parameter, and for `monarch` it is the block count b, NOT a
+# LoRA rank. The type routes the tap into PEFT's `modules_to_save` (a Monarch
+# factor is a 3-D nn.Parameter and cannot be a LoRA target), so it trains through
+# a ModulesToSaveWrapper. The wrapper keeps a frozen zero-output twin, so a bare /
+# disable_adapter() model is still base-identical. `alpha` covers only the LoRA
+# targets — a Monarch tap has no alpha because there is no r to scale against.
+#
+# WHY MONARCH: LoRA's cross-stream delta is hard-capped at rank r. A two-factor
+# Monarch (butterfly) product is FULL RANK at comparable parameter cost — it
+# constrains the sparsity PATTERN instead of the rank. Different hypothesis about
+# what the base->adapter injection needs; not reachable by any LoRA rank.
+#
+# THE ARITHMETIC (H = 2560 on Granite 4.2 3b, 40 layers):
+#   params per tap = H * (b + H/b), minimized at b ~= sqrt(H) ~= 50.6.
+#   The divisors of 2560 bracketing that are 40 and 64, both giving
+#   2560 * 104 = 266,240 / layer. b=40 is picked arbitrarily between the two.
+#
+#   Monarch b=40 :  266,240 trainable / layer  (10,649,600 over 40 layers)
+#   LoRA   r=52  :  266,240 trainable / layer  -> EXACTLY parameter-matched, and
+#                   that is the control arm: sr-qo-mlp-r32-c52-sharedkv-g42.yaml
+#   LoRA   r=32  :  163,840 trainable / layer  (the existing c32 baseline)
+#
+#   266,240 is a FLOOR: no b makes a Monarch tap cheaper, so cost parity with the
+#   c32 baseline is UNREACHABLE. Comparing this arm against c32 is therefore
+#   CONFOUNDED (1.6x the cross-stream parameters). Score it against the c52
+#   control; c32 is only useful as the previously-published reference point.
+#
+# STATUS: SUGGESTIVE, NOT ESTABLISHED. One seed each (seed 2, 2499 scored rows):
+# monarch b=40 with the per-block f_in init 0.9120 vs the c52 control 0.9036
+# (+0.840 pts, p=0.0139) — but the only single-variable contrast, per-block init
+# vs the stock 3-D kaiming_uniform_ (0.9060), is +0.600 pts at p=0.1006, and
+# Bonferroni over the 6 comparisons run puts the bar at 0.0083. Needs the seed
+# replication before any claim.
+#
+# Side benefit: a Monarch tap's frozen dead twin is 266,240/layer instead of
+# CrossStream's H^2 = 6,553,600 — 25x smaller.
+#
+# OTHER COMBINATIONS. The type axis is fully orthogonal to the wiring axis: any
+# name from cross_stream.CROSS_STREAM_TAPS may carry any type, and a single model
+# may mix types across taps (see sr-qo-mlp-r32-cmixed-sharedkv-g42.yaml). E.g.
+#   target_modules: {..., cross_stream_post_attn: 40}
+#   cross_stream_type: monarch                              # Monarch post-attn
+#
+#   target_modules: {..., cross_stream_post_mlp_to_pre_attn: 40}
+#   cross_stream_type: monarch          # zero-lag wiring (-> _forward_base_ahead)
+# The far end of the type axis, Full Linear, needs no new mechanism at all — the
+# rank field is uncapped, so `cross_stream: 2560` with `alpha: 5120` under the
+# default `lora` type spans every H x H matrix (524M trainable; 2x a dense layer,
+# since B*A is a redundant factorization of one).
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  # See sr-qo-mlp-r32-c32-sharedkv-g42.yaml — Granite 4.2 is ChatML and the
+  # thinking-OFF assistant opener ends in an empty <think></think> block, so the
+  # marker must include it or the collator supervises the opener itself.
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    # NOT a LoRA rank: with cross_stream_type=monarch this is the block count b,
+    # 40 blocks of 64x64. b must divide hidden_size (2560).
+    cross_stream: 40
+  cross_stream_type: monarch
+  # Covers the LoRA targets only — the Monarch tap is excluded by the schema.
+  alpha: 64
+  dropout: 0.05
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4           # 1 GPU * 1 * 32 = effective batch 32
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

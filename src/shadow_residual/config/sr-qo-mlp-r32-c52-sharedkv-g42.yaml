@@ -1,0 +1,100 @@
+# PARAMETER-MATCHED LoRA CONTROL for the Monarch arm.
+#
+# The only difference from sr-qo-mlp-r32-c32-sharedkv-g42.yaml is the cross-stream
+# rank: 32 -> 52, with alpha 104 so that alpha/r == 2.0 exactly as in every other
+# arm of this ablation (a rank change with a fixed alpha would silently change the
+# effective scale too, which is the confound `alpha_pattern` exists to remove).
+#
+# WHY 52. A Monarch cross-stream tap costs H*(b + H/b) parameters; on Granite 4.2
+# 3b (H = 2560) the minimum over divisors of H is 2560 * 104 = 266,240 / layer,
+# hit at b = 40 and b = 64. LoRA costs 2*r*H, so 2*r*2560 = 266,240 gives r = 52.
+# This arm therefore has EXACTLY the same number of trainable cross-stream
+# parameters as sr-qo-mlp-r32-cmonarch40-sharedkv-g42.yaml, 266,240 / layer
+# (10,649,600 over 40 layers). The single remaining difference is what those
+# parameters can express: this arm is capped at rank 52, the Monarch arm is full
+# rank (2560).
+#
+# 266,240 is a FLOOR for Monarch — no b is cheaper — so a control at the c32
+# baseline's 163,840 does not exist. That is why this file exists rather than
+# reusing c32: comparing Monarch against c32 confounds layer type with a 1.6x
+# parameter increase.
+#
+# Note the per-module `alpha` dict form: PEFT resolves a single target_name_key
+# against both rank_pattern and alpha_pattern, so a partial alpha dict
+# mis-resolves silently. The schema enforces that its keys match target_modules
+# exactly, hence all six modules are spelled out.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  # See sr-qo-mlp-r32-c32-sharedkv-g42.yaml — Granite 4.2 is ChatML and the
+  # thinking-OFF assistant opener ends in an empty <think></think> block, so the
+  # marker must include it or the collator supervises the opener itself.
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream: 52
+  alpha:
+    q_proj: 64
+    o_proj: 64
+    gate_proj: 64
+    up_proj: 64
+    down_proj: 64
+    cross_stream: 104        # alpha/r = 2.0, matching every other module and arm
+  dropout: 0.05
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4           # 1 GPU * 1 * 32 = effective batch 32
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

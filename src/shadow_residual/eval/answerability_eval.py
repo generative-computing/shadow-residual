@@ -296,8 +296,8 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
 
     from shadow_residual.shadow_residual.build import build_sr_base
     from shadow_residual.training.generation_utils import (
+        read_cross_stream_tap_types_from_adapter,
         read_cross_stream_taps_from_adapter,
-        read_cross_stream_type_from_adapter,
         read_share_moe_routing_from_adapter,
     )
 
@@ -335,23 +335,23 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
     share_moe_routing = read_share_moe_routing_from_adapter(adapter_path)
     print(f"share_moe_routing (from adapter_config.json): {share_moe_routing}")
     # Build exactly the cross-stream topology the adapter was trained with, or its
-    # saved tensors have nothing to bind to. Two axes, both sourced from the saved
-    # adapter_config.json: WHICH sites (taps) and WHAT KIND of module (type + dim).
+    # saved tensors have nothing to bind to. Two axes: WHICH sites (the taps, from
+    # adapter_config.json) and WHAT KIND of module sits at each (the per-tap type,
+    # from the saved tensor SHAPES — which also works on a mid-training
+    # checkpoint-N/, where the config's SR extras were never written).
     cross_stream_taps = read_cross_stream_taps_from_adapter(adapter_path)
-    cross_stream_type, cross_stream_dim = read_cross_stream_type_from_adapter(
-        adapter_path
-    )
+    cross_stream_tap_types = read_cross_stream_tap_types_from_adapter(adapter_path)
     print(
-        f"cross_stream_taps={cross_stream_taps} type={cross_stream_type} "
-        f"dim={cross_stream_dim} (from adapter_config.json)"
+        f"cross_stream_taps={cross_stream_taps} tap_types={cross_stream_tap_types} "
+        "(taps from adapter_config.json, types from the saved tensor shapes; "
+        "taps absent from tap_types are 'lora')"
     )
     base_model = build_sr_base(
         base_model_name,
         torch_dtype=dtype,
         share_moe_routing=share_moe_routing,
         cross_stream_taps=cross_stream_taps,
-        cross_stream_type=cross_stream_type,
-        cross_stream_dim=cross_stream_dim,
+        cross_stream_tap_types=cross_stream_tap_types,
     )
     model = PeftModel.from_pretrained(base_model, adapter_path)
     model = model.to(device)

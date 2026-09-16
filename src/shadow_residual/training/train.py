@@ -334,22 +334,20 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Loading model %s (param_dtype=%s) ...", cfg.model.base, cfg.model.param_dtype)
     if cfg.model.attn_implementation:
         logger.info("Attention backend: %s", cfg.model.attn_implementation)
-    # The cross-stream provenance dim (for cross_stream_type="linear") is the
-    # `cross_stream` entry of the dict form of target_modules (validated by the
-    # config schema — linear is single-tap-only). It rides on the SR config, not
-    # the LoRA surface, and is recorded for provenance — the "linear" module is a
-    # full H×H matrix whose shape does not depend on this value.
-    cross_stream_dim = None
-    if cfg.adapter.cross_stream_type == "linear":
-        cross_stream_dim = cfg.adapter.target_modules["cross_stream"]
+    # The cross-stream TYPE axis, joined with each tap's numeric parameter (its
+    # `target_modules` entry). STRUCTURAL — it decides which module the SR base
+    # builds at each tapped site, so it rides on the SR config, not the LoRA
+    # surface. The number's meaning is type-dependent: a LoRA rank for "lora",
+    # provenance only for "linear" (the matrix is always H×H), the block count b
+    # for "monarch". Empty dict = every tap defaults to "lora".
+    cross_stream_tap_types = cfg.adapter.cross_stream_tap_types_map()
     model = get_shadow_residual_peft_model(
         base_model_name_or_path=cfg.model.base,
         lora_config=peft_config,
         torch_dtype=model_dtype,
         attn_implementation=cfg.model.attn_implementation,
         share_moe_routing=cfg.adapter.share_moe_routing,
-        cross_stream_type=cfg.adapter.cross_stream_type,
-        cross_stream_dim=cross_stream_dim,
+        cross_stream_tap_types=cross_stream_tap_types,
     )
     model.print_trainable_parameters()
 
@@ -522,23 +520,24 @@ def main(argv: list[str] | None = None) -> int:
                 adapter_cfg["last_token"] = cfg.adapter.last_token
                 adapter_cfg["last_token_id"] = last_token_id
             adapter_cfg["share_moe_routing"] = bool(cfg.adapter.share_moe_routing)
-            # Record the cross-stream (w-cross) layer type + provenance dim so the
-            # serving path can rebuild a matching SR base BEFORE PEFT attaches (the
-            # "linear" module's shapes must exist for from_pretrained to bind its
-            # saved modules_to_save weights). Read back by
-            # generation_utils.read_cross_stream_type_from_adapter.
+            # Record the cross-stream (w-cross) layer TYPE per tap, so the topology
+            # is legible in the saved config. PROVENANCE ONLY: the serving path
+            # recovers each non-lora tap's type and numeric parameter from the saved
+            # tensor SHAPES instead (generation_utils.
+            # read_cross_stream_tap_types_from_adapter), because this patch only runs
+            # at the FINAL save — a mid-training checkpoint-N/ dir has no SR extras.
             adapter_cfg["cross_stream_type"] = cfg.adapter.cross_stream_type
-            if cfg.adapter.cross_stream_type == "linear":
-                adapter_cfg["cross_stream_dim"] = cross_stream_dim
+            if cross_stream_tap_types:
+                adapter_cfg["cross_stream_tap_types"] = cross_stream_tap_types
             with adapter_cfg_path.open("w") as f:
                 _json.dump(adapter_cfg, f, indent=2)
             logger.info(
                 "Patched adapter_config.json with last_context_token=%r "
                 "last_token=%r share_moe_routing=%r cross_stream_type=%r "
-                "cross_stream_dim=%r.",
+                "cross_stream_tap_types=%r.",
                 cfg.adapter.last_context_token, cfg.adapter.last_token,
                 bool(cfg.adapter.share_moe_routing),
-                cfg.adapter.cross_stream_type, cross_stream_dim,
+                cfg.adapter.cross_stream_type, cross_stream_tap_types,
             )
 
     # 9. Post-training generation, gated on the generation block being present.

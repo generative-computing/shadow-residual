@@ -90,22 +90,35 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
     or a dict[name, alpha] over the same keys. Both shapes are projected into
     PEFT's surface: `r`, `lora_alpha`, `target_modules`, and the optional
     `rank_pattern` / `alpha_pattern` overrides.
+
+    `cfg.adapter.cross_stream_type` (scalar or per-tap) decides WHICH PEFT list each
+    cross-stream tap lands in — and that placement is what fixes the tap's layer type
+    on the model: `target_modules` → a frozen-zero `CrossStream` + stock `lora.Linear`;
+    `modules_to_save` → a directly-trainable `CrossStreamLinear` / `MonarchCrossStream`
+    + `ModulesToSaveWrapper`. So a saved `adapter_config.json` records the full
+    topology — wiring (tap names) *and* per-tap type — with no extra field.
     """
     from peft import LoraConfig
 
+    # Imported here (not at module scope) to keep this module importable without
+    # torch, like the rest of its HF/PEFT imports.
+    from shadow_residual.shadow_residual.cross_stream import CROSS_STREAM_TAPS
+
     a = cfg.adapter
 
-    # A "linear" cross-stream is a directly-trainable full H×H matrix, NOT a LoRA
-    # target: PEFT persists it via `modules_to_save` (which wraps the whole
-    # module as trainable and round-trips its weight through save/from_pretrained).
-    # Its `cross_stream` value is not a LoRA rank (and doesn't shape the H×H
-    # matrix), so it must be kept out of the LoRA surface (`r`, `target_modules`,
-    # `rank_pattern`) entirely. Strip the single `cross_stream` site from the LoRA
-    # view up front (linear is single-tap-only — mutually exclusive with the
-    # multi-tap registry, enforced in the config schema) so `r`/rank_pattern are
-    # derived only from genuine LoRA targets.
-    linear_cross_stream = a.cross_stream_type == "linear"
-    modules_to_save: list[str] | None = ["cross_stream"] if linear_cross_stream else None
+    # A non-lora cross-stream tap ("linear" = a directly-trainable full H×H matrix,
+    # "monarch" = a full-rank two-factor butterfly) is NOT a LoRA target: PEFT persists
+    # it via `modules_to_save` (which wraps the whole module as trainable and
+    # round-trips its weights through save/from_pretrained). Its `target_modules` value
+    # is not a LoRA rank — it is a provenance dim or a block count — so it must be kept
+    # out of the LoRA surface (`r`, `target_modules`, `rank_pattern`) entirely. ONE
+    # computation drives all of that, so the type axis composes with any wiring.
+    non_lora_taps = a.non_lora_cross_stream_taps()
+    # Registry order: this list drives PEFT's ModulesToSaveWrapper insertion order,
+    # which the FSDP meta-init path requires to be identical on every rank.
+    modules_to_save: list[str] | None = (
+        [n for n in CROSS_STREAM_TAPS if n in set(non_lora_taps)] or None
+    )
 
     if isinstance(a.target_modules, dict):
         # Per-module: PEFT wants a scalar default in `r` plus a list of
@@ -115,7 +128,7 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
         # avoids surprises if PEFT changes how it merges).
         lora_targets = {
             name: rank for name, rank in a.target_modules.items()
-            if not (linear_cross_stream and name == "cross_stream")
+            if name not in set(non_lora_taps)
         }
         target_names = list(lora_targets.keys())
         r_scalar = min(lora_targets.values()) if lora_targets else 1
@@ -125,8 +138,8 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
         # NOT "all-linear" — that would wrap the forbidden K/V projections
         # (rejected in factory._reject_kv_lora). Listing modules explicitly keeps
         # K/V out and engages the dual-stream forward via "cross_stream".
-        # (The scalar form can't carry a linear cross-stream — the schema
-        # requires the dict form for cross_stream_type="linear".)
+        # (The scalar form can't carry a non-lora cross-stream — the schema requires
+        # the dict form for any cross_stream_type other than "lora".)
         target_names = list(_SR_SCALAR_TARGETS)
         r_scalar = a.target_modules
         rank_pattern = None
