@@ -33,6 +33,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    NonNegativeInt,
     PositiveFloat,
     PositiveInt,
     field_validator,
@@ -166,7 +167,14 @@ class AdapterConfig(_Strict):
     #                                           `alpha_pattern`); requires the
     #                                           dict form of `target_modules` with
     #                                           EXACTLY the same key set.
-    alpha: PositiveInt | dict[str, PositiveInt] | None = None
+    #
+    # Dict values may be 0 (scalar form may not): a per-module alpha of 0 zeroes
+    # that module's LoRA scale (`alpha/r == 0`), so its delta is identically 0 on
+    # the forward AND receives no gradient — the module is pinned at its init. For
+    # a `cross_stream` tap (frozen-zero base), that is a dual-stream run with the
+    # base→adapter injection switched off ("icarus" ablation): the tap stays PEFT-
+    # wrapped so the dual-stream path still engages, but contributes nothing.
+    alpha: PositiveInt | dict[str, NonNegativeInt] | None = None
     dropout: float = Field(0.0, ge=0.0, le=1.0)
     bias: Bias = Bias.NONE
     task_type: Literal["CAUSAL_LM"] = "CAUSAL_LM"
