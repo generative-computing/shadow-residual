@@ -112,9 +112,23 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
         r_scalar = a.target_modules
         rank_pattern = None
 
+    # Per-module alpha projects to PEFT's `alpha_pattern` (same shape as
+    # rank_pattern). The schema guarantees a dict alpha's keys equal
+    # target_modules' keys exactly, which matters: PEFT resolves ONE
+    # `target_name_key` from chain(rank_pattern, alpha_pattern) and indexes BOTH
+    # with it, so key sets that differ would silently mis-resolve. `lora_alpha` is
+    # the scalar fallback — set to the min so an (impossible, per the validator)
+    # unlisted module can't inflate scale; every listed module is in alpha_pattern.
+    if isinstance(a.alpha, dict):
+        alpha_scalar = min(a.alpha.values())
+        alpha_pattern: dict[str, int] | None = dict(a.alpha)
+    else:
+        alpha_scalar = a.alpha
+        alpha_pattern = None
+
     kwargs: dict[str, Any] = dict(
         r=r_scalar,
-        lora_alpha=a.alpha,
+        lora_alpha=alpha_scalar,
         lora_dropout=a.dropout,
         bias=a.bias,
         target_modules=target_names,
@@ -122,6 +136,8 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
     )
     if rank_pattern is not None:
         kwargs["rank_pattern"] = rank_pattern
+    if alpha_pattern is not None:
+        kwargs["alpha_pattern"] = alpha_pattern
 
     return LoraConfig(**kwargs)
 

@@ -95,6 +95,52 @@ def test_target_modules_alpha_explicit_overrides():
     assert cfg.adapter.alpha == 64
 
 
+def test_per_module_alpha_dict_accepted():
+    cfg = TrainingConfig.model_validate(
+        _minimal(adapter={
+            "target_modules": {"q_proj": 48, "o_proj": 48},
+            "alpha": {"q_proj": 64, "o_proj": 32},
+        })
+    )
+    assert cfg.adapter.alpha == {"q_proj": 64, "o_proj": 32}
+
+
+def test_per_module_alpha_allows_zero():
+    # A per-module alpha of 0 zeroes that module's LoRA scale (alpha/r == 0).
+    cfg = TrainingConfig.model_validate(
+        _minimal(adapter={
+            "target_modules": {"q_proj": 48, "cross_stream": 48},
+            "alpha": {"q_proj": 64, "cross_stream": 0},
+        })
+    )
+    assert cfg.adapter.alpha["cross_stream"] == 0
+
+
+def test_scalar_alpha_zero_rejected():
+    # The scalar form stays PositiveInt — only per-module dict values may be 0.
+    with pytest.raises(ValidationError):
+        TrainingConfig.model_validate(
+            _minimal(adapter={"target_modules": 32, "alpha": 0})
+        )
+
+
+def test_per_module_alpha_requires_dict_target_modules():
+    with pytest.raises(ValidationError, match="per-module `alpha` dict requires"):
+        TrainingConfig.model_validate(
+            _minimal(adapter={"target_modules": 32, "alpha": {"q_proj": 64}})
+        )
+
+
+def test_per_module_alpha_key_mismatch_rejected():
+    with pytest.raises(ValidationError, match="must match the `target_modules` keys"):
+        TrainingConfig.model_validate(
+            _minimal(adapter={
+                "target_modules": {"q_proj": 48, "o_proj": 48},
+                "alpha": {"q_proj": 64, "cross_stream": 0},
+            })
+        )
+
+
 def test_target_modules_empty_dict_rejected():
     with pytest.raises(ValidationError, match="cannot be empty"):
         TrainingConfig.model_validate(_minimal(adapter={"target_modules": {}}))
