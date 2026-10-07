@@ -33,6 +33,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    NonNegativeInt,
     PositiveFloat,
     PositiveInt,
     field_validator,
@@ -127,7 +128,20 @@ class AdapterConfig(_Strict):
     # The dict form is concise (no separate `rank` field, no risk of the
     # names-and-ranks lists drifting out of sync).
     target_modules: PositiveInt | dict[str, PositiveInt] = 32
-    alpha: PositiveInt | None = None  # default = 2 * (max) rank when None
+    # LoRA scaling is `alpha / r`, so per-module RANK alone can't hold the
+    # effective scale fixed while rank varies. Two shapes, mirroring
+    # `target_modules`:
+    #   - scalar int (or None → 2 * max rank) → one `lora_alpha` for every module
+    #   - dict[str, int]                      → per-module alpha (PEFT's
+    #                                           `alpha_pattern`); requires the
+    #                                           dict form of `target_modules` with
+    #                                           EXACTLY the same key set.
+    #
+    # Dict values may be 0 (the scalar form may not): a per-module alpha of 0
+    # zeroes that module's LoRA scale (`alpha/r == 0`), so its delta is identically
+    # 0 on the forward AND receives no gradient — the module is pinned at its init.
+    # (Used e.g. to run a `cross_stream` tap present-but-silent.)
+    alpha: PositiveInt | dict[str, NonNegativeInt] | None = None
     dropout: float = Field(0.0, ge=0.0, le=1.0)
     bias: Bias = Bias.NONE
     task_type: Literal["CAUSAL_LM"] = "CAUSAL_LM"
@@ -165,6 +179,34 @@ class AdapterConfig(_Strict):
             r = self.target_modules
             max_rank = r if isinstance(r, int) else max(r.values())
             self.alpha = 2 * max_rank
+        return self
+
+    @model_validator(mode="after")
+    def _validate_alpha_keys(self):
+        # A dict `alpha` is only meaningful alongside a dict `target_modules`, and
+        # it must cover EVERY targeted module. Rationale: PEFT resolves a single
+        # `target_name_key` from chain(rank_pattern, alpha_pattern) and looks up
+        # BOTH dicts with it, so a partial alpha_pattern mis-resolves silently.
+        # Beyond that, an omitted module falling back to the scalar default is
+        # exactly the uncontrolled scale change a parameter-aligned ablation is
+        # trying to eliminate — so require the key sets to match exactly.
+        if not isinstance(self.alpha, dict):
+            return self
+        if not isinstance(self.target_modules, dict):
+            raise ValueError(
+                "a per-module `alpha` dict requires the dict form of "
+                "`target_modules` (per-module alpha has no meaning without "
+                "per-module names/ranks)"
+            )
+        alpha_keys = set(self.alpha)
+        target_keys = set(self.target_modules)
+        if alpha_keys != target_keys:
+            missing = sorted(target_keys - alpha_keys)
+            extra = sorted(alpha_keys - target_keys)
+            raise ValueError(
+                "`alpha` dict keys must match the `target_modules` keys exactly; "
+                f"missing={missing} unexpected={extra}"
+            )
         return self
 
 
