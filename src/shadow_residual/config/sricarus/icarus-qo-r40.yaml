@@ -1,0 +1,68 @@
+# SR-vs-Icarus bug-hunt matrix — arm: Icarus, rank 40.
+#
+# Dual-stream SR with cross_stream injection OFF (alpha=0), rank 40. q/o at
+# rank 40, alpha 64 (scaling 1.6) — identical to sr-qo-r40's q/o. Matched SR arm is
+# sr-qo-r40. See icarus-qo-r16.yaml header for the full rationale.
+
+model:
+  base: ibm-granite/granite-4.1-3b
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${EVAL_DATA}
+  max_length: 4096
+
+adapter:
+  target_modules:
+    q_proj: 40
+    o_proj: 40
+    cross_stream: 40
+  alpha:
+    q_proj: 64
+    o_proj: 64
+    cross_stream: 0
+  dropout: 0.05
+  last_context_token: "<|end_of_role|>"
+  last_token: "<|end_of_text|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 1
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [tensorboard]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

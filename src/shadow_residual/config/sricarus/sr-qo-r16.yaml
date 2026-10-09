@@ -1,0 +1,72 @@
+# SR-vs-Icarus bug-hunt matrix — arm: SR, rank 16.
+#
+# True Shadow Residual: dual-stream (frozen base + adapter), shared base-only K/V,
+# with the cross_stream (W-cross) injection LIVE. cross_stream in target_modules
+# engages the dual-stream SR forward; scalar alpha=64 gives every wrapped module
+# (q_proj, o_proj, cross_stream) the SAME scaling alpha/r = 64/16 = 4.0, so the
+# base->adapter injection fires each layer.
+#
+# The ONLY difference from the matched Icarus arm (sr-qo-r16 vs icarus-qo-r16) is
+# the cross_stream alpha: here it is 64 (live), there it is 0 (pinned off).
+# q_proj/o_proj rank+alpha are identical across the two arms at a given rank, so
+# the comparison isolates the W-cross injection.
+
+model:
+  base: ibm-granite/granite-4.1-3b
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${EVAL_DATA}
+  max_length: 4096
+
+adapter:
+  target_modules:
+    q_proj: 16
+    o_proj: 16
+    cross_stream: 16
+  alpha: 64
+  dropout: 0.05
+  last_context_token: "<|end_of_role|>"
+  last_token: "<|end_of_text|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 1
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [tensorboard]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl

@@ -1,0 +1,78 @@
+# SR-vs-Icarus bug-hunt matrix — arm: Icarus, rank 16.
+#
+# Icarus == dual-stream SR with the cross_stream (W-cross) injection switched OFF.
+# cross_stream STAYS in target_modules so the tap is PEFT-wrapped and the
+# dual-stream SR forward engages (frozen base stream + adapter stream, shared
+# base-only K/V) EXACTLY like the sr-qo arm. The only difference is the per-module
+# alpha: cross_stream alpha=0 pins its LoRA scale (alpha/r) at 0, so W_cross(h_base)
+# is identically zero on the forward AND receives no gradient — the base->adapter
+# injection contributes nothing and never learns.
+#
+# q_proj/o_proj: rank 16, alpha 64 (scaling 64/16 = 4.0) — IDENTICAL to sr-qo-r16's
+# q/o. So sr-qo-r16 vs icarus-qo-r16 differ ONLY in whether W_cross is live.
+# (The cross_stream tap carries dead r16 LoRA params pinned at zero-init — accepted
+# cost of the alpha=0 mechanism; it does not affect forward numerics, only the saved
+# param count.)
+
+model:
+  base: ibm-granite/granite-4.1-3b
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${EVAL_DATA}
+  max_length: 4096
+
+adapter:
+  target_modules:
+    q_proj: 16
+    o_proj: 16
+    cross_stream: 16
+  alpha:
+    q_proj: 64
+    o_proj: 64
+    cross_stream: 0
+  dropout: 0.05
+  last_context_token: "<|end_of_role|>"
+  last_token: "<|end_of_text|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 1
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [tensorboard]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl
