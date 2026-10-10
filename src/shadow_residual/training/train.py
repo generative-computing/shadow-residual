@@ -279,6 +279,12 @@ def main(argv: list[str] | None = None) -> int:
             "--quantize (4-bit QLoRA via bitsandbytes) is not currently "
             "supported on the shadow-residual + PEFT training path."
         )
+
+    # Opt-in chunked cross-entropy (SR_CHUNKED_CE=1): bounds the full-vocab softmax
+    # memory for tasks with long untruncated rows (is-vulnerable OOM'd at 21.67 GiB
+    # on a ~37k-token row x 100k vocab). No-op unless the env flag is set.
+    from shadow_residual.training._chunked_ce import maybe_patch_fixed_cross_entropy
+    maybe_patch_fixed_cross_entropy()
     cfg = load_training_config(args.config)
     apply_cli_overrides(cfg, args)
 
