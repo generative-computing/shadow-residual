@@ -1,0 +1,76 @@
+# SR-vs-Icarus bug-hunt matrix — PARAMETER-MATCHED control: Icarus, rank 24.
+#
+# Icarus (dual-stream SR, cross_stream injection OFF via alpha=0) at q/o rank 24.
+# Learned-param budget (q+o only, cross dead): 24·2·H·L = 9,830,400 — EXACTLY equal
+# to SR r16's q+o+cross_stream budget (16·3·H·L). So icarus-qo-r24 vs sr-qo-r16 is a
+# clean parameter-matched A/B: same number of effectively-learned params, the only
+# difference being WHERE they live (Icarus: more q/o rank, no cross; SR: less q/o
+# rank + a live W-cross). Isolates "does the W-cross base->adapter path earn its
+# parameters" from "does Icarus simply have fewer params".
+#
+# cross_stream stays in target_modules (dual-stream SR forward engages, shared
+# base-only K/V) with alpha=0 — its r24 LoRA is dead (pinned at zero-init, no
+# gradient), so it does not count toward learned params.
+
+model:
+  base: ibm-granite/granite-4.1-3b
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${EVAL_DATA}
+  max_length: 4096
+
+adapter:
+  target_modules:
+    q_proj: 24
+    o_proj: 24
+    cross_stream: 24
+  alpha:
+    q_proj: 64
+    o_proj: 64
+    cross_stream: 0
+  dropout: 0.05
+  last_context_token: "<|end_of_role|>"
+  last_token: "<|end_of_text|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 1
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [tensorboard]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl
