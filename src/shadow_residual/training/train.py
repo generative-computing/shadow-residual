@@ -76,6 +76,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Set data.instruction_as_user_message=True — inject RAG documents "
                         "before the first assistant turn (judge/guardian data) instead of "
                         "after the last user turn. ChatML (Granite 4.2/5.0) only.")
+    p.add_argument("--cross-lr", type=float, default=None,
+                   help="Separate learning rate for cross_stream (W-cross) LoRA params. When set, "
+                        "builds a two-group optimizer: cross_stream params at --cross-lr, all other "
+                        "trainable params at the base learning_rate. Diagnostic for the SR-overfit "
+                        "hypothesis (regularize W-cross with a lower LR, or probe with a higher one).")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", action="store_true",
                    help="Periodically log a decoded training example + labels from the collator. "
@@ -433,6 +438,35 @@ def main(argv: list[str] | None = None) -> int:
 
     sft_args = SFTConfig(**_filter_to_sftconfig_fields(sft_kwargs))
 
+    # 6b. Optional per-module LR for cross_stream (W-cross). Default None → single
+    # LR as before. When --cross-lr is set, build a two-group AdamW: cross_stream
+    # trainable params at cross_lr, everything else at the base LR. Diagnostic for
+    # the SR-overfit hypothesis (W-cross capacity hurts generalization at the
+    # shared LR; a lower cross LR regularizes it).
+    optimizers = (None, None)
+    cross_lr = getattr(args, "cross_lr", None)
+    if cross_lr is not None:
+        import torch
+        base_lr = cfg.optimizer.learning_rate
+        cross_params, other_params = [], []
+        for n, pm in model.named_parameters():
+            if not pm.requires_grad:
+                continue
+            (cross_params if "cross_stream" in n else other_params).append(pm)
+        param_groups = [
+            {"params": other_params, "lr": base_lr},
+            {"params": cross_params, "lr": cross_lr},
+        ]
+        optimizer = torch.optim.AdamW(
+            param_groups, lr=base_lr, weight_decay=cfg.optimizer.weight_decay,
+        )
+        optimizers = (optimizer, None)
+        logger.info(
+            "Per-module LR: cross_stream=%g (%d params), base=%g (%d params).",
+            cross_lr, sum(p.numel() for p in cross_params),
+            base_lr, sum(p.numel() for p in other_params),
+        )
+
     # 7. Trainer
     trainer = SFTTrainer(
         model=model,
@@ -442,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
         processing_class=tok,
         data_collator=data_collator,  # None → SFTTrainer uses its default
         callbacks=build_callbacks(cfg),
+        optimizers=optimizers,
     )
 
     # 7a. last_context_token boundary check — fail loudly unless the supervised
