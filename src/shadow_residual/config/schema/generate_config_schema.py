@@ -5,8 +5,8 @@ The reference YAMLs point editors at this schema
 (``# yaml-language-server: $schema=./schema/training_config.schema.json``), so it
 must match the pydantic model that actually validates configs.
 
-    python scripts/generate_config_schema.py          # rewrite the schema
-    python scripts/generate_config_schema.py --check  # exit 1 if it is stale
+    python src/shadow_residual/config/schema/generate_config_schema.py          # rewrite the schema
+    python src/shadow_residual/config/schema/generate_config_schema.py --check  # exit 1 if it is stale
 """
 
 from __future__ import annotations
@@ -18,10 +18,7 @@ from pathlib import Path
 
 from shadow_residual.config import TrainingConfig
 
-SCHEMA_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "src/shadow_residual/config/schema/training_config.schema.json"
-)
+SCHEMA_PATH = Path(__file__).resolve().with_name("training_config.schema.json")
 
 
 def render() -> str:
@@ -35,7 +32,7 @@ def main() -> int:
     text = render()
     if args.check:
         if SCHEMA_PATH.read_text() != text:
-            print(f"{SCHEMA_PATH} is stale; run: python scripts/generate_config_schema.py", file=sys.stderr)
+            print(f"{SCHEMA_PATH} is stale; run: python src/shadow_residual/config/schema/generate_config_schema.py", file=sys.stderr)
             return 1
         return 0
     SCHEMA_PATH.write_text(text)
