@@ -1,0 +1,72 @@
+# SR r16 full-epoch-curve variant: run all 6 epochs, SAVE EVERY epoch, NO early stop.
+#
+# For WTQ + answerability, which stopped prematurely at ep2 in the early-stop run
+# while eval_loss was still decreasing. Here we force all 6 epochs and keep every
+# epoch's checkpoint (save.total_limit high) so we can generate+score each epoch on
+# the 10% held-out split and build a TRUE per-epoch held-out ACCURACY curve — the
+# thing the eval_loss-only early-stop run couldn't give.
+#
+# W-cross LR still gentle via CLI --cross-lr 2e-5. val_path = ${EARLYSTOP_VAL} (10%
+# held-out) so per-epoch eval_loss is still logged for reference; generation.input_path
+# = ${EVAL_DATA} (original) for the final number. load_best_model_at_end=false +
+# early_stopping disabled so nothing truncates the run.
+
+model:
+  base: ibm-granite/granite-4.1-3b
+
+data:
+  train_path: ${DATA_ROOT}/train_90.jsonl
+  val_path:   ${EARLYSTOP_VAL}
+  max_length: 4096
+
+adapter:
+  target_modules:
+    q_proj: 16
+    o_proj: 16
+    cross_stream: 16
+  alpha: 64
+  dropout: 0.05
+  last_context_token: "<|end_of_role|>"
+  last_token: "<|end_of_text|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false   # keep natural last; we score every epoch ourselves
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: null   # NO early stop — run all 6 epochs
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 6                  # keep ALL 6 epoch checkpoints for the curve
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 6
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [tensorboard]
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 16
+  output_filename: predictions.jsonl
