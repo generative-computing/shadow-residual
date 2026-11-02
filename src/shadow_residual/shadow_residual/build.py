@@ -71,7 +71,7 @@ def build_sr_config(
     # randomly initialized, hidden states blew up 78x at layer 0 (see
     # scripts/diagnose_sr_vs_upstream.py output).
     #
-    # MoE bases (Granite 5.0 / granitemoe, num_local_experts > 0) have NO dense
+    # Sparse-MoE bases (num_local_experts > 0) have NO dense
     # shared_mlp — their `intermediate_size` is the *per-expert* FFN width. The
     # SR MLP on such a base is the frozen expert bank (built from num_local_experts
     # + intermediate_size directly, see decoder_hf.ShadowResidualMLP), which never

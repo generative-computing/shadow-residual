@@ -1,4 +1,4 @@
-# CLAUDE.md — working with Shadow Residual
+# CLAUDE.md — Shadow Residual
 
 Operational guide for Claude agents in this repo. Read
 [`docs/sr_architecture_explainer.md`](docs/sr_architecture_explainer.md) for the
