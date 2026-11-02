@@ -34,6 +34,7 @@ dev = ["pytest"]
 [project.scripts]
 sr-train = "shadow_residual.training.train:main"
 sr-generate = "shadow_residual.training.generate:main"
+sr-convert = "shadow_residual.shadow_residual.convert:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

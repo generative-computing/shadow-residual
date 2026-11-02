@@ -187,8 +187,9 @@ A 50-row synthetic file lives at `data_samples/tiny_qa.jsonl`.
   (translates the `target_modules` scalar/dict into PEFT's `r` +
   `target_modules` + `rank_pattern` triple).
 - `shadow_residual.config.adapters.build_callbacks` — early stopping + NaN guard.
-- `shadow_residual.peft_shadow_residual.get_shadow_residual_peft_model` — builds
-  the SR base and PEFT-wraps it.
+- `shadow_residual.training.factory.get_shadow_residual_peft_model` — loads the
+  SR base (an SR checkpoint via `from_pretrained`, or an upstream Granite model
+  converted in memory) and PEFT-wraps it.
 
 ## Tests
 

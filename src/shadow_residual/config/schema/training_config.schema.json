@@ -251,7 +251,7 @@
       "additionalProperties": false,
       "properties": {
         "base": {
-          "description": "HF model ID or local path, e.g. ibm-granite/granite-4.1-3b",
+          "description": "HF model ID or local path: an SR checkpoint (e.g. AlonMal/granite-4.1-3b-sr, made with sr-convert) or an upstream Granite model (e.g. ibm-granite/granite-4.1-3b, converted in memory)",
           "title": "Base",
           "type": "string"
         },

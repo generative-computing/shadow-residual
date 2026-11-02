@@ -40,7 +40,7 @@ def test_examples_validate(monkeypatch, name):
     monkeypatch.setenv("RUN_DIR", "/runs/job1")
     monkeypatch.setenv("EVAL_DATA", "/data/eval.jsonl")
     cfg = load_training_config(EXAMPLES / name)
-    assert cfg.model.base == "ibm-granite/granite-4.1-3b"
+    assert cfg.model.base == "AlonMal/granite-4.1-3b-sr"
     assert cfg.save.output_dir == "/runs/job1/checkpoints"
 
 
