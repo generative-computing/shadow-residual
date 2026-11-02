@@ -51,7 +51,7 @@ class ShadowResidualConfig(GraniteMoeHybridConfig):
     ``layer_types`` is normalized to all-``"attention"`` when absent — SR is an
     attention-only architecture (no SSM / mamba layers).
 
-    MoE (Granite 5.0 / ``granitemoe``) bases carry a nonzero
+    MoE (``granitemoe``) bases carry a nonzero
     ``num_local_experts`` (and ``num_experts_per_tok``). These flow straight
     through ``**kwargs`` to the hybrid parent, which already stores them; SR no
     longer pins ``num_local_experts=0``. When experts are present the SR decoder
@@ -82,7 +82,7 @@ class ShadowResidualConfig(GraniteMoeHybridConfig):
         # requiring the Mamba dims to be self-consistent with hidden_size:
         #   mamba_expand * hidden_size % mamba_n_heads == 0   AND
         #   mamba_d_head * mamba_n_heads == mamba_expand * hidden_size
-        # A `granitemoe` (Granite 5.0) base carries NO mamba fields, so the
+        # A `granitemoe` base carries NO mamba fields, so the
         # parent injects its own large defaults (mamba_n_heads=128, expand=2),
         # which fail the divisibility check for any hidden_size the defaults
         # weren't tuned for (e.g. the tiny test configs, or any non-4096 base).

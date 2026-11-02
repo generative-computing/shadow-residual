@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Granite 5.0 (``granitemoe`` sparse-MoE) support for shadow-residual.
+"""``granitemoe`` (sparse-MoE) support for shadow-residual.
 
 Iteration 1 = **attention-only** adaptation: LoRA on Q/O + ``cross_stream``, the
 sparse expert bank runs **frozen** so the base stream stays bit-identical to the

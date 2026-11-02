@@ -104,7 +104,7 @@ class DataConfig(_Strict):
     # behavior; templates that ignore the kwarg treat it as a no-op. Overridable
     # from the CLI via `--thinking` (CLI wins).
     enable_thinking: bool = False
-    # ChatML (Granite 4.2/5.0) document placement. When RAG `documents` are
+    # ChatML (Granite 4.2) document placement. When RAG `documents` are
     # injected as a tool (search-response) message, this controls where it lands:
     #   - False (default): after the LAST user turn (plain agentic RAG flow).
     #   - True: before the FIRST assistant turn — for judge/guardian data where a
@@ -157,7 +157,7 @@ class AdapterConfig(_Strict):
     # tokenizer is available).
     last_context_token: str | None = None
     last_token: str | None = None
-    # MoE bases (Granite 5.0 / granitemoe) only: when true (the default), the
+    # MoE bases (granitemoe) only: when true (the default), the
     # decoder routes once on the base stream and reuses that expert partition for
     # the adapter stream; set false to route each stream independently. No-op on
     # dense bases. Recorded into the saved adapter_config.json and read back by

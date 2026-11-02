@@ -29,8 +29,8 @@ def validate_shadow_residual_config(config: ShadowResidualConfig) -> None:
       objects for backward compatibility with the vLLM backend and saved
       checkpoints.
     - ``shadow_residual=True`` requires every layer to be of type
-      ``"attention"`` (no SSM / mamba layers). Note: sparse-MoE bases (Granite
-      5.0 / ``granitemoe``, ``num_local_experts > 0``) are attention-only for
+      ``"attention"`` (no SSM / mamba layers). Note: sparse-MoE bases
+      (``granitemoe``, ``num_local_experts > 0``) are attention-only for
       token mixing — the experts are the FFN, not a layer type — so they pass
       this check.
     - When ``num_local_experts > 0``, ``num_experts_per_tok`` must be a positive

@@ -61,7 +61,7 @@ class ShadowResidualMLP(nn.Module):
       runs the wrapped projections (adapter stream, LoRA delta fires);
       :meth:`forward_base_only` runs the raw base weights (base stream, no delta).
 
-    * **MoE** (``num_local_experts > 0``, Granite 5.0 / ``granitemoe``): a frozen
+    * **MoE** (``num_local_experts > 0``, ``granitemoe``): a frozen
       sparse expert bank mirroring :class:`GraniteMoeMoE` — a top-k router plus two
       :class:`GraniteMoeParallelExperts`. The experts are **not** LoRA targets in
       the attention-only iteration, so they are plain (non-``_StreamGatedLinear``)

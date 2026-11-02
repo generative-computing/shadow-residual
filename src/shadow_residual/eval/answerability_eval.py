@@ -669,7 +669,7 @@ def main():
         action="store_true",
         help="[base/peft] Inject RAG documents before the first assistant turn "
              "(judge/guardian data) instead of after the last user turn. ChatML "
-             "(Granite 4.2/5.0) only. Must match the value used at training time.",
+             "(Granite 4.2) only. Must match the value used at training time.",
     )
     parser.add_argument(
         "--max-new-tokens", type=int, default=30,

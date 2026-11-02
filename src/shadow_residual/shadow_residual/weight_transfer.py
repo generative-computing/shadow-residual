@@ -196,7 +196,7 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
                 n_skipped += 1
             return
 
-        # Sparse-MoE expert bank (Granite 5.0 / granitemoe). Upstream stores the
+        # Sparse-MoE expert bank (granitemoe). Upstream stores the
         # expert weights under `block_sparse_moe.*`; the SR MLP nests the mirrored
         # frozen bank under `.mlp.` (router + input_linear + output_linear, see
         # decoder_hf.ShadowResidualMLP MoE mode). Straight copy_ — no reslice:
