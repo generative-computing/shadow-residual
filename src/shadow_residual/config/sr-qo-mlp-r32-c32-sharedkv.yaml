@@ -8,7 +8,10 @@
 # yaml-language-server: $schema=./schema/training_config.schema.json
 
 model:
-  base: ibm-granite/granite-4.1-3b
+  # Pre-converted SR checkpoint of ibm-granite/granite-4.1-3b (made with
+  # sr-convert), loaded with stock from_pretrained. An upstream Granite id
+  # (e.g. ibm-granite/granite-4.1-3b) also works and is converted in memory.
+  base: AlonMal/granite-4.1-3b-sr
 
 data:
   train_path: ${DATA_ROOT}/train.jsonl

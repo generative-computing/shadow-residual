@@ -279,4 +279,48 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
     )
 
 
-__all__ = ["transfer_base_weights"]
+def copy_sr_weights(src_model, dst_model, *, drain_src: bool = False) -> None:
+    """Copy an SR model's weights into a same-config SR model, strictly by name.
+
+    The fill step for a meta-built (and possibly PEFT-wrapped) SR skeleton when
+    the source is an already-converted SR checkpoint: both sides share the SR
+    layout, so every tensor copies by name with no slicing. ``base_layer``
+    indirection on the destination is stripped and LoRA tensors are skipped.
+    Unlike :func:`transfer_base_weights`, which maps an upstream layout and skips
+    what it can't place, any missing / unexpected key or shape mismatch raises.
+
+    Args:
+        drain_src: when True, each source tensor is unbound from ``src_model``
+            as soon as it is copied, so peak host RAM stays near one model copy.
+            ``src_model`` is unusable afterwards.
+    """
+    dst_state = {
+        key.replace(".base_layer.", "."): val
+        for key, val in dst_model.state_dict().items()
+        if "lora_" not in key
+    }
+    src_state = dict(src_model.state_dict())
+    missing = sorted(set(dst_state) - set(src_state))
+    unexpected = sorted(set(src_state) - set(dst_state))
+    mismatched = sorted(
+        key for key in set(src_state) & set(dst_state)
+        if src_state[key].shape != dst_state[key].shape
+    )
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            "SR weight copy: source and destination layouts differ "
+            f"(missing={missing[:5]}, unexpected={unexpected[:5]}, "
+            f"mismatched={mismatched[:5]})."
+        )
+
+    for key in list(src_state):
+        src_val = src_state.pop(key)
+        with torch.no_grad():
+            dst_state[key].copy_(src_val)
+        if drain_src:
+            _unbind_param(src_model, key)
+        del src_val
+    logger.info("Shadow-residual weight copy from SR checkpoint: copied %d.", len(dst_state))
+
+
+__all__ = ["transfer_base_weights", "copy_sr_weights"]

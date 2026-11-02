@@ -104,12 +104,41 @@ checkpoint's `target_modules` (shared when `cross_stream` is present, else
 disjoint), which is correct for any adapter trained with the auto-default. If the
 adapter was trained with a non-default value, pass the same value explicitly.
 
+## SR base checkpoints
+
+The SR base model can be saved as a regular Hugging Face checkpoint
+(`model_type: "shadow_residual"`): the upstream Granite weights re-laid-out for
+SR, plus the upstream tokenizer and chat template. It loads with stock
+`from_pretrained` — no conversion at load time and no `trust_remote_code`;
+importing `shadow_residual.shadow_residual` registers the model type.
+
+```python
+import shadow_residual.shadow_residual  # registers the SR model type
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("AlonMal/granite-4.1-3b-sr")
+```
+
+With no adapter attached it produces the upstream model's outputs. Convert a base
+once with `sr-convert` (it reloads the result and checks every tensor), and
+optionally push it to the Hub:
+
+```bash
+sr-convert --base ibm-granite/granite-4.1-3b --output ./granite-4.1-3b-sr \
+           --repo-id AlonMal/granite-4.1-3b-sr --push
+```
+
+Anywhere a base id is taken (`model.base` in the training YAML, `build_sr_base`,
+the eval CLI), an upstream Granite id still works: it is converted in memory on
+every load.
+
 ## Training SR adapters
 
 Training is driven by a single Pydantic-validated YAML (the schema does not name
 architectures — behavior follows the fields you set). Reference configs live in
 [`src/shadow_residual/config/`](src/shadow_residual/config/); `sr-*` configs
 enable the dual-stream forward by listing `cross_stream` in `target_modules`.
+The default config trains on the SR checkpoint `AlonMal/granite-4.1-3b-sr`.
 
 ### On the current server
 

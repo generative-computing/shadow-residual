@@ -2,11 +2,19 @@
 """Factory: ``get_shadow_residual_peft_model(base_id, lora_config)``.
 
 Builds a :class:`ShadowResidualForCausalLM` and layers PEFT on top.
-Under FSDP, every rank constructs the SR + PEFT module tree on meta
-with identical traversal order; only rank 0 materializes real CPU
-tensors and loads upstream base weights. ``fsdp_sync_module_states``
-broadcasts rank 0's values to other ranks after sharding — peak host
-RAM is one rank's copy instead of N.
+
+The base is either an **SR checkpoint** (``model_type: "shadow_residual"``,
+converted once with ``sr-convert`` — the default in the reference configs) or an
+**upstream Granite checkpoint** (converted in memory on every load).
+
+- SR checkpoint, single process / DDP: stock ``from_pretrained`` of the SR model,
+  then ``get_peft_model``.
+- Everything else: under FSDP, every rank constructs the SR + PEFT module tree on
+  meta with identical traversal order; only rank 0 materializes real CPU tensors
+  and fills them — by ``from_pretrained`` of the SR checkpoint, or by loading the
+  upstream model and slicing its weights into SR layout.
+  ``fsdp_sync_module_states`` broadcasts rank 0's values to other ranks after
+  sharding — peak host RAM is one rank's copy instead of N.
 
 Whether the dual-stream forward actually runs is a runtime decision made
 by the SR model itself (see ``modeling_hf.py``): if no ``cross_stream``
@@ -40,6 +48,7 @@ from shadow_residual.shadow_residual import (
 )
 from shadow_residual.shadow_residual.cross_stream import CrossStream
 from shadow_residual.shadow_residual.weight_transfer import (
+    copy_sr_weights,
     transfer_base_weights,
 )
 # Model-construction helpers live in the model package (no PEFT dependency);
@@ -48,6 +57,8 @@ from shadow_residual.shadow_residual.weight_transfer import (
 from shadow_residual.shadow_residual.build import (
     build_sr_config as _build_sr_config,
     build_sr_base as _build_sr_base,
+    is_sr_checkpoint as _is_sr_checkpoint,
+    load_sr_checkpoint as _load_sr_checkpoint,
     reinit_rope_buffers as _reinit_rope_buffers,
     to_dtype_keep_rope_fp32 as _to_dtype_keep_rope_fp32,
     diagnose_materialized as _diagnose_materialized,
@@ -65,6 +76,8 @@ def _materialize_and_transfer(
     *,
     torch_dtype: Optional[torch.dtype],
     attn_implementation: Optional[str],
+    from_sr_checkpoint: bool = False,
+    share_moe_routing: bool = True,
 ) -> None:
     """Rank-0 only: turn meta tensors into real CPU tensors, then load real
     base weights and re-init LoRA.
@@ -73,10 +86,11 @@ def _materialize_and_transfer(
     rewrites those into real (uninitialized) CPU storage with the same
     shapes/dtypes. We then:
 
-    1. Load the real upstream model and ``transfer_base_weights`` slices
-       its fused projections into the SR base_layer tensors. This
-       repopulates every base weight in-place (the ``base_layer`` keypath
-       indirection is already handled by ``transfer_base_weights``).
+    1. Load the real base weights into the SR base_layer tensors, in place
+       (the ``base_layer`` keypath indirection is stripped by both helpers):
+       an SR checkpoint is loaded with ``from_pretrained`` and copied by name
+       (``copy_sr_weights``, strict); an upstream model is loaded and
+       ``transfer_base_weights`` slices its fused projections.
     2. Re-run PEFT's LoRA init recipe on every wrapped projection so
        ``lora_A`` is kaiming-uniform and ``lora_B`` is zeros. Without
        this step, lora_A would be uninitialized garbage from
@@ -97,29 +111,42 @@ def _materialize_and_transfer(
     # `param.data = torch.empty_like(param, device='cpu')` walk, but
     # safer because it goes through torch's official path.
     peft_model.to_empty(device="cpu")
-
-    # Load the real upstream model. low_cpu_mem_usage avoids the 2x host-
-    # RAM transient on the upstream side (init-real → meta-init → load-
-    # in-place). Without this, large bases (e.g. granite-4.1-30b, 57.7GB)
-    # OOM host RAM even on rank 0 (transient 2x peak crosses 400Gi).
-    load_kwargs = {"low_cpu_mem_usage": True}
-    if torch_dtype is not None:
-        load_kwargs["torch_dtype"] = torch_dtype
-    if attn_implementation is not None:
-        load_kwargs["attn_implementation"] = attn_implementation
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name_or_path, **load_kwargs,
-    )
-
-    # The peft_model wraps SR base; transfer_base_weights walks the SR
-    # state_dict, which already includes the .base_layer. indirection
-    # peft adds — and the function already strips that to find the
-    # underlying SR keys (see the ``.replace(".base_layer.weight", ...)``
-    # branch in weight_transfer.py). drain_src=True frees each upstream
-    # tensor immediately after it's been copied/sliced.
     sr_inner = peft_model.base_model.model  # PeftModel → LoraModel → SR causal-LM
-    transfer_base_weights(base_model, sr_inner, drain_src=True)
-    del base_model
+
+    if from_sr_checkpoint:
+        # Already in SR layout: stock from_pretrained (strict), then a by-name
+        # copy into the skeleton. drain_src=True frees each source tensor as
+        # soon as it is copied, so peak host RAM stays near one model copy.
+        sr_src = _load_sr_checkpoint(
+            base_model_name_or_path,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            share_moe_routing=share_moe_routing,
+        )
+        copy_sr_weights(sr_src, sr_inner, drain_src=True)
+        del sr_src
+    else:
+        # Load the real upstream model. low_cpu_mem_usage avoids the 2x host-
+        # RAM transient on the upstream side (init-real → meta-init → load-
+        # in-place). Without this, large bases (e.g. granite-4.1-30b, 57.7GB)
+        # OOM host RAM even on rank 0 (transient 2x peak crosses 400Gi).
+        load_kwargs = {"low_cpu_mem_usage": True}
+        if torch_dtype is not None:
+            load_kwargs["torch_dtype"] = torch_dtype
+        if attn_implementation is not None:
+            load_kwargs["attn_implementation"] = attn_implementation
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name_or_path, **load_kwargs,
+        )
+
+        # The peft_model wraps SR base; transfer_base_weights walks the SR
+        # state_dict, which already includes the .base_layer. indirection
+        # peft adds — and the function already strips that to find the
+        # underlying SR keys (see the ``.replace(".base_layer.weight", ...)``
+        # branch in weight_transfer.py). drain_src=True frees each upstream
+        # tensor immediately after it's been copied/sliced.
+        transfer_base_weights(base_model, sr_inner, drain_src=True)
+        del base_model
 
     # Re-initialize LoRA params (overwriting the garbage values left by
     # to_empty). PEFT exposes per-layer reset on every LoraLayer; walk
@@ -215,6 +242,36 @@ def _build_sr_peft_model_meta(
     return peft_model
 
 
+def _load_sr_peft_model(
+    base_model_name_or_path: str,
+    lora_config: LoraConfig,
+    *,
+    torch_dtype: Optional[torch.dtype],
+    attn_implementation: Optional[str],
+    share_moe_routing: bool,
+    adapter_name: str,
+):
+    """Single-process / DDP: SR checkpoint via ``from_pretrained``, then PEFT.
+
+    Every process holds a full real model here (no meta / broadcast), so the
+    checkpoint loads directly. The result matches the meta-init path's: same
+    dtypes (the whole PEFT model is cast to ``torch_dtype``, as in
+    :func:`_build_sr_peft_model_meta`), freshly initialized LoRA, zero frozen
+    cross-stream sites and a tied lm_head on tied bases.
+    """
+    sr_model = _load_sr_checkpoint(
+        base_model_name_or_path,
+        torch_dtype=torch_dtype,
+        attn_implementation=attn_implementation,
+        share_moe_routing=share_moe_routing,
+    )
+    peft_model = get_peft_model(sr_model, lora_config, adapter_name=adapter_name)
+    if torch_dtype is not None:
+        # Same uniform-dtype cast as the meta path (see _build_sr_peft_model_meta).
+        peft_model = _to_dtype_keep_rope_fp32(peft_model, torch_dtype)
+    return peft_model
+
+
 def _disable_merge_and_unload(peft_model) -> None:
     """Disable ``merge_and_unload`` on the returned PEFT model.
 
@@ -292,8 +349,9 @@ def get_shadow_residual_peft_model(
     forbidden (no place for a K/V delta to land).
 
     Args:
-        base_model_name_or_path: HF model id or local path of the base
-            Granite model.
+        base_model_name_or_path: HF model id or local path of the base — an SR
+            checkpoint (from ``sr-convert``, loaded with ``from_pretrained``) or
+            an upstream Granite model (converted in memory).
         lora_config: a stock :class:`peft.LoraConfig`.  Driving fields:
 
             * ``target_modules`` — projection names to attach LoRA on, plus
@@ -314,17 +372,34 @@ def get_shadow_residual_peft_model(
         :class:`peft.PeftModel`.
     """
     _reject_kv_lora(lora_config)
+    from_sr_checkpoint = _is_sr_checkpoint(base_model_name_or_path)
     logger.info(
-        "Building SR base from upstream HF Granite. target_modules=%s "
-        "(cross_stream %s present).",
+        "Building SR base from %s. target_modules=%s (cross_stream %s present).",
+        "SR checkpoint" if from_sr_checkpoint else "upstream HF Granite",
         lora_config.target_modules,
         "is" if CROSS_STREAM_NAME in (lora_config.target_modules or []) else "is not",
     )
 
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    fsdp_active = os.environ.get("ACCELERATE_USE_FSDP", "").lower() == "true"
+    if from_sr_checkpoint and not fsdp_active:
+        # No broadcast to coordinate: every process loads the SR checkpoint
+        # with stock from_pretrained and wraps it.
+        peft_model = _load_sr_peft_model(
+            base_model_name_or_path,
+            lora_config,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            share_moe_routing=share_moe_routing,
+            adapter_name=adapter_name,
+        )
+        _disable_merge_and_unload(peft_model)
+        return peft_model
+
     # Path-D pipeline: every rank builds SR + PEFT-wrap on meta with an
     # identical traversal order (config-driven, no from_pretrained
     # divergence). Only rank 0 then materializes real CPU storage and
-    # loads upstream base weights. FSDP's sync_module_states broadcasts
+    # loads base weights. FSDP's sync_module_states broadcasts
     # rank-0's values onto the (sharded) tensors of other ranks.
     sr_config = _build_sr_config(
         base_model_name_or_path,
@@ -341,21 +416,21 @@ def get_shadow_residual_peft_model(
     )
 
     # Materialize meta → real weights. Under FSDP, only rank 0 materializes and
-    # loads upstream weights; FSDP's sync_module_states broadcasts them to the
+    # loads base weights; FSDP's sync_module_states broadcasts them to the
     # (still-meta) other ranks after sharding, which keeps peak host RAM to one
     # rank's copy. WITHOUT FSDP (single-GPU or plain DDP), there is no broadcast,
     # so every rank must materialize its own real weights — otherwise non-rank-0
     # processes keep meta tensors and the Trainer's `.to(device)` fails with
     # "Cannot copy out of meta tensor". FSDP is detected via accelerate's
     # ACCELERATE_USE_FSDP env (set by `accelerate launch --config_file <fsdp>`).
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    fsdp_active = os.environ.get("ACCELERATE_USE_FSDP", "").lower() == "true"
     if local_rank == 0 or not fsdp_active:
         _materialize_and_transfer(
             peft_model,
             base_model_name_or_path,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
+            from_sr_checkpoint=from_sr_checkpoint,
+            share_moe_routing=share_moe_routing,
         )
 
     # Re-tie lm_head ↔ embed_tokens — CONFIG-DRIVEN, and only when the base

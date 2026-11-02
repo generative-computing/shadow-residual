@@ -94,6 +94,11 @@ class ShadowResidualPreTrainedModel(GraniteMoeHybridPreTrainedModel):
     base_model_prefix = "model"
     _no_split_modules = ["ShadowResidualDecoderLayer"]
     _is_stateful = True
+    # The frozen cross-stream weights are all-zero by construction, so a saved SR
+    # checkpoint omits them (see ``ShadowResidualModel._keys_to_ignore_on_save``).
+    # On load they are reported missing, then ``_init_weights`` re-zeros them;
+    # this pattern silences the spurious missing-key warning.
+    _keys_to_ignore_on_load_missing = [r"cross_stream\.weight$"]
 
     @torch.no_grad()
     def _init_weights(self, module):
@@ -142,6 +147,13 @@ class ShadowResidualModel(ShadowResidualPreTrainedModel):
             self.rotary_emb = None
 
         self.gradient_checkpointing = False
+
+        # Don't serialize the frozen all-zero cross-stream weights (H×H per layer,
+        # ~0.5 GB on a 3B base). HF matches these keys exactly (not by regex) and
+        # prefixes them with ``model.`` for the causal-LM wrapper in post_init.
+        self._keys_to_ignore_on_save = {
+            f"layers.{i}.cross_stream.weight" for i in range(config.num_hidden_layers)
+        }
 
         self.post_init()
 

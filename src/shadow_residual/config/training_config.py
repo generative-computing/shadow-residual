@@ -109,7 +109,14 @@ class _Strict(BaseModel):
 
 
 class ModelConfig(_Strict):
-    base: str = Field(..., description="HF model ID or local path, e.g. ibm-granite/granite-4.1-3b")
+    base: str = Field(
+        ...,
+        description=(
+            "HF model ID or local path: an SR checkpoint (e.g. AlonMal/granite-4.1-3b-sr, "
+            "made with sr-convert) or an upstream Granite model (e.g. "
+            "ibm-granite/granite-4.1-3b, converted in memory)"
+        ),
+    )
     attn_implementation: str | None = None  # e.g. "sdpa", "flash_attention_2"
     # Dtype the SR+PEFT model is materialized in. "bf16" (default) loads the
     # whole model — base AND trainable LoRA adapters — in bfloat16. "fp32"
