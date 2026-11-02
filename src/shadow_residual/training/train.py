@@ -75,7 +75,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    action="store_true",
                    help="Set data.instruction_as_user_message=True — inject RAG documents "
                         "before the first assistant turn (judge/guardian data) instead of "
-                        "after the last user turn. ChatML (Granite 4.2/5.0) only.")
+                        "after the last user turn. ChatML (Granite 4.2) only.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", action="store_true",
                    help="Periodically log a decoded training example + labels from the collator. "
