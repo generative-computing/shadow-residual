@@ -31,8 +31,10 @@ src/shadow_residual/
 │   ├── cross_stream.py         frozen zero-init nn.Linear cross-stream site
 │   ├── model_config.py         vendored ShadowResidualConfig
 │   ├── config_helpers.py       validate / set_shadow_residual
-│   ├── build.py                SR config/model construction + RoPE reinit (no PEFT)
-│   ├── weight_transfer.py      fused→unfused QKV / gate-up slicing
+│   ├── build.py                SR config/model construction + RoPE reinit (no PEFT);
+│   │                             loads SR checkpoints or converts upstream in memory
+│   ├── convert.py              sr-convert: upstream Granite → SR checkpoint (+ Hub push)
+│   ├── weight_transfer.py      fused→unfused QKV / gate-up slicing; SR→SR by-name copy
 │   └── _stream_gated_linear.py   _StreamGatedLinear marker + _base_only helper
 │                           #   (100% stock PEFT-adaptable — no custom LoRA classes; the
 │                           #    publishable HF model, needs nothing from training/)
@@ -68,6 +70,10 @@ accelerate launch --config_file src/shadow_residual/config/accelerate/fsdp_4gpu.
 ```
 
 Config essentials:
+- **`model.base`** — an **SR checkpoint** (default: `AlonMal/granite-4.1-3b-sr`)
+  loads with stock `from_pretrained`; an **upstream Granite** id still works and
+  is converted in memory on every load. Make an SR checkpoint once with
+  `sr-convert` (see "SR checkpoints" below).
 - **`"cross_stream"` in `adapter.target_modules`** engages the dual-stream SR
   forward. Do NOT list `k_proj` / `v_proj` (K/V LoRA is rejected).
 - **`adapter.last_context_token`** (optional, single token) → train.py validates
@@ -99,9 +105,28 @@ Single-GPU / non-FSDP runs are unaffected and can generate in-job.
 Vela: use the YAMLs in `examples/vela/`. Pin `trl<1.7` (already in pyproject).
 `eval_loss: nan` per epoch is expected for prompt-only eval rows.
 
+## SR checkpoints
+
+An SR checkpoint is the SR model saved as a regular HF checkpoint
+(`model_type: "shadow_residual"`, SR weight layout, upstream tokenizer + chat
+template). Convert once, optionally push:
+
+```bash
+sr-convert --base ibm-granite/granite-4.1-3b --output ./granite-4.1-3b-sr \
+           --repo-id AlonMal/granite-4.1-3b-sr --push
+```
+
+Importing `shadow_residual.shadow_residual` registers the model type with the HF
+auto classes, so `AutoModelForCausalLM.from_pretrained(<sr ckpt>)` works with no
+`trust_remote_code`. The frozen all-zero cross-stream weights are not saved; they
+are re-zeroed on load. Loading is strict (missing/unexpected weights raise).
+Under FSDP the training factory keeps the meta-init + rank-0 fill + broadcast
+pattern; rank 0 fills from the SR checkpoint by name instead of slicing upstream.
+
 ## Serving / evaluation
 
-No custom loader — build an SR base, then attach the adapter with stock PEFT:
+No custom loader — build an SR base, then attach the adapter with stock PEFT.
+`base_id` may be an SR checkpoint or an upstream Granite id:
 
 ```python
 from shadow_residual.shadow_residual.build import build_sr_base
