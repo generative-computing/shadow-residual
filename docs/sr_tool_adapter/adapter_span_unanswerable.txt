@@ -1,0 +1,6 @@
+<|im_start|>user
+<tool_response>
+{"answerable": false, "rationale": "The retrieved handbook entry describes a single 16-week allotment available to all parents but says nothing about a father-specific, non-transferable reserved portion. The question cannot be answered from the available documents."}
+</tool_response>
+<|im_start|>assistant
+<think></think>I can't answer that from the documents I have. Our handbook describes a single 16-week paid parental-leave allotment available to all parents, but it doesn't mention any portion that is reserved specifically for fathers or that is non-transferable. You may want to check with HR for details on allocation between parents.<|im_end|>
