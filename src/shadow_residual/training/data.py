@@ -146,20 +146,32 @@ def load_jsonl_dataset(
             if not line:
                 continue
             obj = json.loads(line)
-            if "messages" not in obj:
-                raise ValueError(f"{path}: row is missing 'messages' field: {obj!r}")
-            # render_chat folds documents into a system message for ChatML
-            # tokenizers (Granite 4.2, whose template ignores documents=) and
-            # passes them natively otherwise (Granite 4.1). See chat_render.
-            text = render_chat(
-                tokenizer,
-                obj["messages"],
-                documents=obj.get("documents"),
-                tools=obj.get("tools"),
-                add_generation_prompt=False,
-                enable_thinking=enable_thinking,
-                instruction_as_user_message=instruction_as_user_message,
-            )
+            # Pre-rendered passthrough: a row may carry a ready `text` field
+            # instead of `messages`. Used by the SR-adapter-as-tool generator,
+            # which hand-assembles the completion so the supervised span omits
+            # the intermediate turn-closing <|im_end|> that the stock chat
+            # template would insert (that <|im_end|> is the EOS/stop token, so
+            # supervising it teaches the adapter to halt before it can emit the
+            # tool_response at inference). See docs/sr_tool_adapter/.
+            if "text" in obj and "messages" not in obj:
+                text = obj["text"]
+            else:
+                if "messages" not in obj:
+                    raise ValueError(
+                        f"{path}: row is missing 'messages'/'text' field: {obj!r}"
+                    )
+                # render_chat folds documents into a system message for ChatML
+                # tokenizers (Granite 4.2, whose template ignores documents=) and
+                # passes them natively otherwise (Granite 4.1). See chat_render.
+                text = render_chat(
+                    tokenizer,
+                    obj["messages"],
+                    documents=obj.get("documents"),
+                    tools=obj.get("tools"),
+                    add_generation_prompt=False,
+                    enable_thinking=enable_thinking,
+                    instruction_as_user_message=instruction_as_user_message,
+                )
             if last_token_id is not None:
                 # Append the end-of-completion marker unless the row already
                 # ends with it. Scan past trailing whitespace-only tokens before

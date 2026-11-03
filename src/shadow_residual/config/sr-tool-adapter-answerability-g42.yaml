@@ -1,0 +1,82 @@
+# SR-adapter-as-tool training config (Granite 4.2, answerability adapter).
+#
+# The adapter is invoked as a TOOL: the base emits a <tool_call> for
+# `answerability`, the switch routes to this SR adapter, and the adapter
+# generates the <tool_response> verdict + the user-facing answer. See
+# docs/sr_tool_adapter/SR_TOOL_ADAPTER_BOOTSTRAP.md.
+#
+# Boundary wiring (differs from the plain answerability g42 config):
+#   - The supervised completion starts right after the trigger tool-call close,
+#     so the collator response_template (assistant_marker) is "</tool_call>"
+#     (a single token on the 4.2 tokenizer, id 100271). Masking cuts there and
+#     supervises the verdict tool_response + the assistant answer.
+#   - last_context_token = "</tool_call>" (the token immediately before the
+#     supervised region; single-token, satisfies the boundary validator).
+#   - last_token = "<|im_end|>" (end-of-completion marker).
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  # Mask THROUGH the trigger tool-call close; supervise what the adapter emits.
+  assistant_marker: "</tool_call>"
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream: 32
+  alpha: 64
+  dropout: 0.05
+  last_context_token: "</tool_call>"
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 1
+  gradient_accumulation: 8
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 1
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 1
+  seed: 2
+  logging_steps: 5
+  dataloader_num_workers: 2
+  report_to: []
+
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 200
+  do_sample: false
+  batch_size: 8
+  output_filename: predictions.jsonl

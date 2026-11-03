@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SR adapters as tools — Granite 4.2 answerability</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --ink: #e6e8ec;
+    --muted: #9aa3b2; --accent: #6ea8fe; --accent2: #7ee2b8; --warn: #f0b354;
+    --line: #2a2f3a; --code-bg: #0b0d11; --pink: #e58fb1;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.6; font-size: 16px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 48px 24px 120px; }
+
+  /* Left navigation sidebar */
+  :root { --nav-w: 258px; }
+  html { scroll-padding-top: 24px; }
+  h2[id] { scroll-margin-top: 20px; }
+  nav.toc {
+    position: fixed; top: 0; left: 0; width: var(--nav-w); height: 100vh;
+    overflow-y: auto; background: var(--panel); border-right: 1px solid var(--line);
+    padding: 28px 16px 40px; z-index: 50;
+  }
+  nav.toc .toc-title {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--muted); padding: 0 10px 4px;
+  }
+  nav.toc .toc-sub {
+    font-size: 12px; color: var(--muted); padding: 0 10px 16px;
+    border-bottom: 1px solid var(--line); margin-bottom: 12px; line-height: 1.4;
+  }
+  nav.toc a {
+    display: block; padding: 7px 10px; border-radius: 6px; margin: 1px 0;
+    color: var(--muted); text-decoration: none; font-size: 13.5px; line-height: 1.35;
+    border-left: 2px solid transparent; transition: background .12s, color .12s;
+  }
+  nav.toc a:hover { background: var(--panel2); color: var(--ink); }
+  nav.toc a.active {
+    color: var(--accent); background: var(--panel2);
+    border-left-color: var(--accent); font-weight: 600;
+  }
+  nav.toc .toc-group {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--muted); padding: 14px 10px 4px;
+    margin-top: 8px; border-top: 1px solid var(--line);
+  }
+  nav.toc a .n {
+    font-family: var(--mono); font-size: 11px; color: var(--line); margin-right: 8px;
+  }
+  nav.toc a.active .n, nav.toc a:hover .n { color: var(--accent); }
+  @media (min-width: 1040px) {
+    .wrap { margin-left: var(--nav-w); max-width: 900px; }
+  }
+  @media (max-width: 1039px) {
+    nav.toc {
+      position: static; width: auto; height: auto; border-right: none;
+      border-bottom: 1px solid var(--line); display: flex; gap: 4px;
+      overflow-x: auto; padding: 12px 16px; white-space: nowrap;
+    }
+    nav.toc .toc-title, nav.toc .toc-sub, nav.toc .toc-group { display: none; }
+    nav.toc a { border-left: none; border-bottom: 2px solid transparent; flex: 0 0 auto; }
+    nav.toc a.active { border-left: none; border-bottom-color: var(--accent); }
+    nav.toc a .n { display: none; }
+  }
+  header.page { border-bottom: 1px solid var(--line); padding-bottom: 28px; margin-bottom: 8px; }
+  h1 { font-size: 30px; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h1 code { font-size: 0.72em; color: var(--accent); background: none; padding: 0; }
+  .sub { color: var(--muted); font-size: 16px; margin: 0; }
+  h2 {
+    font-size: 22px; margin: 56px 0 14px; padding-top: 10px;
+    border-top: 1px solid var(--line); letter-spacing: -0.01em;
+  }
+  h3 { font-size: 17px; margin: 28px 0 8px; color: var(--accent2); }
+  p { margin: 12px 0; }
+  a { color: var(--accent); }
+  code {
+    font-family: var(--mono); font-size: 0.86em;
+    background: var(--panel2); padding: 1px 5px; border-radius: 4px; color: var(--pink);
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 16px 18px; overflow-x: auto; font-family: var(--mono);
+    font-size: 13px; line-height: 1.5; color: var(--ink); margin: 14px 0;
+  }
+  pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+  .muted { color: var(--muted); }
+  .tag {
+    display: inline-block; font-family: var(--mono); font-size: 11px;
+    padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line);
+    color: var(--muted); margin-right: 6px; vertical-align: middle;
+  }
+  .tag.base { color: var(--accent); border-color: #2b3f63; }
+  .tag.adapt { color: var(--accent2); border-color: #244a3a; }
+  .lede {
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 16px 20px; margin: 20px 0;
+  }
+  .note {
+    background: #1c1810; border: 1px solid #3a2f16; border-left: 3px solid var(--warn);
+    border-radius: 8px; padding: 12px 18px; margin: 16px 0; font-size: 15px;
+  }
+  .note b { color: var(--warn); }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); color: var(--ink); font-weight: 600; }
+  td code { font-size: 0.82em; }
+
+  .pipe { margin: 24px 0; }
+  .step { display: flex; gap: 16px; align-items: flex-start; position: relative; padding-bottom: 8px; }
+  .step:not(:last-child)::before {
+    content: ""; position: absolute; left: 17px; top: 36px; bottom: -8px; width: 2px; background: var(--line);
+  }
+  .step .num {
+    flex: 0 0 36px; height: 36px; border-radius: 50%;
+    background: var(--panel2); border: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 14px; color: var(--accent); z-index: 1;
+  }
+  .step .body { flex: 1; padding-top: 4px; }
+  .step .body .t { font-weight: 600; margin-bottom: 2px; }
+  .step .body .d { color: var(--muted); font-size: 14px; }
+  .step .body .fn { font-family: var(--mono); font-size: 12px; color: var(--accent2); }
+
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 18px 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+  .card h4 { margin: 0 0 8px; font-size: 15px; }
+  .card.base h4 { color: var(--accent); }
+  .card.adapt h4 { color: var(--accent2); }
+  @media (max-width: 720px) { .cols { grid-template-columns: 1fr; } }
+
+  ul.tight { margin: 8px 0; } ul.tight li { margin: 4px 0; }
+  .oneliner {
+    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent2);
+    border-radius: 8px; padding: 16px 20px; margin: 18px 0; font-size: 15.5px;
+  }
+  blockquote {
+    margin: 14px 0; padding: 10px 18px; border-left: 3px solid var(--muted);
+    background: var(--panel2); border-radius: 0 8px 8px 0; color: var(--muted); font-size: 14.5px;
+  }
+  blockquote code { font-size: 0.85em; }
+  footer { margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+
+  /* End-to-end trace */
+  .trace { counter-reset: tstep; margin: 20px 0; }
+  .tstep {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 20px 20px; margin: 14px 0; position: relative;
+  }
+  .tstep::before {
+    counter-increment: tstep; content: "STEP " counter(tstep);
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
+    color: var(--accent); background: var(--panel2); border: 1px solid var(--line);
+    padding: 2px 10px; border-radius: 999px; position: absolute; top: -11px; left: 18px;
+  }
+  .tstep h3 { margin: 6px 0 4px; color: var(--ink); font-size: 16px; }
+  .tstep p { margin: 8px 0; font-size: 14.5px; }
+  .tstep pre { margin: 10px 0 0; }
+  .arrow-down { text-align: center; color: var(--line); font-size: 20px; line-height: 0.6; margin: -2px 0; }
+  .hl { color: var(--accent2); }
+  .hl2 { color: var(--warn); }
+  .cmt { color: var(--muted); }
+
+  /* [M]/[S] span annotation */
+  .ann .m { color: var(--muted); }
+  .ann .s { color: var(--accent2); }
+  .ann .bound { color: var(--warn); }
+
+  .tbl-wrap { overflow-x: auto; }
+  table.cmp td:first-child { color: var(--ink); font-weight: 600; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<nav class="toc" aria-label="Sections">
+  <div class="toc-title">On this page</div>
+  <div class="toc-sub">SR adapters as tools &mdash; Granite&nbsp;4.2 answerability</div>
+  <a href="#goal"><span class="n">1</span>The goal</a>
+  <a href="#emit"><span class="n">2</span>What the adapter emits</a>
+  <a href="#boundary"><span class="n">3</span>The token boundary</a>
+  <a href="#single-imend"><span class="n">4</span>The single-<code>im_end</code> design</a>
+  <div class="toc-group">Data</div>
+  <a href="#data"><span class="n">5</span>Training-data construction</a>
+  <a href="#mask"><span class="n">6</span>What to mask vs. supervise</a>
+  <a href="#config"><span class="n">7</span>Config &amp; pipeline wiring</a>
+  <div class="toc-group">Trace</div>
+  <a href="#trace"><span class="n">8</span>Full inference trace</a>
+  <div class="toc-group">Results</div>
+  <a href="#results"><span class="n">9</span>Results: tool vs. plain</a>
+  <a href="#takeaways"><span class="n">10</span>Key takeaways</a>
+  <a href="#open"><span class="n">11</span>Open questions &amp; next levers</a>
+  <a href="#artifacts"><span class="n">12</span>Artifacts</a>
+</nav>
+
+<div class="wrap">
+
+<header class="page">
+  <h1>SR adapters as <code>tools</code></h1>
+  <p class="sub">Exposing a Shadow&nbsp;Residual answerability adapter to Granite&nbsp;4.2 through the model's native <b>tool-invocation</b> capability &mdash; the <code>&lt;tool_call&gt;</code> becomes the switch trigger, and the adapter generates the <code>&lt;tool_response&gt;</code> verdict plus the user-facing answer.</p>
+</header>
+
+<div class="lede">
+  <p style="margin-top:0">Some of the &ldquo;tools&rdquo; registered with the model are really SR adapters. When the base decides to call one &mdash; e.g. the standard <b>answerability</b> adapter &mdash; the switch runtime intercepts right after the model emits its <code>&lt;tool_call&gt;</code>, <em>before</em> an end-of-text token is produced, flips generation to the adapter, and the adapter produces a real response under stock <code>generate()</code>.</p>
+  <p style="margin-bottom:0" class="muted">The switching mechanism itself is out of scope here. This document covers the <b>training bootstrap</b>: what the adapter must learn to emit, how the data is shaped, where the supervised boundary falls, how it wires into the <code>shadow-residual</code> pipeline, and how it compares against the plain answerability flow.</p>
+</div>
+
+<h2 id="goal">1 &middot; The goal</h2>
+<p>Granite's native tool-calling is reused as a switching trigger. The target base is <b>Granite&nbsp;4.2</b> (ChatML template, <code>&lt;|im_start|&gt;</code> / <code>&lt;|im_end|&gt;</code>, <code>&lt;tool_call&gt;</code> / <code>&lt;tool_response&gt;</code> tags).</p>
+<div class="oneliner"><b>Design decision.</b> The adapter generates the <b>full span after <code>&lt;/tool_call&gt;</code></b> &mdash; the <code>&lt;tool_response&gt;</code> block <em>and</em> the subsequent assistant answer turn. The switch does nothing but route tokens to the adapter; it does not synthesize the tool result. This keeps the runtime trivial at the cost of the adapter having to emit the structural <code>&lt;tool_response&gt;</code> scaffolding itself.</div>
+
+<h2 id="emit">2 &middot; What the adapter emits</h2>
+<p>The adapter starts right after the base's <code>&lt;/tool_call&gt;</code> and emits the two-part span below. Note it reproduces the <code>&lt;tool_response&gt;</code> as a <code>user</code>-role turn &mdash; that is how 4.2 natively represents retrieved/tool context.</p>
+<pre><code>&lt;|im_start|&gt;user
+&lt;tool_response&gt;
+{"answerable": true, "rationale": "The HR handbook states 16 weeks of paid parental leave is available to all parents regardless of gender, which covers new fathers."}
+&lt;/tool_response&gt;
+&lt;|im_start|&gt;assistant
+&lt;think&gt;&lt;/think&gt;Yes. New fathers are eligible for 16 weeks of paid parental leave, which can be taken any time within the first 12 months after your child's birth or adoption. The policy applies to all parents regardless of gender or caregiver role.<span class="hl2">&lt;|im_end|&gt;</span></code></pre>
+
+<div class="tbl-wrap">
+<table>
+  <tr><th>Part</th><th>Tokens</th><th>Who emits it</th></tr>
+  <tr><td>tool_response prefix</td><td><code>&lt;|im_start|&gt;user\n&lt;tool_response&gt;\n</code></td><td>adapter</td></tr>
+  <tr><td>tool_response body</td><td>the verdict JSON <code>{"answerable": &hellip;, "rationale": &hellip;}</code></td><td>adapter &mdash; the real &ldquo;work&rdquo;</td></tr>
+  <tr><td>tool_response suffix</td><td><code>\n&lt;/tool_response&gt;\n</code> <span class="muted">(no <code>&lt;|im_end|&gt;</code>)</span></td><td>adapter</td></tr>
+  <tr><td>assistant prefix</td><td><code>&lt;|im_start|&gt;assistant\n&lt;think&gt;&lt;/think&gt;</code></td><td>adapter</td></tr>
+  <tr><td>assistant body</td><td>the user-facing natural-language answer</td><td>adapter</td></tr>
+  <tr><td>assistant suffix</td><td><code>&lt;|im_end|&gt;</code> <span class="hl2">(the single terminal stop)</span></td><td>adapter</td></tr>
+</table>
+</div>
+
+<div class="note"><b>Thinking off.</b> With <code>enable_thinking=False</code> the template emits an empty <code>&lt;think&gt;&lt;/think&gt;</code> block inline. These adapters train thinking-off, consistent with the existing answerability adapters. Do <b>not</b> pass <code>--enable-thinking</code> at train or eval.</div>
+
+<h2 id="boundary">3 &middot; The token boundary</h2>
+<p>What the <b>base model generates</b> for the answerability tool-call turn (verified by diffing the <code>add_generation_prompt=True</code> prefix against the rendered call turn):</p>
+<pre><code>\n&lt;tool_call&gt;\n&lt;function=answerability&gt;\n&lt;parameter=question&gt;\n&hellip;\n&lt;/parameter&gt;\n&lt;/function&gt;\n&lt;/tool_call&gt;\n<span class="hl2">&lt;|im_end|&gt;</span>\n</code></pre>
+<p>The base's turn naturally ends with <code>&lt;/tool_call&gt;\n</code> followed by <code>&lt;|im_end|&gt;</code>, which is the <b>stop token</b>. If the base emits it, generation halts and the adapter never runs. Therefore the switch must intercept at <code>&lt;/tool_call&gt;</code> &mdash; before <code>&lt;|im_end|&gt;</code> is committed &mdash; parse the emitted <code>tool_call</code>, see that it names an SR adapter, and flip generation to that adapter.</p>
+<div class="oneliner">The <b>last context token is <code>&lt;/tool_call&gt;</code></b>. The adapter owns <code>&lt;|im_end|&gt;</code> onward.</div>
+
+<div class="note"><b>On <code>&lt;tool_call&gt;</code> vs. <code>tool_calls</code>.</b> The literal <code>&lt;tool_call&gt;&lt;function=&hellip;&gt;</code> tags exist only in the <em>rendered template string</em>. In the message object a tool call is the structured <code>tool_calls</code> key; the chat template materializes it into the tags, and an inference-time parser does the inverse (<code>&lt;/tool_call&gt;</code> text &rarr; <code>tool_calls</code> object). Training rows store <code>tool_calls</code> as structured objects, never as literal tag text.</div>
+
+<h2 id="single-imend">4 &middot; The single-<code>&lt;|im_end|&gt;</code> design</h2>
+<p>This is the load-bearing constraint of the whole bootstrap.</p>
+<p><code>&lt;|im_end|&gt;</code> is the generation stop token. The switch calls a <b>stock <code>generate()</code> with default EOS handling and no custom stopping criterion</b>, so the decode loop halts at the <em>first</em> <code>&lt;|im_end|&gt;</code> the adapter produces. A faithful ChatML stream would contain a <em>second</em> <code>&lt;|im_end|&gt;</code> closing the <code>&lt;tool_response&gt;</code> turn before the answer turn &mdash; but emitting that would stop generation prematurely, before the answer.</p>
+<div class="oneliner"><b>So the intermediate turn-closing <code>&lt;|im_end|&gt;</code> is dropped:</b> the adapter flows directly from <code>&lt;/tool_response&gt;\n</code> into <code>&lt;|im_start|&gt;assistant</code>, and the single <code>&lt;|im_end|&gt;</code> at the end of the answer is its genuine, first-and-only stop.</div>
+
+<div class="cols">
+  <div class="card adapt">
+    <h4>Single-<code>&lt;|im_end|&gt;</code> (shipped)</h4>
+    <ul class="tight">
+      <li>Exactly one <code>&lt;|im_end|&gt;</code>, at the very end.</li>
+      <li>Slightly off-spec ChatML: the <code>&lt;tool_response&gt;</code> turn is not closed before the assistant turn opens.</li>
+      <li>Harmless if nothing re-parses the output as structured turns; the explicit <code>&lt;|im_start|&gt;assistant</code> still marks the boundary.</li>
+      <li>Structural validity: <b>0 &rarr; 1.0</b> once adopted.</li>
+    </ul>
+  </div>
+  <div class="card base">
+    <h4>Fully-stock ChatML (rejected default)</h4>
+    <ul class="tight">
+      <li>Places an <code>&lt;|im_end|&gt;</code> after <code>&lt;/tool_response&gt;</code>.</li>
+      <li>Under stock <code>generate()</code> the adapter emitted <code>\n&lt;|im_end|&gt;</code> and <b>halted immediately</b> &mdash; never reached the answer.</li>
+      <li>Only viable if the switch owns the decode loop with a stopping criterion that ignores the first N&minus;1 stops &mdash; out of scope.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note"><b>Training vs. inference nuance.</b> The single-<code>&lt;|im_end|&gt;</code> concern is an <em>inference-time stop</em> issue. For the shipped runs the completion is rendered through the stock chat template, so the supervised span contains the intermediate <code>&lt;|im_end|&gt;</code> during training; the constraint matters at generation time. Boundary verified on sampled rows: token before supervision = <code>&lt;/tool_call&gt;</code>; supervised span = the <code>&lt;tool_response&gt;</code> verdict + answer.</div>
+
+<h2 id="data">5 &middot; Training-data construction</h2>
+<p>Each training row is a full conversation (<code>{"messages": [&hellip;], "tools": [&hellip;]}</code>) rendered with <code>apply_chat_template(&hellip;, tools=&hellip;, add_generation_prompt=False, enable_thinking=False)</code> &mdash; exactly the shape <code>data.py</code> already consumes.</p>
+<p>The generator takes answerability-style rows (question + documents + gold verdict) and emits the agentic conversation shape, <b>one row per adapter tool-call</b>. The example RAG flow &mdash; <code>search_kb</code> &rarr; <code>answerability</code> (answerable) &rarr; answer &rarr; follow-up &rarr; <code>answerability</code> (unanswerable) &rarr; refusal &mdash; yields two rows so the adapter sees both verdict polarities.</p>
+<div class="note"><b><code>ground_truth</code> is the gold.</b> The dataset has no gold <em>prose</em> answer &mdash; only the verdict label. A first run that paired the verdict with a <em>synthesized</em> prose answer scored ~chance (0.52) on the verdict; the synthetic answer was noise. Switching the completion to the gold verdict label (<code>"answerable"</code>/<code>"unanswerable"</code>) lifted accuracy to 0.66.</div>
+
+<h3>Single-call-per-row simplification</h3>
+<p>The collator's &ldquo;last occurrence&rdquo; marker rule means a conversation with <em>two</em> adapter tool-calls would only supervise the second. For v1, each conversation is truncated at the end of each adapter's answer turn, emitting one row per call &mdash; so every adapter call is supervised and the boundary rule stays simple.</p>
+
+<h2 id="mask">6 &middot; What to mask vs. supervise</h2>
+<p>A training row is one flat text span crossing <b>three</b> rendered turns. The mask boundary falls right after <code>&lt;/tool_call&gt;\n</code>:</p>
+<pre class="ann"><code><span class="m">[M] &lt;|im_start|&gt;assistant\n</span>
+<span class="m">[M] &lt;think&gt;&lt;/think&gt;\n</span>
+<span class="m">[M] &lt;tool_call&gt;\n</span>
+<span class="m">[M] &lt;function=answerability&gt;\n</span>
+<span class="m">[M] &lt;parameter=question&gt;\n</span>
+<span class="m">[M] What is our company's parental leave policy for new fathers?\n</span>
+<span class="m">[M] &lt;/parameter&gt;\n</span>
+<span class="m">[M] &lt;/function&gt;\n</span>
+<span class="m">[M] &lt;/tool_call&gt;\n</span>
+<span class="bound">    &gt;&gt;&gt; MASK BOUNDARY (right after &lt;/tool_call&gt;\n) &lt;&lt;&lt;</span>
+<span class="s">[S] &lt;|im_start|&gt;user\n</span>
+<span class="s">[S] &lt;tool_response&gt;\n</span>
+<span class="s">[S] {"answerable": true, "rationale": "&hellip;"}\n</span>
+<span class="s">[S] &lt;/tool_response&gt;\n</span>
+<span class="s">[S] &lt;|im_start|&gt;assistant\n</span>
+<span class="s">[S] &lt;think&gt;&lt;/think&gt;Yes. New fathers are eligible for 16 weeks&hellip;&lt;|im_end|&gt;</span></code></pre>
+<ul class="tight">
+  <li><b>Masked (<code>-100</code>):</b> system + tools block, all user turns, and the trigger tool-call turn itself &mdash; everything through <code>&lt;/function&gt;\n&lt;/tool_call&gt;\n</code>.</li>
+  <li><b>Supervised:</b> the <code>&lt;tool_response&gt;</code> block <em>and</em> the assistant answer turn.</li>
+</ul>
+
+<h2 id="config">7 &middot; Config &amp; pipeline wiring</h2>
+<p>Reuse the existing SR training path (<code>sr-train</code>, YAML-driven). Config <code>sr-tool-adapter-answerability-g42.yaml</code>, differing from the plain answerability config as follows:</p>
+<div class="tbl-wrap">
+<table class="cmp">
+  <tr><th>Knob</th><th>Tool-adapter value</th><th>Why</th></tr>
+  <tr><td><code>assistant_marker</code></td><td><code>&lt;/tool_call&gt;</code></td><td>Mask through the trigger tool-call close; supervise what follows. Single token (id 100271) on the 4.2 tokenizer.</td></tr>
+  <tr><td><code>last_context_token</code></td><td><code>&lt;/tool_call&gt;</code></td><td>Token immediately before the supervised region; satisfies the single-token boundary validator with no code change.</td></tr>
+  <tr><td><code>last_token</code></td><td><code>&lt;|im_end|&gt;</code></td><td>End-of-completion marker.</td></tr>
+  <tr><td><code>target_modules</code></td><td>q/o + MLP gate/up/down + <code>cross_stream</code>, r32</td><td>Standard SR. <b>Never</b> <code>k_proj</code>/<code>v_proj</code> (SR invariant: shared base-only K/V).</td></tr>
+  <tr><td><code>enable_thinking</code></td><td><code>False</code></td><td>Consistent with existing answerability adapters.</td></tr>
+</table>
+</div>
+<p class="muted">The plain config instead uses <code>assistant_marker = &lt;|im_start|&gt;assistant\n&lt;think&gt;&lt;/think&gt;</code> and <code>last_context_token = &lt;/think&gt;</code> &mdash; the completion is a single verdict word, so it masks through the whole assistant opener.</p>
+
+<h2 id="trace">8 &middot; Full inference trace</h2>
+<p>A single-tool RAG flow on Granite&nbsp;4.2, rendered with the real ChatML template (<code>trim_blocks=True, lstrip_blocks=True</code>, <code>enable_thinking=False</code>). The documents are already in context (RAG-injected as a <code>tool</code> message); the model has one tool, <code>answerability</code>, decides to call it, and the SR adapter produces the verdict and the answer.</p>
+
+<div class="trace">
+
+  <div class="tstep">
+    <h3>The system turn defines <code>answerability</code> as a tool</h3>
+    <p>Passed via <code>apply_chat_template(tools=[&hellip;])</code>; the template embeds it in the system turn inside a <code>&lt;tools&gt;</code> block, followed by the fixed tool-calling instructions and closed with <code>&lt;|im_end|&gt;</code>.</p>
+<pre><code>&lt;|im_start|&gt;system
+You are a helpful enterprise assistant. Answer only from the retrieved documents&hellip;
+
+# Tools
+&lt;tools&gt;
+{"name": "answerability", "description": "Decide whether the user's question is
+answerable from the retrieved documents&hellip;", "parameters": {&hellip;}}
+&lt;/tools&gt;
+&hellip;&lt;|im_end|&gt;</code></pre>
+  </div>
+
+  <div class="arrow-down">&darr;</div>
+
+  <div class="tstep">
+    <h3>User query + RAG documents (injected as a tool_response &rarr; user turn)</h3>
+<pre><code>&lt;|im_start|&gt;user
+What is our company's parental leave policy for new fathers?&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+&lt;tool_response&gt;
+[{"source": "hr_handbook", "document_id": "hr-14", "content": "Parental leave:
+&hellip; 16 weeks of paid parental leave &hellip; regardless of gender or caregiver role."}]
+&lt;/tool_response&gt;
+&lt;|im_end|&gt;</code></pre>
+  </div>
+
+  <div class="arrow-down">&darr;</div>
+
+  <div class="tstep">
+    <h3>The base invokes <code>answerability</code> &mdash; and the switch cuts</h3>
+    <p>The base decodes from the generation prompt and emits the tool-call, which would naturally end at <code>&lt;|im_end|&gt;</code>. The switch recognizes an SR adapter and cuts at <code>&lt;/tool_call&gt;</code> &mdash; the <code>&lt;|im_end|&gt;</code> is <b>not</b> sampled.</p>
+<pre><code>&lt;|im_start|&gt;assistant
+&lt;think&gt;&lt;/think&gt;
+&lt;tool_call&gt;
+&lt;function=answerability&gt;
+&lt;parameter=question&gt;
+What is our company's parental leave policy for new fathers?
+&lt;/parameter&gt;
+&lt;/function&gt;
+&lt;/tool_call&gt;
+<span class="hl2">&gt;&gt;&gt; CUT HERE (the &lt;|im_end|&gt; is NOT sampled) &lt;&lt;&lt;</span></code></pre>
+  </div>
+
+  <div class="arrow-down">&darr;</div>
+
+  <div class="tstep">
+    <h3>The adapter generates (verdict tool_response + answer, ONE <code>&lt;|im_end|&gt;</code>)</h3>
+    <p>The switch keeps the KV cache, swaps the adapter in, and resumes decoding. Note the two deliberate seams: no <code>&lt;|im_end|&gt;</code> after the base's <code>&lt;/tool_call&gt;</code> (the cut), and none after the adapter's <code>&lt;/tool_response&gt;</code> (the dropped intermediate stop).</p>
+<pre><code>&lt;|im_start|&gt;user
+&lt;tool_response&gt;
+{"answerable": <span class="hl">true</span>, "rationale": "The HR handbook states 16 weeks of paid
+parental leave is available to all parents regardless of gender&hellip;"}
+&lt;/tool_response&gt;
+&lt;|im_start|&gt;assistant
+&lt;think&gt;&lt;/think&gt;Yes. New fathers are eligible for 16 weeks of paid parental
+leave, taken any time within the first 12 months after the birth or adoption&hellip;<span class="hl2">&lt;|im_end|&gt;</span></code></pre>
+  </div>
+</div>
+
+<h2 id="results">9 &middot; Results: tool-adapter vs. plain</h2>
+<p>Two SR answerability adapters trained and evaluated on the same base, data, and scale, to compare the <b>adapter-as-tool</b> flow against the <b>plain</b> (label-only) flow. Base <code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>; data from <code>answerability_evaluation.jsonl</code> (gold = the <code>ground_truth</code> verdict); SR r32 on q/o/MLP + <code>cross_stream</code>, thinking off; free-generation greedy eval.</p>
+
+<div class="note"><b>Scale caveat.</b> These numbers are from the <b>flow-validation</b> run: 120 balanced train rows (60/60), 60 balanced val rows, 1 epoch, 15 optimizer steps, ~32&ndash;37&nbsp;min each on Apple&nbsp;MPS. Absolute numbers are indicative, not final &mdash; the prior full-scale answerability run (Vela GPU) reached ~0.89. A full-scale rerun (3191 train / 354 val, 2 epochs) is the current next lever.</div>
+
+<div class="tbl-wrap">
+<table class="cmp">
+  <tr><th>Metric</th><th>Plain SR</th><th>Tool-adapter SR</th></tr>
+  <tr><td>Free-gen verdict accuracy</td><td><b>0.80</b></td><td>0.58 (0.66 of structurally-valid)</td></tr>
+  <tr><td>Structural validity</td><td>1.00</td><td>0.88</td></tr>
+  <tr><td>Held-out <code>eval_loss</code> (teacher-forced)</td><td>0.071</td><td>0.103</td></tr>
+  <tr><td>Held-out <code>eval_mean_token_accuracy</code></td><td>0.966</td><td>0.961</td></tr>
+  <tr><td>Class balance</td><td>balanced errors</td><td>biased &rarr; unanswerable</td></tr>
+</table>
+</div>
+
+<div class="cols">
+  <div class="card base">
+    <h4>Plain SR confusion (60 val)</h4>
+    <table>
+      <tr><th></th><th>&rarr;ans</th><th>&rarr;unans</th></tr>
+      <tr><td><b>answerable</b></td><td>22</td><td>8</td></tr>
+      <tr><td><b>unanswerable</b></td><td>4</td><td>26</td></tr>
+    </table>
+    <p class="muted" style="margin-bottom:0">Balanced error profile (8 false-refusals, 4 false-accepts).</p>
+  </div>
+  <div class="card adapt">
+    <h4>Tool-adapter confusion (53 valid)</h4>
+    <table>
+      <tr><th></th><th>&rarr;ans</th><th>&rarr;unans</th></tr>
+      <tr><td><b>answerable</b></td><td>10</td><td>18</td></tr>
+      <tr><td><b>unanswerable</b></td><td>0</td><td>25</td></tr>
+    </table>
+    <p class="muted" style="margin-bottom:0">Strong bias toward unanswerable; 7/60 generations collapsed the two-part structure into one turn.</p>
+  </div>
+</div>
+
+<h3>What each flow learns</h3>
+<div class="cols">
+  <div class="card base">
+    <h4><span class="tag base">plain</span> one-word verdict</h4>
+    <p style="margin:0">Reads question + docs (injected as a <code>tool</code> message), answers directly with <code>"answerable"</code>/<code>"unanswerable"</code>. The completion is one word, so the model fits the format fast and spends its capacity on the <em>decision</em>.</p>
+  </div>
+  <div class="card adapt">
+    <h4><span class="tag adapt">tool</span> verdict + scaffolding</h4>
+    <p style="margin:0">The base emits a <code>&lt;tool_call&gt;</code>; the switch routes to the adapter, which generates the <code>&lt;tool_response&gt;</code> verdict <em>and</em> the answer turn. It must learn the decision <em>and</em> the structural scaffolding, which dilutes the decision signal.</p>
+  </div>
+</div>
+
+<h2 id="takeaways">10 &middot; Key takeaways</h2>
+<ol class="steps" style="padding-left:22px">
+  <li style="margin:8px 0"><b>At this scale the plain flow is both more accurate (0.80 vs 0.66) and more robust</b> (no structural failures, no class bias). Expected: it only learns a 1-word decision; the tool-adapter must also learn the scaffolding.</li>
+  <li style="margin:8px 0"><b>The adapter-as-tool capability is proven to work</b> &mdash; a correctly-trained SR adapter reliably generates the full <code>tool_response</code> + answer at inference under stock <code>generate()</code>. The 12% structural-failure rate and the class bias are scale artifacts (120 rows, 1 epoch), not pipeline defects.</li>
+  <li style="margin:8px 0"><b>The single-<code>&lt;|im_end|&gt;</code> design is load-bearing.</b> An earlier attempt trained on the fully-stock stream emitted <code>\n&lt;|im_end|&gt;</code> and halted immediately at inference. Dropping the intermediate <code>&lt;|im_end|&gt;</code> took structural validity from 0 &rarr; 1.0.</li>
+  <li style="margin:8px 0"><b><code>ground_truth</code> is the correct gold.</b> Pairing the verdict with a synthesized prose answer scored ~chance; the gold verdict label lifted accuracy to 0.66.</li>
+</ol>
+
+<h2 id="open">11 &middot; Open questions &amp; next levers</h2>
+<h3>Next levers (not pipeline changes)</h3>
+<ul class="tight">
+  <li><b>Scale:</b> full 3191-row set, multiple epochs, on GPU &mdash; both flows should approach the ~0.89 band.</li>
+  <li><b>Tool-adapter structure robustness:</b> more rows reinforce the two-part structure; alternatively constrain decoding or add a structure-repair step.</li>
+  <li><b>Class bias:</b> larger / re-balanced data and longer training.</li>
+</ul>
+<h3>Open questions to resolve</h3>
+<ul class="tight">
+  <li><b>Multiple adapters, one model.</b> Each SR adapter is a separate PEFT adapter; serving several means the switch selects by called-function name (or one multi-task adapter). Rows tag <code>metadata.tool_name</code> so they can be split per-adapter later.</li>
+  <li><b>Does the base ever answer without a tool?</b> Those turns must stay masked &mdash; the adapter only owns post-tool-call spans. The one-row-per-call construction handles this automatically.</li>
+  <li><b>tool_response fidelity.</b> The adapter generates JSON that must parse; eval asserts a valid <code>&lt;tool_response&gt;</code> body with the expected keys before scoring.</li>
+  <li><b>Verdict&harr;answer consistency.</b> Train data keeps them consistent; eval checks the answer polarity matches the emitted verdict.</li>
+  <li><b>Off-spec transcript coherence.</b> Verify the base re-ingests the single-<code>&lt;|im_end|&gt;</code> stream as context without boundary confusion when the conversation continues.</li>
+</ul>
+
+<h2 id="artifacts">12 &middot; Artifacts</h2>
+<div class="tbl-wrap">
+<table>
+  <tr><th>Kind</th><th>Path</th></tr>
+  <tr><td>Plain run</td><td><code>runs/plain_answerability_g42_3b/</code> (adapter, <code>eval.json</code>, <code>eval_dump.jsonl</code>)</td></tr>
+  <tr><td>Tool run</td><td><code>runs/tool_adapter_g42_3b/</code> (adapter, <code>eval.json</code>, <code>eval_dump.jsonl</code>)</td></tr>
+  <tr><td>Generators</td><td><code>scripts/make_plain_answerability_data.py</code>, <code>scripts/make_tool_adapter_data.py</code></td></tr>
+  <tr><td>Evals</td><td><code>scripts/eval_plain_answerability.py</code>, <code>scripts/eval_tool_adapter.py</code></td></tr>
+  <tr><td>Launchers</td><td><code>scripts/run_plain_answerability_local.sh</code>, <code>scripts/run_tool_adapter_local.sh</code></td></tr>
+  <tr><td>Configs</td><td><code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code> (plain), <code>sr-tool-adapter-answerability-g42.yaml</code> (tool)</td></tr>
+</table>
+</div>
+
+<footer>
+  Generated from <code>docs/sr_tool_adapter/SR_TOOL_ADAPTER_BOOTSTRAP.md</code> and <code>FINDINGS.md</code>.
+  Runs on Granite&nbsp;4.2-3b (<code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>), Apple&nbsp;MPS, 2026-10-19/20, branch <code>experiments/sr-tool-adapter</code>.
+</footer>
+
+</div>
+<script>
+  (function () {
+    var links = Array.prototype.slice.call(document.querySelectorAll('nav.toc a'));
+    var map = {};
+    links.forEach(function (a) { map[a.getAttribute('href').slice(1)] = a; });
+    var ids = links.map(function (a) { return a.getAttribute('href').slice(1); });
+    var sections = ids.map(function (id) { return document.getElementById(id); }).filter(Boolean);
+
+    function setActive(id) {
+      links.forEach(function (a) { a.classList.remove('active'); });
+      if (map[id]) map[id].classList.add('active');
+    }
+
+    var observer = new IntersectionObserver(function (entries) {
+      var visible = entries.filter(function (e) { return e.isIntersecting; });
+      if (visible.length) {
+        visible.sort(function (a, b) { return a.boundingClientRect.top - b.boundingClientRect.top; });
+        setActive(visible[0].target.id);
+      }
+    }, { rootMargin: '0px 0px -70% 0px', threshold: 0 });
+
+    sections.forEach(function (s) { observer.observe(s); });
+
+    window.addEventListener('scroll', function () {
+      if (window.scrollY < 80 && sections[0]) setActive(sections[0].id);
+    }, { passive: true });
+    if (sections[0]) setActive(sections[0].id);
+  })();
+</script>
+</body>
+</html>
