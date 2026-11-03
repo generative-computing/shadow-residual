@@ -295,19 +295,40 @@ Changes vs. the stock answerability config:
 - `adapter.last_token`: `<|im_end|>` (end-of-completion marker).
 - `data.enable_thinking`: **False**.
 
-> **IMPLEMENTED (branch `experiments/sr-tool-adapter`).** For training we render
-> the completion through the **stock** chat template (via `messages`+`tools` rows),
-> so the supervised span is fully-stock ChatML and contains the intermediate
-> `<|im_end|>` after `</tool_response>`. The single-`<|im_end|>` concern is an
-> *inference-time stop* issue, not a training blocker, so we train on the faithful
-> stock stream. Artifacts:
-> - `scripts/make_tool_adapter_data.py` — answerability rows → tool-adapter convos.
-> - `data/tool_adapter/{train,val}.jsonl` — generated data (3191/354).
-> - `src/shadow_residual/config/sr-tool-adapter-answerability-g42.yaml` — config.
+> **IMPLEMENTED (branch `experiments/sr-tool-adapter`).** The generator emits
+> **pre-rendered `{"text"}` rows** (consumed by `data.py`'s passthrough at
+> `data.py:156`), hand-assembling the completion so the supervised span carries
+> **exactly one, terminal `<|im_end|>`** — the intermediate turn-closing
+> `<|im_end|>` after `</tool_response>` is omitted (it is the EOS/stop token;
+> supervising it would teach the adapter to halt before emitting the answer).
+> Verified against the stock 4.2 template: our span is byte-identical to the
+> template's except for the two omitted `<|im_end|>` seams (after `</tool_call>`
+> and after `</tool_response>`).
+>
+> **`--thinking` flag (3 modes)** controls what the answer turn emits after
+> `<|im_start|>assistant\n`:
+> - `off` *(default)* — nothing: `<|im_start|>assistant\n"answerable"<|im_end|>`
+> - `enabled` — open think tag: `<|im_start|>assistant\n<think>"answerable"<|im_end|>`
+> - `disabled` — empty closed block: `<|im_start|>assistant\n<think></think>"answerable"<|im_end|>`
+>
+> The collator cuts at `</tool_call>`, so the think prefix is part of the
+> **supervised** span (the adapter learns to emit it). `eval_tool_adapter.py` is
+> thinking-mode agnostic: it strips a closed or dangling `<think>` block before
+> reading the answer.
+>
+> **Data source.** `make_tool_adapter_data.py` accepts either the raw
+> `answerability_evaluation.jsonl` shape (explicit `ground_truth` field) **or**
+> the already-rendered `unified_compare/data_v4` shape (no `ground_truth` — the
+> verdict is the final assistant turn, derived via `_verdict_from_messages`).
+> Artifacts:
+> - `scripts/make_tool_adapter_data.py` — answerability rows → tool-adapter convos
+>   (`--thinking {off,enabled,disabled}`).
+> - `src/shadow_residual/config/sr-tool-adapter-answerability-g42.yaml` — config
+>   (`assistant_marker` / `last_context_token` = `</tool_call>`).
 > - `scripts/eval_tool_adapter.py` — structural + verdict-accuracy + consistency eval.
-> Boundary verified: `last_context_token boundary validated on 8/8 sampled rows`;
-> token before supervision = `</tool_call>`; supervised span = verdict
-> `<tool_response>` + answer, ending at `<|im_end|>`.
+> Boundary verified on real data: token before supervision = `</tool_call>`;
+> supervised span = verdict `<tool_response>` + answer, ending at the single
+> terminal `<|im_end|>`.
 
 ### First run result (2026-10-19, Granite 4.2-3b, local MPS)
 
@@ -615,3 +636,42 @@ What is our company's parental leave policy for new fathers?
 ```
 
 > **Two deliberate seams** (both from the single-`<|im_end|>` design): there is no `<|im_end|>` after the base's `</tool_call>` (the cut point), and none after the adapter's `</tool_response>` before `<|im_start|>assistant` (the dropped intermediate stop). The adapter emits exactly one `<|im_end|>`, at the very end — its genuine stop under stock `generate()`.
+
+---
+
+## How the generation is parsed back into messages (answers open-question 5)
+
+One `generate()` call produces a stream spanning **three** logical turns
+(assistant tool_call → tool_response → final assistant answer), because the
+single terminal `<|im_end|>` is the only stop. How an inference engine turns that
+back into discrete messages depends entirely on the serving stack. Verified facts
+(Granite 4.2 tokenizer): `<|im_start|>` (id 100256) and `<|im_end|>` (id 100257)
+are both **single special tokens**; the accumulated generation holds 2 embedded
+`<|im_start|>` + 1 terminal `<|im_end|>`.
+
+**Scenario A — stock chat-completions server (the default, and the trap).** The
+server treats the whole generation as **one assistant message**, runs the Granite
+tool-call parser to lift `<tool_call>…</tool_call>` into `tool_calls[]`, and leaves
+the rest as `content`. The `<tool_response>` and the final answer are **stranded
+inside `content`** as raw text. With the OpenAI-default `skip_special_tokens=True`,
+the `<|im_start|>` markers are **deleted on decode**, so the role boundaries vanish
+entirely (`…</tool_call>\nuser\n<tool_response>…\nassistant\n"answerable"`). The
+three messages are **not** recovered.
+
+**Scenario B — turn-aware re-segmentation (opt-in).** If the switch runtime decodes
+with `skip_special_tokens=False` and splits on `<|im_start|>ROLE`, it recovers all
+three messages cleanly: `assistant`(tool_call) → `user`(tool_response) →
+`assistant`(answer). This only works because the role markers survive, and it is
+**not** what a stock endpoint does — the runtime must deliberately re-split.
+
+**Scenario C — residual seam ambiguities even when B succeeds.** (1) The
+tool_response comes back under role **`user`** (how 4.2 renders tool output), not
+role `tool`; a downstream re-render could mislabel it. (2) The dropped intermediate
+`<|im_end|>` means a **strict** parser that requires every `<|im_start|>` to be
+`<|im_end|>`-closed before the next opens will see malformed turns.
+
+**Bottom line.** The 3-message split is only recoverable if the switch runtime
+(a) keeps special tokens on decode and (b) deliberately re-segments on
+`<|im_start|>`. A naive OpenAI server collapses everything into one assistant
+message with the tool_response + answer stranded in `content` and markers
+stripped. The switch runtime — not the model — owns this responsibility.

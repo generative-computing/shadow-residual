@@ -192,11 +192,12 @@
   <a href="#config"><span class="n">7</span>Config &amp; pipeline wiring</a>
   <div class="toc-group">Trace</div>
   <a href="#trace"><span class="n">8</span>Full inference trace</a>
+  <a href="#parsing"><span class="n">9</span>Parsing the generation back</a>
   <div class="toc-group">Results</div>
-  <a href="#results"><span class="n">9</span>Results: tool vs. plain</a>
-  <a href="#takeaways"><span class="n">10</span>Key takeaways</a>
-  <a href="#open"><span class="n">11</span>Open questions &amp; next levers</a>
-  <a href="#artifacts"><span class="n">12</span>Artifacts</a>
+  <a href="#results"><span class="n">10</span>Results: tool vs. plain</a>
+  <a href="#takeaways"><span class="n">11</span>Key takeaways</a>
+  <a href="#open"><span class="n">12</span>Open questions &amp; next levers</a>
+  <a href="#artifacts"><span class="n">13</span>Artifacts</a>
 </nav>
 
 <div class="wrap">
@@ -271,7 +272,19 @@
   </div>
 </div>
 
-<div class="note"><b>Training vs. inference nuance.</b> The single-<code>&lt;|im_end|&gt;</code> concern is an <em>inference-time stop</em> issue. For the shipped runs the completion is rendered through the stock chat template, so the supervised span contains the intermediate <code>&lt;|im_end|&gt;</code> during training; the constraint matters at generation time. Boundary verified on sampled rows: token before supervision = <code>&lt;/tool_call&gt;</code>; supervised span = the <code>&lt;tool_response&gt;</code> verdict + answer.</div>
+<div class="note"><b>Shipped as single-<code>&lt;|im_end|&gt;</code> in the data.</b> The generator emits pre-rendered <code>{"text"}</code> rows with exactly one, terminal <code>&lt;|im_end|&gt;</code> &mdash; the intermediate turn-closer is omitted in the training data itself, not just worked around at inference. Verified byte-identical to the stock 4.2 template except for the two omitted <code>&lt;|im_end|&gt;</code> seams. Boundary verified on real data: token before supervision = <code>&lt;/tool_call&gt;</code>; supervised span = the <code>&lt;tool_response&gt;</code> verdict + answer, ending at the single terminal <code>&lt;|im_end|&gt;</code>.</div>
+
+<h3>The <code>--thinking</code> flag (3 modes)</h3>
+<p>What the answer turn emits right after <code>&lt;|im_start|&gt;assistant\n</code> is controlled by <code>make_tool_adapter_data.py --thinking</code>. The tool_response block and template scaffolding are built identically through the assistant opener in all three modes; only the think prefix differs. Because the collator cuts at <code>&lt;/tool_call&gt;</code>, the prefix is part of the <b>supervised</b> span &mdash; the adapter learns to emit it.</p>
+<div class="tbl-wrap">
+<table class="cmp">
+  <tr><th>Mode</th><th>After <code>assistant\n</code></th><th>Note</th></tr>
+  <tr><td><code>off</code> <span class="muted">(default)</span></td><td><code>"answerable"&lt;|im_end|&gt;</code></td><td>No think block; shortest completion.</td></tr>
+  <tr><td><code>enabled</code></td><td><code>&lt;think&gt;"answerable"&lt;|im_end|&gt;</code></td><td>Open think tag; adapter reasons before the verdict.</td></tr>
+  <tr><td><code>disabled</code></td><td><code>&lt;think&gt;&lt;/think&gt;"answerable"&lt;|im_end|&gt;</code></td><td>Empty closed block; prior answerability-adapter convention.</td></tr>
+</table>
+</div>
+<p class="muted"><code>eval_tool_adapter.py</code> is thinking-mode agnostic &mdash; it strips a closed or dangling <code>&lt;think&gt;</code> block before reading the answer, so verdict/answer parse under any mode.</p>
 
 <h2 id="data">5 &middot; Training-data construction</h2>
 <p>Each training row is a full conversation (<code>{"messages": [&hellip;], "tools": [&hellip;]}</code>) rendered with <code>apply_chat_template(&hellip;, tools=&hellip;, add_generation_prompt=False, enable_thinking=False)</code> &mdash; exactly the shape <code>data.py</code> already consumes.</p>
@@ -384,7 +397,23 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   </div>
 </div>
 
-<h2 id="results">9 &middot; Results: tool-adapter vs. plain</h2>
+<h2 id="parsing">9 &middot; Parsing the generation back into messages</h2>
+<p>One <code>generate()</code> call produces a stream spanning <b>three</b> logical turns (assistant tool_call &rarr; tool_response &rarr; final assistant answer), because the single terminal <code>&lt;|im_end|&gt;</code> is the only stop. How an inference engine turns that back into discrete messages depends entirely on the serving stack. Verified on the 4.2 tokenizer: <code>&lt;|im_start|&gt;</code> (id 100256) and <code>&lt;|im_end|&gt;</code> (id 100257) are both single special tokens; the accumulated generation holds 2 embedded <code>&lt;|im_start|&gt;</code> + 1 terminal <code>&lt;|im_end|&gt;</code>.</p>
+
+<div class="cols">
+  <div class="card base">
+    <h4>A &mdash; stock server (the trap)</h4>
+    <p style="margin:0">Treats the whole generation as <b>one assistant message</b>: the tool-call parser lifts <code>&lt;tool_call&gt;</code> into <code>tool_calls[]</code>, the rest becomes <code>content</code>. The tool_response + answer are <b>stranded in <code>content</code></b>. With the OpenAI-default <code>skip_special_tokens=True</code> the <code>&lt;|im_start|&gt;</code> markers are <b>deleted on decode</b>, so role boundaries vanish. The 3 messages are <b>not</b> recovered.</p>
+  </div>
+  <div class="card adapt">
+    <h4>B &mdash; turn-aware (opt-in)</h4>
+    <p style="margin:0">If the switch runtime decodes with <code>skip_special_tokens=False</code> and splits on <code>&lt;|im_start|&gt;ROLE</code>, it recovers all three cleanly: <code>assistant</code>(tool_call) &rarr; <code>user</code>(tool_response) &rarr; <code>assistant</code>(answer). Works only because the markers survive &mdash; <b>not</b> what a stock endpoint does.</p>
+  </div>
+</div>
+<div class="note"><b>Residual seams even when B succeeds.</b> (1) The tool_response returns under role <code>user</code> (how 4.2 renders tool output), not <code>tool</code> &mdash; a downstream re-render could mislabel it. (2) The dropped intermediate <code>&lt;|im_end|&gt;</code> means a <em>strict</em> parser (every <code>&lt;|im_start|&gt;</code> must close before the next opens) sees malformed turns.</div>
+<div class="oneliner"><b>Bottom line.</b> The 3-message split is recoverable only if the switch runtime (a) keeps special tokens on decode and (b) deliberately re-segments on <code>&lt;|im_start|&gt;</code>. A naive OpenAI server collapses everything into one assistant message with the tool_response + answer stranded in <code>content</code>, markers stripped. The <b>runtime</b>, not the model, owns this.</div>
+
+<h2 id="results">10 &middot; Results: tool-adapter vs. plain</h2>
 <p>Two SR answerability adapters trained and evaluated on the same base, data, and scale, to compare the <b>adapter-as-tool</b> flow against the <b>plain</b> (label-only) flow. Base <code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>; data from <code>answerability_evaluation.jsonl</code> (gold = the <code>ground_truth</code> verdict); SR r32 on q/o/MLP + <code>cross_stream</code>, thinking off; free-generation greedy eval.</p>
 
 <div class="note"><b>Scale caveat.</b> These numbers are from the <b>flow-validation</b> run: 120 balanced train rows (60/60), 60 balanced val rows, 1 epoch, 15 optimizer steps, ~32&ndash;37&nbsp;min each on Apple&nbsp;MPS. Absolute numbers are indicative, not final &mdash; the prior full-scale answerability run (Vela GPU) reached ~0.89. A full-scale rerun (3191 train / 354 val, 2 epochs) is the current next lever.</div>
@@ -433,7 +462,7 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   </div>
 </div>
 
-<h2 id="takeaways">10 &middot; Key takeaways</h2>
+<h2 id="takeaways">11 &middot; Key takeaways</h2>
 <ol class="steps" style="padding-left:22px">
   <li style="margin:8px 0"><b>At this scale the plain flow is both more accurate (0.80 vs 0.66) and more robust</b> (no structural failures, no class bias). Expected: it only learns a 1-word decision; the tool-adapter must also learn the scaffolding.</li>
   <li style="margin:8px 0"><b>The adapter-as-tool capability is proven to work</b> &mdash; a correctly-trained SR adapter reliably generates the full <code>tool_response</code> + answer at inference under stock <code>generate()</code>. The 12% structural-failure rate and the class bias are scale artifacts (120 rows, 1 epoch), not pipeline defects.</li>
@@ -441,7 +470,7 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   <li style="margin:8px 0"><b><code>ground_truth</code> is the correct gold.</b> Pairing the verdict with a synthesized prose answer scored ~chance; the gold verdict label lifted accuracy to 0.66.</li>
 </ol>
 
-<h2 id="open">11 &middot; Open questions &amp; next levers</h2>
+<h2 id="open">12 &middot; Open questions &amp; next levers</h2>
 <h3>Next levers (not pipeline changes)</h3>
 <ul class="tight">
   <li><b>Scale:</b> full 3191-row set, multiple epochs, on GPU &mdash; both flows should approach the ~0.89 band.</li>
@@ -454,10 +483,10 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   <li><b>Does the base ever answer without a tool?</b> Those turns must stay masked &mdash; the adapter only owns post-tool-call spans. The one-row-per-call construction handles this automatically.</li>
   <li><b>tool_response fidelity.</b> The adapter generates JSON that must parse; eval asserts a valid <code>&lt;tool_response&gt;</code> body with the expected keys before scoring.</li>
   <li><b>Verdict&harr;answer consistency.</b> Train data keeps them consistent; eval checks the answer polarity matches the emitted verdict.</li>
-  <li><b>Off-spec transcript coherence.</b> Verify the base re-ingests the single-<code>&lt;|im_end|&gt;</code> stream as context without boundary confusion when the conversation continues.</li>
+  <li><b>Off-spec transcript coherence.</b> <em>Answered in <a href="#parsing">&sect;9</a>:</em> the single-<code>&lt;|im_end|&gt;</code> stream is only re-segmented into messages if the switch runtime keeps special tokens and splits on <code>&lt;|im_start|&gt;</code>; a stock server strands the tool_response + answer in one assistant <code>content</code>.</li>
 </ul>
 
-<h2 id="artifacts">12 &middot; Artifacts</h2>
+<h2 id="artifacts">13 &middot; Artifacts</h2>
 <div class="tbl-wrap">
 <table>
   <tr><th>Kind</th><th>Path</th></tr>
