@@ -34,6 +34,20 @@ def _last_user_question(messages: list[dict]) -> str | None:
     return None
 
 
+def _verdict_from_messages(messages: list[dict]) -> str | None:
+    """Derive the verdict from the final assistant turn (unified_compare/data_v4
+    shape, which has no `ground_truth` field — its last assistant turn is the gold
+    quoted label '"answerable"' / '"unanswerable"'). Returns a normalized label
+    or None if the last assistant turn isn't a recognizable verdict."""
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            raw = (m.get("content") or "").strip().strip('"').strip().lower()
+            if raw in ("answerable", "unanswerable", "partial", "conversational"):
+                return raw
+            return None
+    return None
+
+
 def _normalize_documents(docs) -> list[dict]:
     out = []
     for i, d in enumerate(docs or []):
@@ -47,7 +61,7 @@ def _normalize_documents(docs) -> list[dict]:
 
 
 def build_row(obj: dict) -> dict | None:
-    gt = obj.get("ground_truth")
+    gt = obj.get("ground_truth") or _verdict_from_messages(obj.get("messages", []))
     if gt in ("conversational", None):
         return None
     answerable = gt in ("answerable", "partial")

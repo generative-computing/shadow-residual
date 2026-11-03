@@ -74,6 +74,24 @@ def _last_user_question(messages: list[dict]) -> str | None:
     return None
 
 
+def _verdict_from_messages(messages: list[dict]) -> str | None:
+    """Derive the answerability verdict from the FINAL assistant turn.
+
+    The unified_compare answerability data (data_v4) carries no `ground_truth`
+    field — it is already-rendered multi-turn chat whose last assistant turn is
+    the gold verdict, a quoted label like '"answerable"' / '"unanswerable"'
+    (optionally wrapped in quotes/whitespace). Returns a normalized
+    "answerable" / "unanswerable" / "partial" / "conversational", or None if the
+    last assistant turn isn't a recognizable verdict label."""
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            raw = (m.get("content") or "").strip().strip('"').strip().lower()
+            if raw in ("answerable", "unanswerable", "partial", "conversational"):
+                return raw
+            return None
+    return None
+
+
 def _normalize_documents(docs) -> list[dict]:
     out = []
     for i, d in enumerate(docs or []):
@@ -95,10 +113,12 @@ THINK_PREFIX = {"off": "", "enabled": "<think>", "disabled": "<think></think>"}
 
 
 def build_row(obj: dict, tokenizer, thinking: str = "off") -> dict | None:
-    gt = obj.get("ground_truth")
-    # `ground_truth` is the gold answerability verdict and the SOLE supervised
-    # signal. Keep the clean binary decision: map partial->answerable, drop
-    # conversational (no grounding decision to learn).
+    # The gold verdict is either an explicit `ground_truth` field (raw
+    # answerability_evaluation.jsonl shape) or, failing that, the final assistant
+    # turn of an already-rendered conversation (unified_compare/data_v4 shape).
+    gt = obj.get("ground_truth") or _verdict_from_messages(obj.get("messages", []))
+    # Keep the clean binary decision: map partial->answerable, drop conversational
+    # (no grounding decision to learn) and anything unrecognized.
     if gt in ("conversational", None):
         return None
     answerable = gt in ("answerable", "partial")
