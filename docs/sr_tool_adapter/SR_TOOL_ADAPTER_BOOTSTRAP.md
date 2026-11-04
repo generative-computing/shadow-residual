@@ -635,7 +635,14 @@ What is our company's parental leave policy for new fathers?
 >>> CUT HERE (the <|im_end|> is NOT sampled) <<<
 ```
 
-### STEP 4 — the adapter generates (verdict tool_response + answer, ONE `<|im_end|>`)
+### STEP 4 — the adapter generates the tool_response, then stops at the assistant opener
+
+The adapter emits the verdict `<tool_response>` turn **and the opener of the next
+assistant turn**, then **stops at `<|im_start|>assistant\n`**. It does **not**
+write the answer — control hands back to the base (or another adapter) to generate
+the assistant answer. Which entity generates that answer is **out of scope** here.
+Single-`<|im_end|>` seam: none after `</tool_call>` (the cut) and none after
+`</tool_response>` before the opener.
 
 ```
 <|im_start|>user
@@ -643,6 +650,16 @@ What is our company's parental leave policy for new fathers?
 {"answerable": true, "rationale": "The HR handbook states 16 weeks of paid parental leave is available to all parents regardless of gender, which covers new fathers."}
 </tool_response>
 <|im_start|>assistant
+   <-- ADAPTER STOPS HERE (right after the assistant opener)
+```
+
+### STEP 5 — the base (or another adapter) writes the answer (out of scope)
+
+Resuming from the handoff point (cursor right after `<|im_start|>assistant\n`), the
+base or a downstream adapter generates the user-facing answer and its terminal
+`<|im_end|>`. This turn is **not** the answerability adapter's output:
+
+```
 <think></think>Yes. New fathers are eligible for 16 weeks of paid parental leave, taken any time within the first 12 months after the birth or adoption. The policy applies to all parents regardless of gender.<|im_end|>
 ```
 
