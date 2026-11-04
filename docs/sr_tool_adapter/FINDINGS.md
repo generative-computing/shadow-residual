@@ -98,9 +98,38 @@ structural scaffolding. In principle this is the plain flow's advantage, kept
 inside the tool protocol. See `SR_TOOL_ADAPTER_BOOTSTRAP.md` → *Tool formatting
 modes*.
 
-**Vela run (Granite 4.2-3b, 2 epochs, 4-GPU DDP; data generated in-pod from the
-same `unified_compare/data_v4` source as the autoregressive Vela run):** pending.
-Results land here and in the HTML once the job completes.
+### Vela run (2026-11-04, job `antonp-sr-tooladapter-ext-42-3b`, commit `b29a377`)
+
+Granite 4.2-3b prerelease, SR r32 q/o/MLP + cross_stream, 4-GPU DDP, 2 epochs
+(750 optimizer steps). Data was generated in-pod from `unified_compare/data_v4`
+(11,978 train / 1,350 val), the same source as the autoregressive Vela run.
+Boundary validated on 8/8 rows per rank.
+
+| metric | value |
+|---|---|
+| free-gen verdict accuracy (1,350 val) | **0.9541** |
+| structural validity (generation parses as the dict) | **1.00** |
+| EOS stop rate (ended on `<|im_end|>`, not max tokens) | **1.00** |
+| held-out `eval_loss`, epoch 1 → 2 | 0.0191 → 0.0167 |
+| held-out `eval_mean_token_accuracy`, epoch 1 → 2 | 0.9927 → 0.9936 |
+
+|  | →answerable | →unanswerable |
+|---|---|---|
+| **answerable** (665) | 630 | 35 |
+| **unanswerable** (685) | 27 | 658 |
+
+Balanced error profile: 35 false-refusals, 27 false-accepts. Every generation was
+exactly the dict followed by EOS, so the environment-side contract (emit the
+payload, stop, let the env close the tag) holds with no structural failures.
+
+> **Comparability caveat.** This val set is the `data_v4` held-out split
+> (in-distribution with training), scored by `eval_tool_adapter.py`. It is **not**
+> the canonical answerability eval (`evaluation_data/answerability/`, scored by
+> `answerability_eval`) behind the ~0.89 numbers. The like-for-like comparison is
+> the autoregressive Vela run on the same `data_v4` split.
+
+Artifacts: `/danieloh_cos/granite-switch/adapter_training/shadow_residual_runs/tooladapter_external_42_3b/sr-tooladapter-ext-ans-42-3b/run_20261104T080120Z/`
+(`checkpoints/` adapter, `eval.json`, `eval_dump.jsonl`).
 
 ## Next levers (not pipeline changes)
 
