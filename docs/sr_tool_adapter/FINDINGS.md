@@ -88,6 +88,20 @@ tool_response + answer into one turn).
    verdict — the synthetic answer was noise. Switching the completion to the gold
    verdict label (`"answerable"`/`"unanswerable"`) lifted verdict accuracy to 0.66.
 
+## External tool formatting (`external_tool_formatting`)
+
+A second mode in which the environment owns the template: it writes
+`<tool_response>\n`, the adapter emits only the verdict dict and stops on EOS, and
+the environment appends `\n</tool_response>\n`. The supervised span is just
+`{"answerable": <bool>}<|im_end|>`, so the adapter learns the decision with no
+structural scaffolding. In principle this is the plain flow's advantage, kept
+inside the tool protocol. See `SR_TOOL_ADAPTER_BOOTSTRAP.md` → *Tool formatting
+modes*.
+
+**Vela run (Granite 4.2-3b, 2 epochs, 4-GPU DDP; data generated in-pod from the
+same `unified_compare/data_v4` source as the autoregressive Vela run):** pending.
+Results land here and in the HTML once the job completes.
+
 ## Next levers (not pipeline changes)
 
 - **Scale:** full 3191-row set, multiple epochs, on GPU — both flows should

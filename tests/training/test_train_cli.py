@@ -12,6 +12,7 @@ from shadow_residual.config import load_training_config
 from shadow_residual.training.train import (
     _build_parser,
     apply_cli_overrides,
+    apply_tool_formatting,
 )
 
 
@@ -120,6 +121,46 @@ def test_thinking_flag_default_off(config_path):
     args = _build_parser().parse_args(["--config", str(config_path)])
     apply_cli_overrides(cfg, args)
     assert cfg.data.enable_thinking is False
+
+
+def test_tool_formatting_default_off(config_path):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(["--config", str(config_path)])
+    apply_cli_overrides(cfg, args)
+    apply_tool_formatting(cfg)
+    assert cfg.data.tool_formatting is None
+    assert cfg.data.assistant_marker is None
+    assert cfg.adapter.last_context_token is None
+    assert cfg.adapter.last_token is None
+
+
+def test_tool_formatting_bare_flag_is_autoregressive(config_path):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(["--config", str(config_path), "--tool-formatting"])
+    apply_cli_overrides(cfg, args)
+    apply_tool_formatting(cfg)
+    assert cfg.data.tool_formatting == "autoregressive_tool_formatting"
+    assert cfg.data.assistant_marker == "</tool_call>"
+    assert cfg.adapter.last_context_token == "</tool_call>"
+    assert cfg.adapter.last_token == "<|im_end|>"
+
+
+def test_tool_formatting_external_markers(config_path):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(
+        ["--config", str(config_path), "--tool-formatting", "external_tool_formatting"]
+    )
+    apply_cli_overrides(cfg, args)
+    apply_tool_formatting(cfg)
+    assert cfg.data.tool_formatting == "external_tool_formatting"
+    assert cfg.data.assistant_marker == "<tool_response>\n"
+    assert cfg.adapter.last_context_token == "\n"
+    assert cfg.adapter.last_token == "<|im_end|>"
+
+
+def test_tool_formatting_rejects_unknown_mode(config_path):
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["--config", str(config_path), "--tool-formatting", "bogus"])
 
 
 def test_quantize_flag_does_not_touch_config(config_path):

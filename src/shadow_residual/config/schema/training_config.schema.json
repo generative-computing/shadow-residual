@@ -172,6 +172,17 @@
           "default": false,
           "title": "Instruction As User Message",
           "type": "boolean"
+        },
+        "tool_formatting": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolFormatting"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -420,6 +431,15 @@
         "constant_with_warmup"
       ],
       "title": "SchedulerType",
+      "type": "string"
+    },
+    "ToolFormatting": {
+      "description": "How an SR adapter invoked as a tool relates to the chat template.\n\n- AUTOREGRESSIVE: the adapter takes over right after the base's\n  ``</tool_call>`` and itself emits the whole ``<tool_response>`` turn plus\n  the final assistant answer, ending at a single terminal ``<|im_end|>``.\n- EXTERNAL: the serving environment owns the template. It closes the base's\n  tool-call turn, writes ``<|im_start|>user\\n<tool_response>\\n`` and hands\n  over; the adapter emits only the tool-response dict and stops (EOS). The\n  environment then appends ``\\n</tool_response>\\n``.",
+      "enum": [
+        "autoregressive_tool_formatting",
+        "external_tool_formatting"
+      ],
+      "title": "ToolFormatting",
       "type": "string"
     },
     "TrainerConfig": {

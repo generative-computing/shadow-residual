@@ -186,18 +186,19 @@
   <a href="#emit"><span class="n">2</span>What the adapter emits</a>
   <a href="#boundary"><span class="n">3</span>The token boundary</a>
   <a href="#single-imend"><span class="n">4</span>The single-<code>im_end</code> design</a>
+  <a href="#modes"><span class="n">5</span>Two formatting modes</a>
   <div class="toc-group">Data</div>
-  <a href="#data"><span class="n">5</span>Training-data construction</a>
-  <a href="#mask"><span class="n">6</span>What to mask vs. supervise</a>
-  <a href="#config"><span class="n">7</span>Config &amp; pipeline wiring</a>
+  <a href="#data"><span class="n">6</span>Training-data construction</a>
+  <a href="#mask"><span class="n">7</span>What to mask vs. supervise</a>
+  <a href="#config"><span class="n">8</span>Config &amp; pipeline wiring</a>
   <div class="toc-group">Trace</div>
-  <a href="#trace"><span class="n">8</span>Full inference trace</a>
-  <a href="#parsing"><span class="n">9</span>Parsing the generation back</a>
+  <a href="#trace"><span class="n">9</span>Full inference trace</a>
+  <a href="#parsing"><span class="n">10</span>Parsing the generation back</a>
   <div class="toc-group">Results</div>
-  <a href="#results"><span class="n">10</span>Results: tool vs. plain</a>
-  <a href="#takeaways"><span class="n">11</span>Key takeaways</a>
-  <a href="#open"><span class="n">12</span>Open questions &amp; next levers</a>
-  <a href="#artifacts"><span class="n">13</span>Artifacts</a>
+  <a href="#results"><span class="n">11</span>Results: tool vs. plain</a>
+  <a href="#takeaways"><span class="n">12</span>Key takeaways</a>
+  <a href="#open"><span class="n">13</span>Open questions &amp; next levers</a>
+  <a href="#artifacts"><span class="n">14</span>Artifacts</a>
 </nav>
 
 <div class="wrap">
@@ -286,7 +287,61 @@
 </div>
 <p class="muted"><code>eval_tool_adapter.py</code> is thinking-mode agnostic &mdash; it strips a closed or dangling <code>&lt;think&gt;</code> block before reading the answer, so verdict/answer parse under any mode.</p>
 
-<h2 id="data">5 &middot; Training-data construction</h2>
+<h2 id="modes">5 &middot; Two formatting modes: autoregressive vs. external</h2>
+<p>Sections 2&ndash;4 describe <b><code>autoregressive_tool_formatting</code></b>: the adapter owns everything after the base's <code>&lt;/tool_call&gt;</code>, including the ChatML scaffolding. <b><code>external_tool_formatting</code></b> takes the opposite stance: the <b>serving environment owns the template</b> and the adapter only produces the tool's payload.</p>
+
+<div class="cols">
+  <div class="card adapt">
+    <h4><span class="tag adapt">default</span> autoregressive_tool_formatting</h4>
+    <ul class="tight">
+      <li><b>Adapter starts after</b> the base's <code>&lt;/tool_call&gt;</code>.</li>
+      <li><b>Adapter emits</b> <code>&lt;|im_start|&gt;user\n&lt;tool_response&gt;\n{dict}\n&lt;/tool_response&gt;\n&lt;|im_start|&gt;assistant\n[think]answer&lt;|im_end|&gt;</code>.</li>
+      <li>One <code>generate()</code> call covers three logical turns; the runtime is trivial but has to re-segment the output (&sect;10).</li>
+      <li>Markers: <code>assistant_marker</code> = <code>last_context_token</code> = <code>&lt;/tool_call&gt;</code>.</li>
+      <li><code>--thinking</code> applies (answer-turn think prefix).</li>
+    </ul>
+  </div>
+  <div class="card base">
+    <h4><span class="tag base">new</span> external_tool_formatting</h4>
+    <ul class="tight">
+      <li><b>Env writes</b> <code>\n&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\n&lt;tool_response&gt;\n</code> (closing the base's turn, opening the tool turn) and hands over.</li>
+      <li><b>Adapter emits</b> only <code>{"answerable": true}</code>, then stops on EOS (<code>&lt;|im_end|&gt;</code>).</li>
+      <li><b>Env drops the EOS</b> and appends <code>\n&lt;/tool_response&gt;\n&lt;|im_end|&gt;\n</code>; the base then writes the final answer itself.</li>
+      <li>Markers: <code>assistant_marker</code> = <code>&lt;tool_response&gt;\n</code>, <code>last_context_token</code> = <code>\n</code>.</li>
+      <li>No answer turn, so <code>--thinking</code> does not apply.</li>
+    </ul>
+  </div>
+</div>
+
+<h3>The external span, token by token</h3>
+<pre class="ann"><code><span class="m">[M] &hellip;&lt;/function&gt;\n&lt;/tool_call&gt;           &larr; base</span>
+<span class="m">[M] \n&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\n         &larr; env (stock template glue)</span>
+<span class="m">[M] &lt;tool_response&gt;\n                         &larr; env; last context token = "\n"</span>
+<span class="bound">    &gt;&gt;&gt; MASK BOUNDARY (right after &lt;tool_response&gt;\n) &lt;&lt;&lt;</span>
+<span class="s">[S] {"answerable": true}                      &larr; adapter</span>
+<span class="s">[S] &lt;|im_end|&gt;                                 &larr; adapter's stop (EOS); env discards it</span>
+<span class="m">    \n&lt;/tool_response&gt;\n&lt;|im_end|&gt;\n            &larr; env appends; base resumes</span></code></pre>
+
+<div class="oneliner"><b>Why the trained span ends in <code>&lt;|im_end|&gt;</code>, not <code>\n&lt;/tool_response&gt;</code>.</b> Under stock <code>generate()</code> the only stop is EOS. If the adapter learned to emit <code>\n&lt;/tool_response&gt;</code> it would run on into whatever comes next. Training it to emit the dict and then <code>&lt;|im_end|&gt;</code> gives a clean, engine-native stop. The environment treats that EOS as &ldquo;payload done&rdquo; and writes the closing tag itself. <code>&lt;/tool_response&gt;</code> is a single special token (id&nbsp;100273), so an env that prefers it can also use it as a stop string.</div>
+
+<div class="note"><b>Verified against the stock 4.2 template.</b> An external row with the env suffix appended is <b>byte-identical</b> to <code>apply_chat_template([&hellip;, assistant(tool_calls), tool(dict)])</code>, so the transcript the base re-reads is fully stock ChatML with no off-spec seams (unlike autoregressive mode). The external context is the autoregressive context plus the stock glue, so the two modes see identical prompts up to <code>&lt;/tool_call&gt;</code>. Both are covered by <code>tests/training/test_tool_formatting.py</code>: template identity, the collator supervising exactly <code>{dict}&lt;|im_end|&gt;</code>, and the boundary validator.</div>
+
+<h3>Enabling it</h3>
+<pre><code><span class="cmt"># data (one row per adapter call; --thinking must stay off)</span>
+python scripts/make_tool_adapter_data.py --input &lt;answerability.jsonl&gt; --base-model &lt;4.2&gt; \
+  --out-train train.jsonl --out-val val.jsonl --tool-formatting external_tool_formatting
+
+<span class="cmt"># train (the CLI flag overrides the config's autoregressive default)</span>
+sr-train --config src/shadow_residual/config/sr-tool-adapter-answerability-g42.yaml \
+  --tool-formatting external_tool_formatting --train-data train.jsonl --val-data val.jsonl &hellip;
+
+<span class="cmt"># eval (mode read from each row's metadata.tool_formatting)</span>
+python scripts/eval_tool_adapter.py --base-model &lt;4.2&gt; --adapter &lt;ckpt&gt; --val val.jsonl</code></pre>
+<p>In external mode the eval cuts the prompt at <code>&lt;tool_response&gt;\n</code> and requires the <em>entire</em> generation (up to EOS) to parse as a dict with a boolean <code>answerable</code>. It reports <code>structural_rate</code>, <code>verdict_accuracy</code>, a confusion table, and <code>eos_stop_rate</code> (the fraction that ended on EOS rather than hitting <code>max_new_tokens</code>).</p>
+
+<div class="note"><b>Tool logic is opt-in for the whole repo.</b> <code>data.tool_formatting</code> defaults to unset: standard chat SFT, rows must carry <code>messages</code>, and pre-rendered <code>{"text"}</code> rows are rejected. Setting the field (YAML) or passing <code>--tool-formatting [MODE]</code> (a bare flag means autoregressive) enables the passthrough and fixes the three boundary markers per mode. The mode is recorded into <code>adapter_config.json</code>.</div>
+
+<h2 id="data">6 &middot; Training-data construction</h2>
 <p>Each training row is a full conversation (<code>{"messages": [&hellip;], "tools": [&hellip;]}</code>) rendered with <code>apply_chat_template(&hellip;, tools=&hellip;, add_generation_prompt=False, enable_thinking=False)</code> &mdash; exactly the shape <code>data.py</code> already consumes.</p>
 <p>The generator takes answerability-style rows (question + documents + gold verdict) and emits the agentic conversation shape, <b>one row per adapter tool-call</b>. The example RAG flow &mdash; <code>search_kb</code> &rarr; <code>answerability</code> (answerable) &rarr; answer &rarr; follow-up &rarr; <code>answerability</code> (unanswerable) &rarr; refusal &mdash; yields two rows so the adapter sees both verdict polarities.</p>
 <div class="note"><b><code>ground_truth</code> is the gold.</b> The dataset has no gold <em>prose</em> answer &mdash; only the verdict label. A first run that paired the verdict with a <em>synthesized</em> prose answer scored ~chance (0.52) on the verdict; the synthetic answer was noise. Switching the completion to the gold verdict label (<code>"answerable"</code>/<code>"unanswerable"</code>) lifted accuracy to 0.66.</div>
@@ -294,7 +349,7 @@
 <h3>Single-call-per-row simplification</h3>
 <p>The collator's &ldquo;last occurrence&rdquo; marker rule means a conversation with <em>two</em> adapter tool-calls would only supervise the second. For v1, each conversation is truncated at the end of each adapter's answer turn, emitting one row per call &mdash; so every adapter call is supervised and the boundary rule stays simple.</p>
 
-<h2 id="mask">6 &middot; What to mask vs. supervise</h2>
+<h2 id="mask">7 &middot; What to mask vs. supervise</h2>
 <p>A training row is one flat text span crossing <b>three</b> rendered turns. The mask boundary falls right after <code>&lt;/tool_call&gt;\n</code>:</p>
 <pre class="ann"><code><span class="m">[M] &lt;|im_start|&gt;assistant\n</span>
 <span class="m">[M] &lt;think&gt;&lt;/think&gt;\n</span>
@@ -317,11 +372,12 @@
   <li><b>Supervised:</b> the <code>&lt;tool_response&gt;</code> block <em>and</em> the assistant answer turn.</li>
 </ul>
 
-<h2 id="config">7 &middot; Config &amp; pipeline wiring</h2>
+<h2 id="config">8 &middot; Config &amp; pipeline wiring</h2>
 <p>Reuse the existing SR training path (<code>sr-train</code>, YAML-driven). Config <code>sr-tool-adapter-answerability-g42.yaml</code>, differing from the plain answerability config as follows:</p>
 <div class="tbl-wrap">
 <table class="cmp">
   <tr><th>Knob</th><th>Tool-adapter value</th><th>Why</th></tr>
+  <tr><td><code>tool_formatting</code></td><td><code>autoregressive_tool_formatting</code> <span class="muted">(or <code>external_tool_formatting</code> via <code>--tool-formatting</code>)</span></td><td>Opts in to tool training and sets the three markers below per mode (&sect;5). Unset in every other config.</td></tr>
   <tr><td><code>assistant_marker</code></td><td><code>&lt;/tool_call&gt;</code></td><td>Mask through the trigger tool-call close; supervise what follows. Single token (id 100271) on the 4.2 tokenizer.</td></tr>
   <tr><td><code>last_context_token</code></td><td><code>&lt;/tool_call&gt;</code></td><td>Token immediately before the supervised region; satisfies the single-token boundary validator with no code change.</td></tr>
   <tr><td><code>last_token</code></td><td><code>&lt;|im_end|&gt;</code></td><td>End-of-completion marker.</td></tr>
@@ -331,7 +387,7 @@
 </div>
 <p class="muted">The plain config instead uses <code>assistant_marker = &lt;|im_start|&gt;assistant\n&lt;think&gt;&lt;/think&gt;</code> and <code>last_context_token = &lt;/think&gt;</code> &mdash; the completion is a single verdict word, so it masks through the whole assistant opener.</p>
 
-<h2 id="trace">8 &middot; Full inference trace</h2>
+<h2 id="trace">9 &middot; Full inference trace</h2>
 <p>A single-tool RAG flow on Granite&nbsp;4.2, rendered with the real ChatML template (<code>trim_blocks=True, lstrip_blocks=True</code>, <code>enable_thinking=False</code>). The documents are already in context (RAG-injected as a <code>tool</code> message); the model has one tool, <code>answerability</code>, decides to call it, and the SR adapter produces the verdict and the answer.</p>
 
 <div class="trace">
@@ -397,7 +453,7 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   </div>
 </div>
 
-<h2 id="parsing">9 &middot; Parsing the generation back into messages</h2>
+<h2 id="parsing">10 &middot; Parsing the generation back into messages</h2>
 <p>One <code>generate()</code> call produces a stream spanning <b>three</b> logical turns (assistant tool_call &rarr; tool_response &rarr; final assistant answer), because the single terminal <code>&lt;|im_end|&gt;</code> is the only stop. How an inference engine turns that back into discrete messages depends entirely on the serving stack. Verified on the 4.2 tokenizer: <code>&lt;|im_start|&gt;</code> (id 100256) and <code>&lt;|im_end|&gt;</code> (id 100257) are both single special tokens; the accumulated generation holds 2 embedded <code>&lt;|im_start|&gt;</code> + 1 terminal <code>&lt;|im_end|&gt;</code>.</p>
 
 <div class="cols">
@@ -413,7 +469,7 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
 <div class="note"><b>Residual seams even when B succeeds.</b> (1) The tool_response returns under role <code>user</code> (how 4.2 renders tool output), not <code>tool</code> &mdash; a downstream re-render could mislabel it. (2) The dropped intermediate <code>&lt;|im_end|&gt;</code> means a <em>strict</em> parser (every <code>&lt;|im_start|&gt;</code> must close before the next opens) sees malformed turns.</div>
 <div class="oneliner"><b>Bottom line.</b> The 3-message split is recoverable only if the switch runtime (a) keeps special tokens on decode and (b) deliberately re-segments on <code>&lt;|im_start|&gt;</code>. A naive OpenAI server collapses everything into one assistant message with the tool_response + answer stranded in <code>content</code>, markers stripped. The <b>runtime</b>, not the model, owns this.</div>
 
-<h2 id="results">10 &middot; Results: tool-adapter vs. plain</h2>
+<h2 id="results">11 &middot; Results: tool-adapter vs. plain</h2>
 <p>Two SR answerability adapters trained and evaluated on the same base, data, and scale, to compare the <b>adapter-as-tool</b> flow against the <b>plain</b> (label-only) flow. Base <code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>; data from <code>answerability_evaluation.jsonl</code> (gold = the <code>ground_truth</code> verdict); SR r32 on q/o/MLP + <code>cross_stream</code>, thinking off; free-generation greedy eval.</p>
 
 <div class="note"><b>Scale caveat.</b> These numbers are from the <b>flow-validation</b> run: 120 balanced train rows (60/60), 60 balanced val rows, 1 epoch, 15 optimizer steps, ~32&ndash;37&nbsp;min each on Apple&nbsp;MPS. Absolute numbers are indicative, not final &mdash; the prior full-scale answerability run (Vela GPU) reached ~0.89. A full-scale rerun (3191 train / 354 val, 2 epochs) is the current next lever.</div>
@@ -462,7 +518,7 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   </div>
 </div>
 
-<h2 id="takeaways">11 &middot; Key takeaways</h2>
+<h2 id="takeaways">12 &middot; Key takeaways</h2>
 <ol class="steps" style="padding-left:22px">
   <li style="margin:8px 0"><b>At this scale the plain flow is both more accurate (0.80 vs 0.66) and more robust</b> (no structural failures, no class bias). Expected: it only learns a 1-word decision; the tool-adapter must also learn the scaffolding.</li>
   <li style="margin:8px 0"><b>The adapter-as-tool capability is proven to work</b> &mdash; a correctly-trained SR adapter reliably generates the full <code>tool_response</code> + answer at inference under stock <code>generate()</code>. The 12% structural-failure rate and the class bias are scale artifacts (120 rows, 1 epoch), not pipeline defects.</li>
@@ -470,7 +526,7 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   <li style="margin:8px 0"><b><code>ground_truth</code> is the correct gold.</b> Pairing the verdict with a synthesized prose answer scored ~chance; the gold verdict label lifted accuracy to 0.66.</li>
 </ol>
 
-<h2 id="open">12 &middot; Open questions &amp; next levers</h2>
+<h2 id="open">13 &middot; Open questions &amp; next levers</h2>
 <h3>Next levers (not pipeline changes)</h3>
 <ul class="tight">
   <li><b>Scale:</b> full 3191-row set, multiple epochs, on GPU &mdash; both flows should approach the ~0.89 band.</li>
@@ -483,10 +539,10 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   <li><b>Does the base ever answer without a tool?</b> Those turns must stay masked &mdash; the adapter only owns post-tool-call spans. The one-row-per-call construction handles this automatically.</li>
   <li><b>tool_response fidelity.</b> The adapter generates JSON that must parse; eval asserts a valid <code>&lt;tool_response&gt;</code> body with the expected keys before scoring.</li>
   <li><b>Verdict&harr;answer consistency.</b> Train data keeps them consistent; eval checks the answer polarity matches the emitted verdict.</li>
-  <li><b>Off-spec transcript coherence.</b> <em>Answered in <a href="#parsing">&sect;9</a>:</em> the single-<code>&lt;|im_end|&gt;</code> stream is only re-segmented into messages if the switch runtime keeps special tokens and splits on <code>&lt;|im_start|&gt;</code>; a stock server strands the tool_response + answer in one assistant <code>content</code>.</li>
+  <li><b>Off-spec transcript coherence.</b> <em>Answered in <a href="#parsing">&sect;10</a>:</em> the single-<code>&lt;|im_end|&gt;</code> stream is only re-segmented into messages if the switch runtime keeps special tokens and splits on <code>&lt;|im_start|&gt;</code>; a stock server strands the tool_response + answer in one assistant <code>content</code>.</li>
 </ul>
 
-<h2 id="artifacts">13 &middot; Artifacts</h2>
+<h2 id="artifacts">14 &middot; Artifacts</h2>
 <div class="tbl-wrap">
 <table>
   <tr><th>Kind</th><th>Path</th></tr>
@@ -496,6 +552,9 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   <tr><td>Evals</td><td><code>scripts/eval_plain_answerability.py</code>, <code>scripts/eval_tool_adapter.py</code></td></tr>
   <tr><td>Launchers</td><td><code>scripts/run_plain_answerability_local.sh</code>, <code>scripts/run_tool_adapter_local.sh</code></td></tr>
   <tr><td>Configs</td><td><code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code> (plain), <code>sr-tool-adapter-answerability-g42.yaml</code> (tool)</td></tr>
+  <tr><td>Mode flag</td><td><code>data.tool_formatting</code> / <code>--tool-formatting</code> &mdash; <code>training_config.py:ToolFormatting</code>, markers in <code>train.py:_TOOL_FORMATTING_MARKERS</code></td></tr>
+  <tr><td>Format tests</td><td><code>tests/training/test_tool_formatting.py</code> (real 4.2 template; skipped without the tokenizer)</td></tr>
+  <tr><td>External run (Vela)</td><td><code>/danieloh_cos/granite-switch/adapter_training/shadow_residual_runs/tooladapter_external_42_3b/</code></td></tr>
 </table>
 </div>
 

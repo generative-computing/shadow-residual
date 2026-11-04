@@ -111,8 +111,31 @@ def _normalize_documents(docs) -> list[dict]:
 #   disabled -> "<think></think>" (empty, closed think block)
 THINK_PREFIX = {"off": "", "enabled": "<think>", "disabled": "<think></think>"}
 
+AUTOREGRESSIVE = "autoregressive_tool_formatting"
+EXTERNAL = "external_tool_formatting"
+_SENTINEL = "__SR_TOOL_RESPONSE_SENTINEL__"
 
-def build_row(obj: dict, tokenizer, thinking: str = "off") -> dict | None:
+
+def _external_context(context_msgs: list[dict], tokenizer) -> str:
+    """Stock-template render through the env-written "<tool_response>\\n".
+
+    The env closes the base's tool-call turn and opens the tool-response turn
+    exactly as the chat template would, so render with a sentinel tool message
+    and cut right before it."""
+    rendered = tokenizer.apply_chat_template(
+        context_msgs + [{"role": "tool", "content": _SENTINEL}],
+        tools=[ANSWERABILITY_TOOL], tokenize=False,
+        add_generation_prompt=False, enable_thinking=False,
+    )
+    ctx = rendered[: rendered.rindex(_SENTINEL)]
+    if not ctx.endswith("<tool_response>\n"):
+        raise ValueError(f"unexpected tool-response opener: {ctx[-40:]!r}")
+    return ctx
+
+
+def build_row(
+    obj: dict, tokenizer, thinking: str = "off", tool_formatting: str = AUTOREGRESSIVE
+) -> dict | None:
     # The gold verdict is either an explicit `ground_truth` field (raw
     # answerability_evaluation.jsonl shape) or, failing that, the final assistant
     # turn of an already-rendered conversation (unified_compare/data_v4 shape).
@@ -159,6 +182,15 @@ def build_row(obj: dict, tokenizer, thinking: str = "off") -> dict | None:
             ],
         },
     ]
+    metadata = {"tool_name": "answerability", "verdict": gt, "tool_formatting": tool_formatting}
+
+    if tool_formatting == EXTERNAL:
+        # The adapter emits ONLY the tool-response dict, then EOS (<|im_end|>, the
+        # stock generate() stop). The env drops the EOS and appends
+        # "\n</tool_response>\n<|im_end|>\n" itself.
+        ctx = _external_context(context_msgs, tokenizer)
+        return {"text": ctx + json.dumps(verdict) + "<|im_end|>", "metadata": metadata}
+
     ctx = tokenizer.apply_chat_template(
         context_msgs, tools=[ANSWERABILITY_TOOL], tokenize=False,
         add_generation_prompt=False, enable_thinking=False,
@@ -179,10 +211,7 @@ def build_row(obj: dict, tokenizer, thinking: str = "off") -> dict | None:
         + answer
         + "<|im_end|>"
     )
-    return {
-        "text": ctx + completion,
-        "metadata": {"tool_name": "answerability", "verdict": gt},
-    }
+    return {"text": ctx + completion, "metadata": metadata}
 
 
 def main() -> None:
@@ -200,10 +229,23 @@ def main() -> None:
         default="off",
         help=(
             "What the adapter's answer turn emits after '<|im_start|>assistant\\n': "
-            "off = nothing (default); enabled = '<think>'; disabled = '<think></think>'."
+            "off = nothing (default); enabled = '<think>'; disabled = '<think></think>'. "
+            "Autoregressive mode only (external mode has no answer turn)."
+        ),
+    )
+    ap.add_argument(
+        "--tool-formatting",
+        choices=[AUTOREGRESSIVE, EXTERNAL],
+        default=AUTOREGRESSIVE,
+        help=(
+            f"{AUTOREGRESSIVE} (default): adapter starts after '</tool_call>' and emits "
+            f"the tool_response turn + final answer. {EXTERNAL}: env writes "
+            "'<tool_response>\\n'; adapter emits only the dict, then EOS."
         ),
     )
     args = ap.parse_args()
+    if args.tool_formatting == EXTERNAL and args.thinking != "off":
+        ap.error(f"--thinking applies only to {AUTOREGRESSIVE}")
 
     from transformers import AutoTokenizer
 
@@ -215,7 +257,10 @@ def main() -> None:
             line = line.strip()
             if not line:
                 continue
-            r = build_row(json.loads(line), tokenizer, thinking=args.thinking)
+            r = build_row(
+                json.loads(line), tokenizer,
+                thinking=args.thinking, tool_formatting=args.tool_formatting,
+            )
             if r is not None:
                 rows.append(r)
     if args.limit:

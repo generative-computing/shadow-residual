@@ -54,6 +54,8 @@ most-edited fields.
 --batch-size INT        override batch.per_device_train
 --grad-accum INT        override batch.gradient_accumulation
 --thinking              set data.enable_thinking=True (apply_chat_template enable_thinking)
+--tool-formatting [MODE]  opt in to SR-adapter-as-tool training (data.tool_formatting);
+                        bare flag = autoregressive_tool_formatting, or external_tool_formatting
 --wandb                 set runtime.report_to=['wandb']
 --debug-collator        periodically log a decoded training example + labels
 --skip-post-train-generate   skip the in-process post-training generation step
@@ -139,6 +141,22 @@ adapter:
 `apply_chat_template(..., enable_thinking=...)` when rendering each training
 row. Set it in the YAML or pass `--thinking` on the CLI (CLI wins). Templates
 that don't understand the kwarg ignore it, so the default is a no-op.
+
+## `tool_formatting` (SR adapter invoked as a tool — opt-in)
+
+`data.tool_formatting` defaults to unset: standard chat SFT, no tool logic, and
+rows must carry `messages`. Setting it (YAML or `--tool-formatting`) accepts the
+pre-rendered `{"text"}` rows produced by `scripts/make_tool_adapter_data.py` and
+fixes the boundary markers (overriding `assistant_marker` / `last_context_token`
+/ `last_token`):
+
+| mode | adapter takes over after | adapter emits | markers |
+|---|---|---|---|
+| `autoregressive_tool_formatting` | base's `</tool_call>` | `<tool_response>` turn + final answer, one terminal `<|im_end|>` | `</tool_call>` / `</tool_call>` / `<|im_end|>` |
+| `external_tool_formatting` | env-written `<tool_response>\n` | the tool-response dict only, then EOS | `<tool_response>\n` / `\n` / `<|im_end|>` |
+
+The mode is recorded into `adapter_config.json`. See
+`docs/sr_tool_adapter/sr_tool_adapter.html`.
 
 ## Response-only label masking
 
