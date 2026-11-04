@@ -94,6 +94,7 @@ def load_jsonl_dataset(
     enable_thinking: bool = False,
     last_token: str | None = None,
     instruction_as_user_message: bool = False,
+    allow_prerendered: bool = False,
 ) -> "Dataset":
     """Load a JSONL file and apply the model's chat template to each row.
 
@@ -124,6 +125,10 @@ def load_jsonl_dataset(
     marker (with or without trailing whitespace) are left unchanged. The string
     must encode to exactly one token id (enforced by the caller).
 
+    ``allow_prerendered`` (SR-adapter-as-tool only, set when
+    ``data.tool_formatting`` is on) also accepts rows that carry a ready
+    ``text`` field instead of ``messages``; it is used verbatim.
+
     Returns a `datasets.Dataset` with a single ``text`` column containing the
     chat-templated string. SFTTrainer reads the ``text`` field directly.
     """
@@ -146,20 +151,14 @@ def load_jsonl_dataset(
             if not line:
                 continue
             obj = json.loads(line)
-            # Pre-rendered passthrough: a row may carry a ready `text` field
-            # instead of `messages`. Used by the SR-adapter-as-tool generator,
-            # which hand-assembles the completion so the supervised span omits
-            # the intermediate turn-closing <|im_end|> that the stock chat
-            # template would insert (that <|im_end|> is the EOS/stop token, so
-            # supervising it teaches the adapter to halt before it can emit the
-            # tool_response at inference). See docs/sr_tool_adapter/.
-            if "text" in obj and "messages" not in obj:
+            # Pre-rendered passthrough (tool-formatting runs only): the
+            # SR-adapter-as-tool generator hand-assembles rows whose turn seams
+            # the stock chat template can't produce. See docs/sr_tool_adapter/.
+            if allow_prerendered and "text" in obj and "messages" not in obj:
                 text = obj["text"]
             else:
                 if "messages" not in obj:
-                    raise ValueError(
-                        f"{path}: row is missing 'messages'/'text' field: {obj!r}"
-                    )
+                    raise ValueError(f"{path}: row is missing 'messages' field: {obj!r}")
                 # render_chat folds documents into a system message for ChatML
                 # tokenizers (Granite 4.2, whose template ignores documents=) and
                 # passes them natively otherwise (Granite 4.1). See chat_render.

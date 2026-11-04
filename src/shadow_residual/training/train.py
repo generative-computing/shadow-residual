@@ -26,9 +26,32 @@ from shadow_residual.config.adapters import (
     to_peft_config,
     to_training_arguments,
 )
-from shadow_residual.config.training_config import TrainingConfig
+from shadow_residual.config.training_config import ToolFormatting, TrainingConfig
 
 logger = logging.getLogger(__name__)
+
+
+# Boundary markers per SR-adapter-as-tool mode:
+# (assistant_marker, last_context_token, last_token).
+#   autoregressive: supervision starts after the base's </tool_call>; the adapter
+#     emits the tool_response turn + final answer, ending at <|im_end|>.
+#   external: the env writes "<tool_response>\n"; supervision starts after it and
+#     covers only the dict, ending at <|im_end|> (the EOS the adapter stops on).
+_TOOL_FORMATTING_MARKERS = {
+    ToolFormatting.AUTOREGRESSIVE.value: ("</tool_call>", "</tool_call>", "<|im_end|>"),
+    ToolFormatting.EXTERNAL.value: ("<tool_response>\n", "\n", "<|im_end|>"),
+}
+
+
+def apply_tool_formatting(cfg: TrainingConfig) -> None:
+    """Set the boundary markers implied by ``cfg.data.tool_formatting`` (no-op if unset)."""
+    mode = cfg.data.tool_formatting
+    if mode is None:
+        return
+    marker, last_ctx, last_tok = _TOOL_FORMATTING_MARKERS[mode]
+    cfg.data.assistant_marker = marker
+    cfg.adapter.last_context_token = last_ctx
+    cfg.adapter.last_token = last_tok
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -76,6 +99,13 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Set data.instruction_as_user_message=True — inject RAG documents "
                         "before the first assistant turn (judge/guardian data) instead of "
                         "after the last user turn. ChatML (Granite 4.2) only.")
+    p.add_argument("--tool-formatting", dest="tool_formatting", nargs="?",
+                   const=ToolFormatting.AUTOREGRESSIVE.value, default=None,
+                   choices=[m.value for m in ToolFormatting],
+                   help="Opt in to SR-adapter-as-tool training (data.tool_formatting). "
+                        "A bare flag selects autoregressive_tool_formatting; "
+                        "external_tool_formatting trains the adapter to emit only the "
+                        "tool-response dict after an env-written '<tool_response>\\n'.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", action="store_true",
                    help="Periodically log a decoded training example + labels from the collator. "
@@ -113,6 +143,8 @@ def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
         cfg.data.enable_thinking = True
     if args.instruction_as_user_message:
         cfg.data.instruction_as_user_message = True
+    if args.tool_formatting is not None:
+        cfg.data.tool_formatting = args.tool_formatting
     if args.debug_collator:
         cfg.trainer.debug_collator = True
         # Also turn on generation debug printing at the same rate, unless the
@@ -276,6 +308,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     cfg = load_training_config(args.config)
     apply_cli_overrides(cfg, args)
+    apply_tool_formatting(cfg)
+    if cfg.data.tool_formatting is not None:
+        logger.info(
+            "Tool formatting: %s (assistant_marker=%r last_context_token=%r last_token=%r)",
+            cfg.data.tool_formatting, cfg.data.assistant_marker,
+            cfg.adapter.last_context_token, cfg.adapter.last_token,
+        )
 
     logger.info("Adapter activation: unconditional (always active)")
     logger.info("Base model:   %s", cfg.model.base)
@@ -381,17 +420,20 @@ def main(argv: list[str] | None = None) -> int:
 
     # 5. Datasets. last_token (when set) is appended to rows that don't already
     # end with it — done at the text level so both masking paths inherit it.
+    allow_prerendered = cfg.data.tool_formatting is not None
     train_ds = load_jsonl_dataset(
         cfg.data.train_path, tok,
         enable_thinking=cfg.data.enable_thinking,
         last_token=cfg.adapter.last_token,
         instruction_as_user_message=cfg.data.instruction_as_user_message,
+        allow_prerendered=allow_prerendered,
     )
     val_ds = load_jsonl_dataset(
         cfg.data.val_path, tok,
         enable_thinking=cfg.data.enable_thinking,
         last_token=cfg.adapter.last_token,
         instruction_as_user_message=cfg.data.instruction_as_user_message,
+        allow_prerendered=allow_prerendered,
     )
     logger.info("Train rows: %d, Val rows: %d", len(train_ds), len(val_ds))
 
@@ -521,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
                 adapter_cfg["last_token"] = cfg.adapter.last_token
                 adapter_cfg["last_token_id"] = last_token_id
             adapter_cfg["share_moe_routing"] = bool(cfg.adapter.share_moe_routing)
+            if cfg.data.tool_formatting is not None:
+                adapter_cfg["tool_formatting"] = cfg.data.tool_formatting
             with adapter_cfg_path.open("w") as f:
                 _json.dump(adapter_cfg, f, indent=2)
             logger.info(

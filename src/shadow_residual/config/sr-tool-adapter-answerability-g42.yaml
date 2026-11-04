@@ -13,6 +13,12 @@
 #   - last_context_token = "</tool_call>" (the token immediately before the
 #     supervised region; single-token, satisfies the boundary validator).
 #   - last_token = "<|im_end|>" (end-of-completion marker).
+#
+# data.tool_formatting opts in to tool-adapter training and sets these three
+# markers itself (train.py:_TOOL_FORMATTING_MARKERS); the explicit values below
+# match autoregressive_tool_formatting. Override with
+# `--tool-formatting external_tool_formatting` to train the env-formatted mode
+# (markers become "<tool_response>\n" / "\n" / "<|im_end|>").
 
 # yaml-language-server: $schema=./schema/training_config.schema.json
 
@@ -23,6 +29,7 @@ data:
   train_path: ${DATA_ROOT}/train.jsonl
   val_path:   ${DATA_ROOT}/val.jsonl
   max_length: 4096
+  tool_formatting: autoregressive_tool_formatting
   # Mask THROUGH the trigger tool-call close; supervise what the adapter emits.
   assistant_marker: "</tool_call>"
 

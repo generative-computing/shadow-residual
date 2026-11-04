@@ -102,6 +102,15 @@ def test_load_jsonl_rejects_missing_messages(tmp_path, tokenizer):
         load_jsonl_dataset(bad, tokenizer)
 
 
+def test_load_jsonl_prerendered_text_requires_opt_in(tmp_path, tokenizer):
+    p = tmp_path / "pre.jsonl"
+    p.write_text(json.dumps({"text": "PRE-RENDERED ROW", "metadata": {}}) + "\n")
+    with pytest.raises(ValueError, match="missing 'messages'"):
+        load_jsonl_dataset(p, tokenizer)
+    ds = load_jsonl_dataset(p, tokenizer, allow_prerendered=True)
+    assert ds[0]["text"] == "PRE-RENDERED ROW"
+
+
 def test_load_jsonl_rejects_empty_file(tmp_path, tokenizer):
     empty = tmp_path / "empty.jsonl"
     empty.write_text("")

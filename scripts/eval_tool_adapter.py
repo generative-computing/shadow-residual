@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Evaluate an SR-adapter-as-tool answerability adapter.
 
-Builds, for each val row, the inference prompt that ends right after the trigger
-`<tool_call>` close (so the adapter continues from the switch point), generates
-with the adapter attached, then scores:
+The mode is read from each val row's `metadata.tool_formatting`:
 
-  - structural: the generated `<tool_response>` body parses as JSON with an
-    `answerable` boolean key
-  - accuracy:   parsed verdict == gold verdict
-  - consistency: for answerable the answer is non-refusal; for unanswerable the
-    answer refuses (polarity of the answer matches the emitted verdict)
+  - autoregressive_tool_formatting: the prompt ends right after the trigger
+    `</tool_call>`; the adapter emits the `<tool_response>` turn + answer.
+    Scores structural / accuracy / consistency (answer label matches verdict).
+  - external_tool_formatting: the prompt ends right after the env-written
+    `<tool_response>\\n`; the whole generation (up to EOS) must be the dict.
+    Scores structural (generation parses as a dict with a boolean `answerable`),
+    accuracy, and eos_stop_rate (generation ended on EOS, not max_new_tokens).
 
 Usage:
   python scripts/eval_tool_adapter.py \
@@ -30,14 +30,27 @@ from pathlib import Path
 # "unanswerable"); consistency = answer label matches the emitted verdict bool.
 
 
-def build_context(tokenizer, row: dict) -> tuple[str, bool]:
-    """Return (prompt_text, gold_answerable). The prompt ends right at the
-    trigger `</tool_call>` so generation resumes where the adapter would.
+AUTOREGRESSIVE = "autoregressive_tool_formatting"
+EXTERNAL = "external_tool_formatting"
+_EXTERNAL_OPENER = "<tool_response>\n"
 
-    Rows are pre-rendered `text` (the SR-adapter-as-tool shape) — slice at
-    `</tool_call>`. Falls back to rendering `messages` if present (legacy)."""
+
+def row_tool_formatting(row: dict) -> str:
+    return row.get("metadata", {}).get("tool_formatting", AUTOREGRESSIVE)
+
+
+def build_context(tokenizer, row: dict) -> tuple[str, bool]:
+    """Return (prompt_text, gold_answerable), cut where the adapter takes over.
+
+    Autoregressive rows cut right after the trigger `</tool_call>`; external rows
+    cut right after the env-written `<tool_response>\\n`. Rows are pre-rendered
+    `text`; legacy `messages` rows are rendered (autoregressive only)."""
     gold = row["metadata"]["verdict"]
     gold_answerable = gold in ("answerable", "partial")
+    if row_tool_formatting(row) == EXTERNAL:
+        text = row["text"]
+        cut = text.rindex(_EXTERNAL_OPENER) + len(_EXTERNAL_OPENER)
+        return text[:cut], gold_answerable
     if "text" in row:
         text = row["text"]
     else:
@@ -49,6 +62,16 @@ def build_context(tokenizer, row: dict) -> tuple[str, bool]:
         )
     cut = text.rindex("</tool_call>") + len("</tool_call>")
     return text[:cut], gold_answerable
+
+
+def parse_external_verdict(generated: str) -> dict | None:
+    """External mode: the whole generation (up to EOS) must be the dict."""
+    body = generated.split("<|im_end|>", 1)[0].strip()
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def parse_verdict(generated: str) -> dict | None:
@@ -100,7 +123,10 @@ def main() -> None:
     from peft import PeftModel
     from shadow_residual.shadow_residual.build import build_sr_base
 
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = (
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available() else "cpu"
+    )
     tok = AutoTokenizer.from_pretrained(args.base_model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -109,7 +135,12 @@ def main() -> None:
     model.to(device).eval()
 
     rows = [json.loads(l) for l in Path(args.val).open() if l.strip()][: args.limit]
-    n = struct_ok = acc_ok = cons_ok = 0
+    modes = {row_tool_formatting(r) for r in rows}
+    if len(modes) != 1:
+        raise ValueError(f"val rows mix tool_formatting modes: {sorted(modes)}")
+    mode = modes.pop()
+    n = struct_ok = acc_ok = cons_ok = stop_ok = 0
+    conf = {}
     dump = open(args.dump, "w") if args.dump else None
     for row in rows:
         prompt, gold_answerable = build_context(tok, row)
@@ -118,14 +149,24 @@ def main() -> None:
             out = model.generate(**ids, max_new_tokens=args.max_new_tokens,
                                   do_sample=False, pad_token_id=tok.pad_token_id)
         gen = tok.decode(out[0][ids["input_ids"].shape[1]:], skip_special_tokens=False)
-        verdict = parse_verdict(gen)
-        answer = extract_answer(gen)
         n += 1
-        if verdict is not None and isinstance(verdict.get("answerable"), bool):
+        if mode == EXTERNAL:
+            verdict = parse_external_verdict(gen)
+            answer = ""
+            stop_ok += gen.rstrip().endswith("<|im_end|>")
+        else:
+            verdict = parse_verdict(gen)
+            answer = extract_answer(gen)
+        pred = verdict.get("answerable") if verdict is not None else None
+        key = f"{'answerable' if gold_answerable else 'unanswerable'}->" + (
+            "invalid" if not isinstance(pred, bool) else "answerable" if pred else "unanswerable"
+        )
+        conf[key] = conf.get(key, 0) + 1
+        if isinstance(pred, bool):
             struct_ok += 1
-            pred = verdict["answerable"]
             if pred == gold_answerable:
                 acc_ok += 1
+        if mode == AUTOREGRESSIVE and isinstance(pred, bool):
             # Consistency: the answer-turn label matches the verdict bool.
             ans_l = answer.lower()
             answer_label = (
@@ -141,13 +182,18 @@ def main() -> None:
         dump.close()
 
     res = {
+        "tool_formatting": mode,
         "n": n,
         "structural_valid": struct_ok,
         "structural_rate": round(struct_ok / max(n, 1), 4),
         "verdict_accuracy": round(acc_ok / max(n, 1), 4),
         "verdict_accuracy_of_valid": round(acc_ok / max(struct_ok, 1), 4),
-        "consistency_rate": round(cons_ok / max(n, 1), 4),
+        "confusion": dict(sorted(conf.items())),
     }
+    if mode == EXTERNAL:
+        res["eos_stop_rate"] = round(stop_ok / max(n, 1), 4)
+    else:
+        res["consistency_rate"] = round(cons_ok / max(n, 1), 4)
     print(json.dumps(res, indent=2))
     if args.out:
         Path(args.out).write_text(json.dumps(res, indent=2))

@@ -65,6 +65,21 @@ class Bias(str, Enum):
     LORA_ONLY = "lora_only"
 
 
+class ToolFormatting(str, Enum):
+    """How an SR adapter invoked as a tool relates to the chat template.
+
+    - AUTOREGRESSIVE: the adapter takes over right after the base's
+      ``</tool_call>`` and itself emits the whole ``<tool_response>`` turn plus
+      the final assistant answer, ending at a single terminal ``<|im_end|>``.
+    - EXTERNAL: the serving environment owns the template. It closes the base's
+      tool-call turn, writes ``<|im_start|>user\\n<tool_response>\\n`` and hands
+      over; the adapter emits only the tool-response dict and stops (EOS). The
+      environment then appends ``\\n</tool_response>\\n``.
+    """
+    AUTOREGRESSIVE = "autoregressive_tool_formatting"
+    EXTERNAL = "external_tool_formatting"
+
+
 # --- Sub-models ---------------------------------------------------------------
 
 
@@ -113,6 +128,12 @@ class DataConfig(_Strict):
     # No-op for non-ChatML (Granite 4.1) rendering and for rows without documents.
     # Overridable from the CLI via `--instruction-as-user-message` (CLI wins).
     instruction_as_user_message: bool = False
+    # Opt-in SR-adapter-as-tool training. None (default) = standard chat SFT with
+    # no tool logic. When set, train.py accepts pre-rendered `{"text"}` rows and
+    # applies the mode's boundary markers (assistant_marker / last_context_token /
+    # last_token), overriding any values set above. Overridable from the CLI via
+    # `--tool-formatting [MODE]` (CLI wins; a bare flag selects autoregressive).
+    tool_formatting: ToolFormatting | None = None
 
 
 class AdapterConfig(_Strict):

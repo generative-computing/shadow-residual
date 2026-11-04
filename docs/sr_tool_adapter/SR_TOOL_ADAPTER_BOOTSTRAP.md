@@ -17,6 +17,18 @@ data, where the supervised boundary falls, and how to wire it into the existing
 Target base: **Granite 4.2** (ChatML template, `<|im_start|>` / `<|im_end|>`,
 `<tool_call>` / `<tool_response>` tags).
 
+**Two formatting modes** (`data.tool_formatting` / `--tool-formatting`; see
+[Tool formatting modes](#tool-formatting-modes) below):
+- `autoregressive_tool_formatting` *(default when tool training is on)*: the
+  adapter takes over after `</tool_call>` and emits the `<tool_response>` turn
+  plus the final answer. Most of this document describes this mode.
+- `external_tool_formatting`: the environment writes `<tool_response>\n`; the
+  adapter emits only the dict and stops on EOS; the environment closes the tag.
+
+Tool training is **opt-in for the repo**: with `tool_formatting` unset (every
+config except `sr-tool-adapter-answerability-g42.yaml`) training is standard chat
+SFT and pre-rendered `{"text"}` rows are rejected.
+
 ---
 
 ## What the adapter must generate (confirmed design)
@@ -296,8 +308,9 @@ Changes vs. the stock answerability config:
 - `data.enable_thinking`: **False**.
 
 > **IMPLEMENTED (branch `experiments/sr-tool-adapter`).** The generator emits
-> **pre-rendered `{"text"}` rows** (consumed by `data.py`'s passthrough at
-> `data.py:156`), hand-assembling the completion so the supervised span carries
+> **pre-rendered `{"text"}` rows** (consumed by `load_jsonl_dataset`'s
+> `allow_prerendered` passthrough, enabled only when `data.tool_formatting` is
+> set), hand-assembling the completion so the supervised span carries
 > **exactly one, terminal `<|im_end|>`** — the intermediate turn-closing
 > `<|im_end|>` after `</tool_response>` is omitted (it is the EOS/stop token;
 > supervising it would teach the adapter to halt before emitting the answer).
@@ -329,6 +342,64 @@ Changes vs. the stock answerability config:
 > Boundary verified on real data: token before supervision = `</tool_call>`;
 > supervised span = verdict `<tool_response>` + answer, ending at the single
 > terminal `<|im_end|>`.
+
+---
+
+## Tool formatting modes
+
+`data.tool_formatting` selects how much of the chat template the adapter owns.
+Setting it opts in to tool training and fixes the three boundary markers
+(`train.py:_TOOL_FORMATTING_MARKERS`, overriding any YAML values); the mode is
+recorded into `adapter_config.json`.
+
+| | `autoregressive_tool_formatting` | `external_tool_formatting` |
+|---|---|---|
+| adapter takes over after | base's `</tool_call>` | env-written `<tool_response>\n` |
+| adapter emits | `\n<|im_start|>user\n<tool_response>\n{dict}\n</tool_response>\n<|im_start|>assistant\n[think]answer<|im_end|>` | `{dict}<|im_end|>` |
+| env writes afterwards | nothing (one generate covers 3 turns) | `\n</tool_response>\n<|im_end|>\n`, then the base answers |
+| `assistant_marker` | `</tool_call>` | `<tool_response>\n` |
+| `last_context_token` | `</tool_call>` | `\n` |
+| `last_token` | `<|im_end|>` | `<|im_end|>` |
+| `--thinking` | applies (answer-turn prefix) | n/a (generator rejects non-`off`) |
+| transcript vs. stock template | two omitted `<|im_end|>` seams | **byte-identical** after the env suffix |
+
+### External mode, token by token
+
+```
+[M] ...</function>\n</tool_call>          <- base
+[M] \n<|im_end|>\n<|im_start|>user\n      <- env (stock template glue)
+[M] <tool_response>\n                     <- env; last context token = "\n"
+    >>> MASK BOUNDARY <<<
+[S] {"answerable": true}                  <- adapter
+[S] <|im_end|>                            <- adapter's EOS stop; env discards it
+    \n</tool_response>\n<|im_end|>\n       <- env appends; base resumes
+```
+
+The adapter is trained to end on `<|im_end|>` rather than `\n</tool_response>`
+because stock `generate()` stops only on EOS. The env treats EOS as "payload
+done" and writes the closing tag itself. (`</tool_response>` is a single special
+token, id 100273, so an env that prefers it can use it as a stop string.)
+
+The generator builds the external context by rendering the conversation plus a
+sentinel `tool` message through the stock template and cutting before the
+sentinel. The context is therefore exactly the template's own tool-turn opener,
+and it extends the autoregressive context (identical through `</tool_call>`).
+`tests/training/test_tool_formatting.py` asserts template byte-identity, that the
+collator supervises exactly `{dict}<|im_end|>`, and the boundary validator for
+both modes.
+
+```bash
+python scripts/make_tool_adapter_data.py --input <answerability.jsonl> --base-model <4.2> \
+  --out-train train.jsonl --out-val val.jsonl --tool-formatting external_tool_formatting
+sr-train --config src/shadow_residual/config/sr-tool-adapter-answerability-g42.yaml \
+  --tool-formatting external_tool_formatting --train-data train.jsonl --val-data val.jsonl ...
+python scripts/eval_tool_adapter.py --base-model <4.2> --adapter <ckpt> --val val.jsonl
+```
+
+`eval_tool_adapter.py` reads the mode from each row's `metadata.tool_formatting`.
+In external mode it cuts the prompt at `<tool_response>\n`, requires the whole
+generation (up to EOS) to parse as a dict with a boolean `answerable`, and reports
+`structural_rate`, `verdict_accuracy`, a confusion table, and `eos_stop_rate`.
 
 ### First run result (2026-10-19, Granite 4.2-3b, local MPS)
 
