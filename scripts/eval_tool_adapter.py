@@ -36,6 +36,7 @@ _EXTERNAL_OPENER = "<tool_response>\n"
 
 
 def row_tool_formatting(row: dict) -> str:
+    # Rows generated before the flag existed carry no tag and are autoregressive.
     return row.get("metadata", {}).get("tool_formatting", AUTOREGRESSIVE)
 
 

@@ -68,13 +68,14 @@ class Bias(str, Enum):
 class ToolFormatting(str, Enum):
     """How an SR adapter invoked as a tool relates to the chat template.
 
+    - EXTERNAL (default when tool training is on): the serving environment owns
+      the template. It closes the base's tool-call turn, writes
+      ``<|im_start|>user\\n<tool_response>\\n`` and hands over; the adapter emits
+      only the tool-response dict and stops (EOS). The environment then appends
+      ``\\n</tool_response>\\n``.
     - AUTOREGRESSIVE: the adapter takes over right after the base's
       ``</tool_call>`` and itself emits the whole ``<tool_response>`` turn plus
       the final assistant answer, ending at a single terminal ``<|im_end|>``.
-    - EXTERNAL: the serving environment owns the template. It closes the base's
-      tool-call turn, writes ``<|im_start|>user\\n<tool_response>\\n`` and hands
-      over; the adapter emits only the tool-response dict and stops (EOS). The
-      environment then appends ``\\n</tool_response>\\n``.
     """
     AUTOREGRESSIVE = "autoregressive_tool_formatting"
     EXTERNAL = "external_tool_formatting"
@@ -132,7 +133,7 @@ class DataConfig(_Strict):
     # no tool logic. When set, train.py accepts pre-rendered `{"text"}` rows and
     # applies the mode's boundary markers (assistant_marker / last_context_token /
     # last_token), overriding any values set above. Overridable from the CLI via
-    # `--tool-formatting [MODE]` (CLI wins; a bare flag selects autoregressive).
+    # `--tool-formatting [MODE]` (CLI wins; a bare flag selects external).
     tool_formatting: ToolFormatting | None = None
 
 

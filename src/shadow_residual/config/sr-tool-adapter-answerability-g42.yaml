@@ -1,24 +1,25 @@
 # SR-adapter-as-tool training config (Granite 4.2, answerability adapter).
 #
 # The adapter is invoked as a TOOL: the base emits a <tool_call> for
-# `answerability`, the switch routes to this SR adapter, and the adapter
-# generates the <tool_response> verdict + the user-facing answer. See
+# `answerability` and the switch routes to this SR adapter. See
 # docs/sr_tool_adapter/SR_TOOL_ADAPTER_BOOTSTRAP.md.
 #
-# Boundary wiring (differs from the plain answerability g42 config):
-#   - The supervised completion starts right after the trigger tool-call close,
-#     so the collator response_template (assistant_marker) is "</tool_call>"
-#     (a single token on the 4.2 tokenizer, id 100271). Masking cuts there and
-#     supervises the verdict tool_response + the assistant answer.
-#   - last_context_token = "</tool_call>" (the token immediately before the
-#     supervised region; single-token, satisfies the boundary validator).
-#   - last_token = "<|im_end|>" (end-of-completion marker).
+# Default mode: external_tool_formatting. The environment closes the base's
+# tool-call turn and writes "<|im_start|>user\n<tool_response>\n"; the adapter
+# emits only the verdict dict and stops on EOS; the environment then appends
+# "\n</tool_response>\n". Boundary wiring:
+#   - assistant_marker = "<tool_response>\n": mask through the env-written
+#     opener, supervise the dict.
+#   - last_context_token = "\n" (the token immediately before the supervised
+#     region; single-token, satisfies the boundary validator).
+#   - last_token = "<|im_end|>" (the EOS the adapter stops on).
 #
 # data.tool_formatting opts in to tool-adapter training and sets these three
 # markers itself (train.py:_TOOL_FORMATTING_MARKERS); the explicit values below
-# match autoregressive_tool_formatting. Override with
-# `--tool-formatting external_tool_formatting` to train the env-formatted mode
-# (markers become "<tool_response>\n" / "\n" / "<|im_end|>").
+# match external_tool_formatting. Override with
+# `--tool-formatting autoregressive_tool_formatting` to have the adapter emit the
+# whole tool-response turn after "</tool_call>" (markers become "</tool_call>" /
+# "</tool_call>" / "<|im_end|>").
 
 # yaml-language-server: $schema=./schema/training_config.schema.json
 
@@ -29,9 +30,9 @@ data:
   train_path: ${DATA_ROOT}/train.jsonl
   val_path:   ${DATA_ROOT}/val.jsonl
   max_length: 4096
-  tool_formatting: autoregressive_tool_formatting
-  # Mask THROUGH the trigger tool-call close; supervise what the adapter emits.
-  assistant_marker: "</tool_call>"
+  tool_formatting: external_tool_formatting
+  # Mask THROUGH the env-written tool-response opener; supervise the dict.
+  assistant_marker: "<tool_response>\n"
 
 adapter:
   target_modules:
@@ -43,7 +44,7 @@ adapter:
     cross_stream: 32
   alpha: 64
   dropout: 0.05
-  last_context_token: "</tool_call>"
+  last_context_token: "\n"
   last_token: "<|im_end|>"
 
 optimizer:

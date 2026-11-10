@@ -134,27 +134,27 @@ def test_tool_formatting_default_off(config_path):
     assert cfg.adapter.last_token is None
 
 
-def test_tool_formatting_bare_flag_is_autoregressive(config_path):
+def test_tool_formatting_bare_flag_is_external(config_path):
     cfg = load_training_config(config_path)
     args = _build_parser().parse_args(["--config", str(config_path), "--tool-formatting"])
-    apply_cli_overrides(cfg, args)
-    apply_tool_formatting(cfg)
-    assert cfg.data.tool_formatting == "autoregressive_tool_formatting"
-    assert cfg.data.assistant_marker == "</tool_call>"
-    assert cfg.adapter.last_context_token == "</tool_call>"
-    assert cfg.adapter.last_token == "<|im_end|>"
-
-
-def test_tool_formatting_external_markers(config_path):
-    cfg = load_training_config(config_path)
-    args = _build_parser().parse_args(
-        ["--config", str(config_path), "--tool-formatting", "external_tool_formatting"]
-    )
     apply_cli_overrides(cfg, args)
     apply_tool_formatting(cfg)
     assert cfg.data.tool_formatting == "external_tool_formatting"
     assert cfg.data.assistant_marker == "<tool_response>\n"
     assert cfg.adapter.last_context_token == "\n"
+    assert cfg.adapter.last_token == "<|im_end|>"
+
+
+def test_tool_formatting_autoregressive_markers(config_path):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(
+        ["--config", str(config_path), "--tool-formatting", "autoregressive_tool_formatting"]
+    )
+    apply_cli_overrides(cfg, args)
+    apply_tool_formatting(cfg)
+    assert cfg.data.tool_formatting == "autoregressive_tool_formatting"
+    assert cfg.data.assistant_marker == "</tool_call>"
+    assert cfg.adapter.last_context_token == "</tool_call>"
     assert cfg.adapter.last_token == "<|im_end|>"
 
 

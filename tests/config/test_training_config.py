@@ -272,9 +272,10 @@ def test_tool_adapter_config_opts_in(monkeypatch):
     for var in ("DATA_ROOT", "RUN_DIR", "EVAL_DATA", "BASE_MODEL"):
         monkeypatch.setenv(var, "/x")
     cfg = load_training_config(EXAMPLES / "sr-tool-adapter-answerability-g42.yaml")
-    assert cfg.data.tool_formatting == "autoregressive_tool_formatting"
-    assert cfg.data.assistant_marker == "</tool_call>"
-    assert cfg.adapter.last_context_token == "</tool_call>"
+    assert cfg.data.tool_formatting == "external_tool_formatting"
+    assert cfg.data.assistant_marker == "<tool_response>\n"
+    assert cfg.adapter.last_context_token == "\n"
+    assert cfg.adapter.last_token == "<|im_end|>"
 
 
 # --- validation block (formerly `eval:`) --------------------------------------

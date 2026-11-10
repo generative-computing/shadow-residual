@@ -134,7 +134,7 @@ def _external_context(context_msgs: list[dict], tokenizer) -> str:
 
 
 def build_row(
-    obj: dict, tokenizer, thinking: str = "off", tool_formatting: str = AUTOREGRESSIVE
+    obj: dict, tokenizer, thinking: str = "off", tool_formatting: str = EXTERNAL
 ) -> dict | None:
     # The gold verdict is either an explicit `ground_truth` field (raw
     # answerability_evaluation.jsonl shape) or, failing that, the final assistant
@@ -235,12 +235,12 @@ def main() -> None:
     )
     ap.add_argument(
         "--tool-formatting",
-        choices=[AUTOREGRESSIVE, EXTERNAL],
-        default=AUTOREGRESSIVE,
+        choices=[EXTERNAL, AUTOREGRESSIVE],
+        default=EXTERNAL,
         help=(
-            f"{AUTOREGRESSIVE} (default): adapter starts after '</tool_call>' and emits "
-            f"the tool_response turn + final answer. {EXTERNAL}: env writes "
-            "'<tool_response>\\n'; adapter emits only the dict, then EOS."
+            f"{EXTERNAL} (default): env writes '<tool_response>\\n'; adapter emits only "
+            f"the dict, then EOS. {AUTOREGRESSIVE}: adapter starts after '</tool_call>' "
+            "and emits the tool_response turn + final answer."
         ),
     )
     args = ap.parse_args()

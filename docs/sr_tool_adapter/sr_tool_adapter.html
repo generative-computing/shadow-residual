@@ -288,11 +288,11 @@
 <p class="muted"><code>eval_tool_adapter.py</code> is thinking-mode agnostic &mdash; it strips a closed or dangling <code>&lt;think&gt;</code> block before reading the answer, so verdict/answer parse under any mode.</p>
 
 <h2 id="modes">5 &middot; Two formatting modes: autoregressive vs. external</h2>
-<p>Sections 2&ndash;4 describe <b><code>autoregressive_tool_formatting</code></b>: the adapter owns everything after the base's <code>&lt;/tool_call&gt;</code>, including the ChatML scaffolding. <b><code>external_tool_formatting</code></b> takes the opposite stance: the <b>serving environment owns the template</b> and the adapter only produces the tool's payload.</p>
+<p>Sections 2&ndash;4 describe <b><code>autoregressive_tool_formatting</code></b>, the original design: the adapter owns everything after the base's <code>&lt;/tool_call&gt;</code>, including the ChatML scaffolding. <b><code>external_tool_formatting</code></b>, now the <b>default</b>, takes the opposite stance: the <b>serving environment owns the template</b> and the adapter only produces the tool's payload. It became the default after the full-scale Vela run (0.9541 verdict accuracy, 100% structurally valid; &sect;11). Pass <code>--tool-formatting autoregressive_tool_formatting</code> to the generator <em>and</em> the trainer for the original mode.</p>
 
 <div class="cols">
   <div class="card adapt">
-    <h4><span class="tag adapt">default</span> autoregressive_tool_formatting</h4>
+    <h4>autoregressive_tool_formatting</h4>
     <ul class="tight">
       <li><b>Adapter starts after</b> the base's <code>&lt;/tool_call&gt;</code>.</li>
       <li><b>Adapter emits</b> <code>&lt;|im_start|&gt;user\n&lt;tool_response&gt;\n{dict}\n&lt;/tool_response&gt;\n&lt;|im_start|&gt;assistant\n[think]answer&lt;|im_end|&gt;</code>.</li>
@@ -302,7 +302,7 @@
     </ul>
   </div>
   <div class="card base">
-    <h4><span class="tag base">new</span> external_tool_formatting</h4>
+    <h4><span class="tag base">default</span> external_tool_formatting</h4>
     <ul class="tight">
       <li><b>Env writes</b> <code>\n&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\n&lt;tool_response&gt;\n</code> (closing the base's turn, opening the tool turn) and hands over.</li>
       <li><b>Adapter emits</b> only <code>{"answerable": true}</code>, then stops on EOS (<code>&lt;|im_end|&gt;</code>).</li>
@@ -327,19 +327,19 @@
 <div class="note"><b>Verified against the stock 4.2 template.</b> An external row with the env suffix appended is <b>byte-identical</b> to <code>apply_chat_template([&hellip;, assistant(tool_calls), tool(dict)])</code>, so the transcript the base re-reads is fully stock ChatML with no off-spec seams (unlike autoregressive mode). The external context is the autoregressive context plus the stock glue, so the two modes see identical prompts up to <code>&lt;/tool_call&gt;</code>. Both are covered by <code>tests/training/test_tool_formatting.py</code>: template identity, the collator supervising exactly <code>{dict}&lt;|im_end|&gt;</code>, and the boundary validator.</div>
 
 <h3>Enabling it</h3>
-<pre><code><span class="cmt"># data (one row per adapter call; --thinking must stay off)</span>
+<pre><code><span class="cmt"># data (one row per adapter call; external is the generator default, --thinking must stay off)</span>
 python scripts/make_tool_adapter_data.py --input &lt;answerability.jsonl&gt; --base-model &lt;4.2&gt; \
-  --out-train train.jsonl --out-val val.jsonl --tool-formatting external_tool_formatting
+  --out-train train.jsonl --out-val val.jsonl
 
-<span class="cmt"># train (the CLI flag overrides the config's autoregressive default)</span>
+<span class="cmt"># train (the config defaults to external; no mode flag needed)</span>
 sr-train --config src/shadow_residual/config/sr-tool-adapter-answerability-g42.yaml \
-  --tool-formatting external_tool_formatting --train-data train.jsonl --val-data val.jsonl &hellip;
+  --train-data train.jsonl --val-data val.jsonl &hellip;
 
 <span class="cmt"># eval (mode read from each row's metadata.tool_formatting)</span>
 python scripts/eval_tool_adapter.py --base-model &lt;4.2&gt; --adapter &lt;ckpt&gt; --val val.jsonl</code></pre>
 <p>In external mode the eval cuts the prompt at <code>&lt;tool_response&gt;\n</code> and requires the <em>entire</em> generation (up to EOS) to parse as a dict with a boolean <code>answerable</code>. It reports <code>structural_rate</code>, <code>verdict_accuracy</code>, a confusion table, and <code>eos_stop_rate</code> (the fraction that ended on EOS rather than hitting <code>max_new_tokens</code>).</p>
 
-<div class="note"><b>Tool logic is opt-in for the whole repo.</b> <code>data.tool_formatting</code> defaults to unset: standard chat SFT, rows must carry <code>messages</code>, and pre-rendered <code>{"text"}</code> rows are rejected. Setting the field (YAML) or passing <code>--tool-formatting [MODE]</code> (a bare flag means autoregressive) enables the passthrough and fixes the three boundary markers per mode. The mode is recorded into <code>adapter_config.json</code>.</div>
+<div class="note"><b>Tool logic is opt-in for the whole repo.</b> <code>data.tool_formatting</code> defaults to unset: standard chat SFT, rows must carry <code>messages</code>, and pre-rendered <code>{"text"}</code> rows are rejected. Setting the field (YAML) or passing <code>--tool-formatting [MODE]</code> (a bare flag means external) enables the passthrough and fixes the three boundary markers per mode. The mode is recorded into <code>adapter_config.json</code>.</div>
 
 <h2 id="data">6 &middot; Training-data construction</h2>
 <p>Each training row is a full conversation (<code>{"messages": [&hellip;], "tools": [&hellip;]}</code>) rendered with <code>apply_chat_template(&hellip;, tools=&hellip;, add_generation_prompt=False, enable_thinking=False)</code> &mdash; exactly the shape <code>data.py</code> already consumes.</p>
@@ -376,11 +376,11 @@ python scripts/eval_tool_adapter.py --base-model &lt;4.2&gt; --adapter &lt;ckpt&
 <p>Reuse the existing SR training path (<code>sr-train</code>, YAML-driven). Config <code>sr-tool-adapter-answerability-g42.yaml</code>, differing from the plain answerability config as follows:</p>
 <div class="tbl-wrap">
 <table class="cmp">
-  <tr><th>Knob</th><th>Tool-adapter value</th><th>Why</th></tr>
-  <tr><td><code>tool_formatting</code></td><td><code>autoregressive_tool_formatting</code> <span class="muted">(or <code>external_tool_formatting</code> via <code>--tool-formatting</code>)</span></td><td>Opts in to tool training and sets the three markers below per mode (&sect;5). Unset in every other config.</td></tr>
-  <tr><td><code>assistant_marker</code></td><td><code>&lt;/tool_call&gt;</code></td><td>Mask through the trigger tool-call close; supervise what follows. Single token (id 100271) on the 4.2 tokenizer.</td></tr>
-  <tr><td><code>last_context_token</code></td><td><code>&lt;/tool_call&gt;</code></td><td>Token immediately before the supervised region; satisfies the single-token boundary validator with no code change.</td></tr>
-  <tr><td><code>last_token</code></td><td><code>&lt;|im_end|&gt;</code></td><td>End-of-completion marker.</td></tr>
+  <tr><th>Knob</th><th>Tool-adapter value (default: external)</th><th>Why</th></tr>
+  <tr><td><code>tool_formatting</code></td><td><code>external_tool_formatting</code> <span class="muted">(or <code>autoregressive_tool_formatting</code> via <code>--tool-formatting</code>)</span></td><td>Opts in to tool training and sets the three markers below per mode (&sect;5). Unset in every other config.</td></tr>
+  <tr><td><code>assistant_marker</code></td><td><code>&lt;tool_response&gt;\n</code> <span class="muted">(autoregressive: <code>&lt;/tool_call&gt;</code>)</span></td><td>Mask through the env-written tool-response opener; supervise the dict. In autoregressive mode, mask through the trigger tool-call close (single token, id 100271).</td></tr>
+  <tr><td><code>last_context_token</code></td><td><code>\n</code> <span class="muted">(autoregressive: <code>&lt;/tool_call&gt;</code>)</span></td><td>Token immediately before the supervised region; satisfies the single-token boundary validator.</td></tr>
+  <tr><td><code>last_token</code></td><td><code>&lt;|im_end|&gt;</code></td><td>The EOS the adapter stops on (both modes).</td></tr>
   <tr><td><code>target_modules</code></td><td>q/o + MLP gate/up/down + <code>cross_stream</code>, r32</td><td>Standard SR. <b>Never</b> <code>k_proj</code>/<code>v_proj</code> (SR invariant: shared base-only K/V).</td></tr>
   <tr><td><code>enable_thinking</code></td><td><code>False</code></td><td>Consistent with existing answerability adapters.</td></tr>
 </table>

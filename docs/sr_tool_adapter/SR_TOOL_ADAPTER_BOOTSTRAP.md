@@ -19,11 +19,12 @@ Target base: **Granite 4.2** (ChatML template, `<|im_start|>` / `<|im_end|>`,
 
 **Two formatting modes** (`data.tool_formatting` / `--tool-formatting`; see
 [Tool formatting modes](#tool-formatting-modes) below):
-- `autoregressive_tool_formatting` *(default when tool training is on)*: the
-  adapter takes over after `</tool_call>` and emits the `<tool_response>` turn
-  plus the final answer. Most of this document describes this mode.
-- `external_tool_formatting`: the environment writes `<tool_response>\n`; the
-  adapter emits only the dict and stops on EOS; the environment closes the tag.
+- `external_tool_formatting` *(default when tool training is on)*: the
+  environment writes `<tool_response>\n`; the adapter emits only the dict and
+  stops on EOS; the environment closes the tag.
+- `autoregressive_tool_formatting`: the adapter takes over after `</tool_call>`
+  and emits the `<tool_response>` turn itself. Most of the design sections below
+  describe this mode, which came first.
 
 Tool training is **opt-in for the repo**: with `tool_formatting` unset (every
 config except `sr-tool-adapter-answerability-g42.yaml`) training is standard chat
@@ -352,7 +353,15 @@ Setting it opts in to tool training and fixes the three boundary markers
 (`train.py:_TOOL_FORMATTING_MARKERS`, overriding any YAML values); the mode is
 recorded into `adapter_config.json`.
 
-| | `autoregressive_tool_formatting` | `external_tool_formatting` |
+**Default: `external_tool_formatting`.** The tool config
+(`sr-tool-adapter-answerability-g42.yaml`), a bare `--tool-formatting`, and
+`make_tool_adapter_data.py` all default to it. It was made the default after the
+full-scale Vela run (0.9541 verdict accuracy, 100% structurally valid; see
+`FINDINGS.md`). Pass `autoregressive_tool_formatting` explicitly to train or
+generate data for the other mode. `eval_tool_adapter.py` reads the mode from each
+row and treats untagged legacy rows as autoregressive.
+
+| | `autoregressive_tool_formatting` | `external_tool_formatting` *(default)* |
 |---|---|---|
 | adapter takes over after | base's `</tool_call>` | env-written `<tool_response>\n` |
 | adapter emits | `\n<|im_start|>user\n<tool_response>\n{dict}\n</tool_response>\n<|im_start|>assistant\n[think]answer<|im_end|>` | `{dict}<|im_end|>` |
@@ -389,11 +398,16 @@ collator supervises exactly `{dict}<|im_end|>`, and the boundary validator for
 both modes.
 
 ```bash
+# external (default) — no mode flag needed
 python scripts/make_tool_adapter_data.py --input <answerability.jsonl> --base-model <4.2> \
-  --out-train train.jsonl --out-val val.jsonl --tool-formatting external_tool_formatting
+  --out-train train.jsonl --out-val val.jsonl
 sr-train --config src/shadow_residual/config/sr-tool-adapter-answerability-g42.yaml \
-  --tool-formatting external_tool_formatting --train-data train.jsonl --val-data val.jsonl ...
+  --train-data train.jsonl --val-data val.jsonl ...
 python scripts/eval_tool_adapter.py --base-model <4.2> --adapter <ckpt> --val val.jsonl
+
+# autoregressive — pass the mode to BOTH the generator and the trainer
+python scripts/make_tool_adapter_data.py ... --tool-formatting autoregressive_tool_formatting
+sr-train --config ... --tool-formatting autoregressive_tool_formatting ...
 ```
 
 `eval_tool_adapter.py` reads the mode from each row's `metadata.tool_formatting`.

@@ -55,7 +55,7 @@ most-edited fields.
 --grad-accum INT        override batch.gradient_accumulation
 --thinking              set data.enable_thinking=True (apply_chat_template enable_thinking)
 --tool-formatting [MODE]  opt in to SR-adapter-as-tool training (data.tool_formatting);
-                        bare flag = autoregressive_tool_formatting, or external_tool_formatting
+                        bare flag = external_tool_formatting, or autoregressive_tool_formatting
 --wandb                 set runtime.report_to=['wandb']
 --debug-collator        periodically log a decoded training example + labels
 --skip-post-train-generate   skip the in-process post-training generation step
@@ -152,8 +152,13 @@ fixes the boundary markers (overriding `assistant_marker` / `last_context_token`
 
 | mode | adapter takes over after | adapter emits | markers |
 |---|---|---|---|
+| `external_tool_formatting` *(default)* | env-written `<tool_response>\n` | the tool-response dict only, then EOS | `<tool_response>\n` / `\n` / `<|im_end|>` |
 | `autoregressive_tool_formatting` | base's `</tool_call>` | `<tool_response>` turn + final answer, one terminal `<|im_end|>` | `</tool_call>` / `</tool_call>` / `<|im_end|>` |
-| `external_tool_formatting` | env-written `<tool_response>\n` | the tool-response dict only, then EOS | `<tool_response>\n` / `\n` / `<|im_end|>` |
+
+A bare `--tool-formatting`, `make_tool_adapter_data.py`, and
+`sr-tool-adapter-answerability-g42.yaml` all default to
+`external_tool_formatting`; pass `autoregressive_tool_formatting` explicitly for
+the other mode.
 
 The mode is recorded into `adapter_config.json`. See
 `docs/sr_tool_adapter/sr_tool_adapter.html`.

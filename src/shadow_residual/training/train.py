@@ -100,12 +100,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         "before the first assistant turn (judge/guardian data) instead of "
                         "after the last user turn. ChatML (Granite 4.2) only.")
     p.add_argument("--tool-formatting", dest="tool_formatting", nargs="?",
-                   const=ToolFormatting.AUTOREGRESSIVE.value, default=None,
+                   const=ToolFormatting.EXTERNAL.value, default=None,
                    choices=[m.value for m in ToolFormatting],
                    help="Opt in to SR-adapter-as-tool training (data.tool_formatting). "
-                        "A bare flag selects autoregressive_tool_formatting; "
-                        "external_tool_formatting trains the adapter to emit only the "
-                        "tool-response dict after an env-written '<tool_response>\\n'.")
+                        "A bare flag selects external_tool_formatting (the adapter emits "
+                        "only the tool-response dict after an env-written "
+                        "'<tool_response>\\n'); autoregressive_tool_formatting has the "
+                        "adapter emit the whole tool-response turn after '</tool_call>'.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", action="store_true",
                    help="Periodically log a decoded training example + labels from the collator. "
