@@ -153,6 +153,18 @@ def _materialize_and_transfer(
             n_cross += 1
     logger.info("Re-zeroed %d frozen CrossStream weight(s) after materialize.", n_cross)
 
+    # Read-out mode: the per-layer readout_norm gamma (frozen original AND the
+    # PEFT modules_to_save copy) is not an upstream weight either, so to_empty
+    # garbage would survive here too. Reset every copy to gamma=1.
+    n_readout = 0
+    for name, param in peft_model.named_parameters():
+        if ".readout_norm." in name:
+            with torch.no_grad():
+                param.fill_(1.0)
+            n_readout += 1
+    if n_readout:
+        logger.info("Reset %d readout_norm weight(s) to 1 after materialize.", n_readout)
+
     # Re-initialize non-persistent RoPE buffers. The rotary embedding
     # registers ``inv_freq`` (and ``original_inv_freq``) with
     # persistent=False, so they are NOT in the upstream state_dict —
@@ -275,6 +287,58 @@ def _reject_kv_lora(lora_config: LoraConfig) -> None:
         )
 
 
+READOUT_NORM_NAME = "readout_norm"
+
+
+def _validate_readout_lora(lora_config: LoraConfig) -> None:
+    """Read-out mode trains only ``cross_stream`` LoRA + the ``readout_norm`` gamma.
+
+    The read-out adapter stream runs no attention/MLP, so a LoRA delta on
+    q/o/MLP would be trained, saved, and never fire. Reject it rather than ship
+    dead weights.
+    """
+    targets = lora_config.target_modules
+    names = [targets] if isinstance(targets, str) else list(targets or [])
+    extra = sorted(set(names) - {CROSS_STREAM_NAME})
+    if CROSS_STREAM_NAME not in names or extra:
+        raise ValueError(
+            'adapter_stream="readout" requires target_modules == ["cross_stream"] '
+            f"(the read-out stream has no attention/MLP for a delta to land on); got {names}."
+        )
+    if READOUT_NORM_NAME not in (lora_config.modules_to_save or []):
+        raise ValueError(
+            'adapter_stream="readout" requires modules_to_save=["readout_norm"] '
+            "(the per-layer RMSNorm gamma is the read-out stream's other trainable)."
+        )
+
+
+def _upcast_readout_gamma(peft_model, *, fsdp_active: bool) -> None:
+    """Keep the trainable read-out RMSNorm gamma in fp32.
+
+    gamma sits at ~1.0, where the bf16 spacing is 2**-7; Adam steps of ~lr
+    (2e-4) round to nothing, so a bf16 gamma never moves. DDP / single GPU
+    tolerate one fp32 parameter; FSDP flattens with a uniform dtype, so there
+    the caller must use ``model.param_dtype: fp32`` instead.
+    """
+    from peft.utils.other import ModulesToSaveWrapper
+
+    n = 0
+    for name, module in peft_model.named_modules():
+        if isinstance(module, ModulesToSaveWrapper) and name.endswith(READOUT_NORM_NAME):
+            if fsdp_active:
+                dtype = next(module.modules_to_save.parameters()).dtype
+                if dtype != torch.float32:
+                    logger.warning(
+                        "readout_norm gamma is %s under FSDP (uniform-dtype flatten); "
+                        "a bf16 gamma cannot move at lr~1e-4 — set model.param_dtype: fp32.",
+                        dtype,
+                    )
+                return
+            module.modules_to_save.to(torch.float32)
+            n += 1
+    logger.info("Kept %d trainable readout_norm gamma(s) in fp32.", n)
+
+
 def get_shadow_residual_peft_model(
     base_model_name_or_path: str,
     lora_config: LoraConfig,
@@ -283,6 +347,7 @@ def get_shadow_residual_peft_model(
     adapter_name: str = "default",
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
+    adapter_stream: str = "full",
 ):
     """Build a :class:`peft.PeftModel` for shadow-residual + LoRA.
 
@@ -307,11 +372,18 @@ def get_shadow_residual_peft_model(
             per-stream routing); on by default. No-op on dense bases. train.py
             records it into the saved ``adapter_config.json`` so the serving path
             can source it back rather than hand-passing.
+        adapter_stream: ``"full"`` (default — the adapter stream is a second
+            LoRA-adapted transformer) or ``"readout"`` (the adapter stream is
+            ``readout_norm(h) + W_cross(h_base)`` only; trains ``cross_stream``
+            LoRA + ``modules_to_save=["readout_norm"]``). Recorded into
+            ``adapter_config.json`` by train.py.
 
     Returns:
         :class:`peft.PeftModel`.
     """
     _reject_kv_lora(lora_config)
+    if adapter_stream == "readout":
+        _validate_readout_lora(lora_config)
     logger.info(
         "Building SR base from upstream HF Granite. target_modules=%s "
         "(cross_stream %s present).",
@@ -329,6 +401,7 @@ def get_shadow_residual_peft_model(
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         share_moe_routing=share_moe_routing,
+        adapter_stream=adapter_stream,
     )
 
     peft_model = _build_sr_peft_model_meta(
@@ -348,6 +421,8 @@ def get_shadow_residual_peft_model(
     # ACCELERATE_USE_FSDP env (set by `accelerate launch --config_file <fsdp>`).
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     fsdp_active = os.environ.get("ACCELERATE_USE_FSDP", "").lower() == "true"
+    if adapter_stream == "readout":
+        _upcast_readout_gamma(peft_model, fsdp_active=fsdp_active)
     if local_rank == 0 or not fsdp_active:
         _materialize_and_transfer(
             peft_model,

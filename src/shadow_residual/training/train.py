@@ -360,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
         torch_dtype=model_dtype,
         attn_implementation=cfg.model.attn_implementation,
         share_moe_routing=cfg.adapter.share_moe_routing,
+        adapter_stream=cfg.adapter.adapter_stream,
         **({"adapter_name": task_specs[0][0]} if task_specs else {}),
     )
     if task_specs:
@@ -576,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
                 adapter_cfg["last_token"] = cfg.adapter.last_token
                 adapter_cfg["last_token_id"] = last_token_id
             adapter_cfg["share_moe_routing"] = bool(cfg.adapter.share_moe_routing)
+            adapter_cfg["adapter_stream"] = cfg.adapter.adapter_stream
             if task_specs:
                 adapter_cfg["shared_a_tasks"] = [n for n, _, _ in task_specs]
             with adapter_cfg_path.open("w") as f:

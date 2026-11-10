@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>SR Read-out Stream &mdash; empty-adapter-stream design</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --panel-2: #eff1f3;
+    --text: #1f2328;
+    --muted: #656d76;
+    --accent: #0969da;
+    --base: #0a5ca8;
+    --adapter: #cf222e;
+    --cross: #9a6700;
+    --frozen: #6c7a89;
+    --good: #1a7f37;
+    --warn: #9a6700;
+    --bad: #cf222e;
+    --code-bg: #f6f8fa;
+    --border: #d0d7de;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+  header { padding: 28px 24px; background: linear-gradient(135deg, #f6f8fa 0%, #eaeef2 100%); border-bottom: 1px solid var(--border); }
+  header h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: .2px; }
+  header .sub { color: var(--muted); }
+  h2 { margin-top: 56px; padding-bottom: 6px; border-bottom: 1px solid var(--border); font-size: 22px; }
+  h3 { margin-top: 32px; font-size: 17px; color: var(--accent); }
+  h4 { margin-top: 22px; font-size: 15px; color: var(--text); }
+  p { color: var(--text); }
+  code, pre { font-family: ui-monospace, SF Mono, Menlo, monospace; font-size: 13.5px; }
+  code { background: var(--code-bg); border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; color: #0550ae; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; overflow-x: auto; color: #1f2328; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin: 14px 0; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 13px; color: var(--muted); margin: 8px 0 14px; }
+  .swatch { display: inline-block; width: 14px; height: 14px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--accent); font-weight: 600; }
+  td code { font-size: 12.5px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border); background: var(--panel-2); color: var(--muted); margin-right: 6px; }
+  .pill.base { color: var(--base); border-color: #b6d3ec; background: #ddeefb; }
+  .pill.adapter { color: var(--adapter); border-color: #f0c0c4; background: #ffebe9; }
+  .pill.cross { color: var(--cross); border-color: #e6d08a; background: #fff8c5; }
+  .note { border-left: 3px solid var(--accent); background: #ddf4ff; padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 12px 0; }
+  .warn { border-left: 3px solid var(--warn); background: #fff8c5; padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 12px 0; }
+  svg { display: block; max-width: 100%; height: auto; }
+  .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin: 18px 0; }
+  .caption { color: var(--muted); font-size: 13px; margin-top: 8px; text-align: center; }
+  .small { font-size: 13px; color: var(--muted); }
+  .eqn { font-family: ui-monospace, monospace; font-size: 15px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin: 14px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap" style="padding-bottom: 0;">
+    <h1>SR Read-out Stream &mdash; empty-adapter-stream design</h1>
+    <div class="sub">A proposed Shadow-Residual variant where the adapter stream carries <em>no activations of its own</em> &mdash; only the per-layer W<sub>cross</sub> injection from the base, carried forward through an inter-layer RMSNorm.</div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<div class="note">
+  <strong>Status: implemented and CPU-tested; Vela jobs not yet launched</strong> (blocked on getting the code to the pods, &sect;10). Sections 1&ndash;5 are the original
+  design (unchanged). Section 6 records how every open question was resolved,
+  &sect;7 the implementation, &sect;8 the experiment and evaluation protocol, &sect;9 the
+  results, and &sect;10 the issues hit along the way. For the current (shared-base-K/V)
+  design see <span class="small"><code>sr_architecture_explainer.html</code></span>.
+  <br><span class="small">Branch <code>feature/different-arch</code>. Config switch:
+  <code>adapter.adapter_stream: readout</code> (default <code>full</code> = today's SR, untouched).</span>
+</div>
+
+<div class="legend">
+  <span><span class="swatch" style="background:#0a5ca8"></span>base stream &mdash; frozen full transformer</span>
+  <span><span class="swatch" style="background:#cf222e"></span>adapter stream &mdash; read-out only</span>
+  <span><span class="swatch" style="background:#9a6700"></span>cross-stream injection W<sub>cross</sub> (B&middot;A, trainable)</span>
+  <span><span class="swatch" style="background:#1a7f37"></span>RMSNorm &gamma; (trainable)</span>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="idea">1. The idea in one line</h2>
+
+<p>
+In today's SR the adapter stream is a <em>second full transformer</em>: it runs its own
+(LoRA-adapted) attention and MLP, and <em>also</em> receives the cross-stream injection
+from the base. This proposal strips the adapter stream down to <strong>nothing but the
+injection</strong>. The adapter stream never attends and never runs an MLP; the only thing
+that writes into it is <code>W_cross(h_base_output)</code>, accumulated layer over layer
+through an RMSNorm. The base stream is the full, frozen base model &mdash; unchanged.
+</p>
+
+<div class="eqn">
+  h_adapt<sub>l+1</sub> &nbsp;=&nbsp; RMSNorm<sub>l</sub>( h_adapt<sub>l</sub> ) &nbsp;+&nbsp; W<sub>cross</sub><sub>,l</sub>( h_base_output<sub>l</sub> )
+  <br><span class="small">h_adapt<sub>0</sub> = embeds &times; embedding_multiplier &nbsp;&nbsp;(clone of the base seed, as in current SR)</span>
+  <br><span class="small">logits = lm_head( norm( h_adapt<sub>N</sub> ) ) / logits_scaling &nbsp;&nbsp;(only the adapter stream reaches the head)</span>
+</div>
+
+<ul>
+  <li><span class="pill base">base</span> <code>h_base_output<sub>l</sub></code> &mdash; the base stream's layer-<em>l</em> output (after attention + MLP residuals); bit-identical to the unadapted base model.</li>
+  <li><span class="pill adapter">adapter</span> <code>RMSNorm(h_adapt<sub>l</sub>)</code> &mdash; the adapter carry from below, renormalized. This <strong>replaces</strong> the running sum, so the adapter state is unit-scale at every layer rather than an ever-growing residual.</li>
+  <li><span class="pill cross">cross</span> <code>W<sub>cross,l</sub>(&middot;)</code> &mdash; the rank-<em>R</em> <code>B&middot;A</code> injection; the <strong>sole trainable projection</strong>.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="perlayer">2. Per-layer compute graph</h2>
+
+<div class="diagram">
+<svg viewBox="0 0 980 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Read-out stream per-layer compute graph">
+  <defs>
+    <marker id="arrB" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0a5ca8"/>
+    </marker>
+    <marker id="arrA" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#cf222e"/>
+    </marker>
+    <marker id="arrC" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9a6700"/>
+    </marker>
+  </defs>
+  <style>
+    .lane-base   { fill: #ddeefb; stroke: #7fb2df; }
+    .lane-adapt  { fill: #ffebe9; stroke: #f0a8ad; }
+    .box         { fill: #eef1f5; stroke: #d0d7de; }
+    .boxA        { fill: #ffebe9; stroke: #f0a8ad; }
+    .boxB        { fill: #ddeefb; stroke: #7fb2df; }
+    .boxC        { fill: #fff8c5; stroke: #d9bf6b; }
+    .boxN        { fill: #d5f0dd; stroke: #7fc495; }
+    .edgeA       { stroke: #cf222e; fill: none; stroke-width: 1.6; }
+    .edgeB       { stroke: #0a5ca8; fill: none; stroke-width: 1.6; }
+    .edgeC       { stroke: #9a6700; fill: none; stroke-width: 2.2; }
+    .lbl         { font: 13px ui-monospace, monospace; fill: #1f2328; }
+    .sub         { font: 11px ui-monospace, monospace; fill: #656d76; }
+    .title       { font: 13px -apple-system, sans-serif; fill: #1f2328; }
+  </style>
+
+  <!-- lane backgrounds -->
+  <rect class="lane-base"  x="40"  y="20" width="420" height="520" rx="10" opacity="0.30"/>
+  <rect class="lane-adapt" x="560" y="20" width="380" height="520" rx="10" opacity="0.30"/>
+  <text class="title" x="60"  y="42">base stream &mdash; full frozen transformer (Q/K/V/O + MLP)</text>
+  <text class="title" x="580" y="42">adapter stream &mdash; read-out only (no attn, no MLP)</text>
+
+  <!-- Inputs -->
+  <rect class="boxB" x="120" y="60" width="260" height="36" rx="6"/>
+  <text class="lbl" x="146" y="84">h_base  (from prev layer)</text>
+  <rect class="boxA" x="640" y="60" width="220" height="36" rx="6"/>
+  <text class="lbl" x="668" y="84">h_adapt (from prev layer)</text>
+
+  <!-- base: input layernorm -->
+  <rect class="box" x="120" y="120" width="260" height="34" rx="6"/>
+  <text class="lbl" x="150" y="142">input_layernorm( h_base )</text>
+
+  <!-- adapter: RMSNorm of carry (the inter-layer norm) -->
+  <rect class="boxN" x="640" y="120" width="220" height="34" rx="6"/>
+  <text class="lbl" x="664" y="142">RMSNorm( h_adapt )  &gamma;</text>
+
+  <!-- base attention -->
+  <rect class="boxB" x="100" y="178" width="300" height="56" rx="6"/>
+  <text class="lbl"  x="122" y="201">q/k/v/o_proj   (frozen base)</text>
+  <text class="sub"  x="122" y="219">computes the single shared K/V cache</text>
+
+  <!-- adapter carry passthrough (held) -->
+  <rect class="boxA" x="640" y="178" width="220" height="56" rx="6"/>
+  <text class="lbl"  x="664" y="201">carry = RMSNorm(h_adapt)</text>
+  <text class="sub"  x="664" y="219">no attention / no K/V on adapter</text>
+
+  <!-- base residual -->
+  <rect class="boxB" x="120" y="256" width="260" height="34" rx="6"/>
+  <text class="lbl" x="150" y="278">h_base += o_base &middot; &mu;_res</text>
+
+  <!-- base post-attn LN -->
+  <rect class="box" x="120" y="312" width="260" height="34" rx="6"/>
+  <text class="lbl" x="150" y="334">post_attention_layernorm( h_base )</text>
+
+  <!-- base MLP -->
+  <rect class="boxB" x="100" y="368" width="300" height="52" rx="6"/>
+  <text class="lbl" x="122" y="390">gate/up/down   (frozen base MLP)</text>
+  <text class="sub" x="122" y="408">bit-exact unadapted base</text>
+
+  <!-- base output -->
+  <rect class="boxB" x="120" y="442" width="260" height="36" rx="6"/>
+  <text class="lbl" x="134" y="466">h_base_output  (post-MLP residual)</text>
+
+  <!-- cross stream site -->
+  <rect class="boxC" x="430" y="360" width="160" height="60" rx="6"/>
+  <text class="lbl" x="448" y="384">W_cross</text>
+  <text class="sub" x="448" y="402">B&middot;A,  rank R</text>
+  <text class="sub" x="448" y="416">trainable</text>
+
+  <!-- adapter sum (next-layer state) -->
+  <rect class="boxA" x="620" y="442" width="260" height="36" rx="6"/>
+  <text class="lbl" x="636" y="466">h_adapt += W_cross(h_base_output)</text>
+
+  <!-- edges: base lane -->
+  <path class="edgeB" d="M250,96  V120" marker-end="url(#arrB)"/>
+  <path class="edgeB" d="M250,154 V178" marker-end="url(#arrB)"/>
+  <path class="edgeB" d="M250,234 V256" marker-end="url(#arrB)"/>
+  <path class="edgeB" d="M250,290 V312" marker-end="url(#arrB)"/>
+  <path class="edgeB" d="M250,346 V368" marker-end="url(#arrB)"/>
+  <path class="edgeB" d="M250,420 V442" marker-end="url(#arrB)"/>
+
+  <!-- edges: adapter lane carry -->
+  <path class="edgeA" d="M750,96  V120" marker-end="url(#arrA)"/>
+  <path class="edgeA" d="M750,154 V178" marker-end="url(#arrA)"/>
+  <path class="edgeA" d="M750,234 V442" marker-end="url(#arrA)"/>
+
+  <!-- base_output -> W_cross -->
+  <path class="edgeC" d="M380,460 C410,460 420,400 430,392" marker-end="url(#arrC)"/>
+  <!-- W_cross -> adapter sum -->
+  <path class="edgeC" d="M590,392 C700,392 720,430 740,442" marker-end="url(#arrC)"/>
+  <text class="sub" x="398" y="350" fill="#9a6700">W_cross(h_base_output)  &rarr;  h_adapt</text>
+</svg>
+<div class="caption">One decoder layer. <strong>Left (blue):</strong> the base stream runs the full frozen
+Q/K/V/O + MLP and produces <code>h_base_output</code> &mdash; bit-identical to the unadapted base,
+and the owner of the single shared K/V cache. <strong>Right (red):</strong> the adapter stream does
+<em>nothing</em> of its own: its carry is just <code>RMSNorm(h_adapt)</code>. <strong>Gold:</strong> the only
+write into the adapter stream is <code>W_cross(h_base_output)</code>. The next-layer adapter state is
+<code>RMSNorm(h_adapt) + W_cross(h_base_output)</code>.</div>
+</div>
+
+<div class="warn">
+  <strong>No adapter K/V, no adapter attention.</strong> Because the adapter stream never attends,
+  token-to-token mixing happens <em>entirely inside the frozen base</em>. The adapter can only mix
+  base information <em>across layers</em> (by stacking per-position read-outs), never across positions
+  on its own. That is the defining constraint of this design.
+</div>
+
+<!-- ============================================================ -->
+<h2 id="interlayer">3. Inter-layer recurrence</h2>
+
+<p>
+Zooming out: the base lane is the ordinary frozen transformer; the adapter lane is a
+<strong>renormalize-then-inject</strong> recurrence. RMSNorm sits on the adapter residual
+<em>between</em> layers, so each adapter state is unit-scale before the next base read-out lands.
+</p>
+
+<div class="diagram">
+<svg viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Inter-layer recurrence">
+  <defs>
+    <marker id="iB" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0a5ca8"/>
+    </marker>
+    <marker id="iA" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#cf222e"/>
+    </marker>
+    <marker id="iC" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9a6700"/>
+    </marker>
+  </defs>
+  <style>
+    .cardB { fill: #ddeefb; stroke: #7fb2df; }
+    .cardA { fill: #ffebe9; stroke: #f0a8ad; }
+    .nrm   { fill: #d5f0dd; stroke: #7fc495; }
+    .wc    { fill: #fff8c5; stroke: #d9bf6b; }
+    .eB    { stroke: #0a5ca8; fill: none; stroke-width: 1.8; }
+    .eA    { stroke: #cf222e; fill: none; stroke-width: 1.8; }
+    .eC    { stroke: #9a6700; fill: none; stroke-width: 2.2; }
+    .t     { font: 12.5px ui-monospace, monospace; fill: #1f2328; }
+    .s     { font: 11px ui-monospace, monospace; fill: #656d76; }
+    .h     { font: 12px -apple-system, sans-serif; fill: #656d76; }
+  </style>
+
+  <text class="h" x="150" y="28">base lane (frozen)</text>
+  <text class="h" x="600" y="28">adapter lane (read-out)</text>
+
+  <!-- seed -->
+  <rect class="cardB" x="120" y="44" width="200" height="34" rx="6"/>
+  <text class="t" x="138" y="66">embeds &times; mult = h_base_0</text>
+  <rect class="cardA" x="560" y="44" width="240" height="34" rx="6"/>
+  <text class="t" x="578" y="66">h_adapt_0 = embeds &times; mult</text>
+
+  <!-- layer 0 -->
+  <rect class="cardB" x="100" y="104" width="240" height="46" rx="6"/>
+  <text class="t" x="118" y="126">layer 0 (full base attn+MLP)</text>
+  <text class="s" x="118" y="142">&rarr; h_base_output_0</text>
+
+  <rect class="nrm" x="470" y="104" width="150" height="46" rx="6"/>
+  <text class="t" x="486" y="132">RMSNorm_0</text>
+  <rect class="wc"  x="650" y="104" width="150" height="46" rx="6"/>
+  <text class="t" x="666" y="126">+ W_cross_0</text>
+  <text class="s" x="666" y="142">(h_base_output_0)</text>
+
+  <!-- layer 1 -->
+  <rect class="cardB" x="100" y="200" width="240" height="46" rx="6"/>
+  <text class="t" x="118" y="222">layer 1 (full base attn+MLP)</text>
+  <text class="s" x="118" y="238">&rarr; h_base_output_1</text>
+
+  <rect class="nrm" x="470" y="200" width="150" height="46" rx="6"/>
+  <text class="t" x="486" y="228">RMSNorm_1</text>
+  <rect class="wc"  x="650" y="200" width="150" height="46" rx="6"/>
+  <text class="t" x="666" y="222">+ W_cross_1</text>
+  <text class="s" x="666" y="238">(h_base_output_1)</text>
+
+  <!-- dots -->
+  <text class="t" x="200" y="296">&#8942;  layers 2 .. N-2</text>
+  <text class="t" x="610" y="296">&#8942;</text>
+
+  <!-- layer N-1 -->
+  <rect class="cardB" x="100" y="320" width="240" height="46" rx="6"/>
+  <text class="t" x="118" y="342">layer N-1 (full base attn+MLP)</text>
+  <text class="s" x="118" y="358">&rarr; h_base_output_{N-1}</text>
+
+  <rect class="nrm" x="470" y="320" width="150" height="46" rx="6"/>
+  <text class="t" x="486" y="348">RMSNorm</text>
+  <rect class="wc"  x="650" y="320" width="150" height="46" rx="6"/>
+  <text class="t" x="666" y="342">+ W_cross</text>
+  <text class="s" x="666" y="358">(h_base_output)</text>
+
+  <!-- head -->
+  <rect class="cardB" x="100" y="420" width="240" height="34" rx="6"/>
+  <text class="t" x="118" y="442">h_base_{N-1}  (DISCARDED)</text>
+  <rect class="cardA" x="540" y="420" width="280" height="34" rx="6"/>
+  <text class="t" x="558" y="442">norm(h_adapt_N) &rarr; lm_head</text>
+
+  <!-- base vertical flow -->
+  <path class="eB" d="M220,78  V104" marker-end="url(#iB)"/>
+  <path class="eB" d="M220,150 V200" marker-end="url(#iB)"/>
+  <path class="eB" d="M220,246 V320" marker-end="url(#iB)"/>
+  <path class="eB" d="M220,366 V420" marker-end="url(#iB)"/>
+
+  <!-- adapter carry: state -> RMSNorm -> sum -> next state -->
+  <path class="eA" d="M680,78  C560,86 545,100 545,104" marker-end="url(#iA)"/>
+  <path class="eA" d="M620,127 H650" marker-end="url(#iA)"/>
+  <path class="eA" d="M725,150 C725,172 680,178 545,200" marker-end="url(#iA)"/>
+  <path class="eA" d="M620,223 H650" marker-end="url(#iA)"/>
+  <path class="eA" d="M725,246 V270" marker-end="url(#iA)"/>
+  <path class="eA" d="M725,306 V320" marker-end="url(#iA)"/>
+  <path class="eA" d="M620,343 H650" marker-end="url(#iA)"/>
+  <path class="eA" d="M725,366 C725,392 700,420 690,420" marker-end="url(#iA)"/>
+
+  <!-- cross injections: base_output -> W_cross -->
+  <path class="eC" d="M340,127 C420,127 600,120 650,124" marker-end="url(#iC)"/>
+  <path class="eC" d="M340,223 C420,223 600,216 650,220" marker-end="url(#iC)"/>
+  <path class="eC" d="M340,343 C420,343 600,336 650,340" marker-end="url(#iC)"/>
+</svg>
+<div class="caption">The base lane is the unadapted frozen transformer; its layer outputs are read out by
+each layer's <code>W_cross</code> and injected into the adapter lane. The adapter lane renormalizes its
+carry (<code>RMSNorm</code>) before adding the next read-out. After the last layer the base state is
+discarded; only <code>norm(h_adapt<sub>N</sub>)</code> reaches the head &mdash; exactly as in current SR.</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="vs">4. How it differs from current SR</h2>
+
+<table>
+  <tr><th></th><th>Current SR (shared-base-KV)</th><th>Read-out stream (this proposal)</th></tr>
+  <tr><td>Adapter attention (Q/O LoRA)</td><td>yes &mdash; delta fires over shared base K/V</td><td><strong>none</strong> &mdash; adapter never attends</td></tr>
+  <tr><td>Adapter MLP (gate/up/down LoRA)</td><td>yes &mdash; delta fires</td><td><strong>none</strong></td></tr>
+  <tr><td>Adapter update</td><td><code>h_adapt += o_adapt + mlp_adapt + W_cross(h_base)</code></td><td><code>h_adapt = RMSNorm(h_adapt) + W_cross(h_base_output)</code></td></tr>
+  <tr><td>Trainable / layer</td><td>cross_stream B&middot;A + optional attn/MLP LoRA</td><td>cross_stream B&middot;A + one RMSNorm &gamma;</td></tr>
+  <tr><td>Base stream</td><td>frozen full transformer</td><td>frozen full transformer <span class="small">(unchanged)</span></td></tr>
+  <tr><td>Shared base K/V</td><td>yes</td><td>yes <span class="small">(and the <em>only</em> K/V &mdash; no adapter Q either)</span></td></tr>
+  <tr><td>Head reads</td><td><code>norm(h_adapt)</code></td><td><code>norm(h_adapt)</code> <span class="small">(unchanged)</span></td></tr>
+</table>
+
+<p>
+The base stream, shared-base-K/V, and the frozen-base invariant are all <strong>unchanged</strong>.
+The structural difference is confined to the adapter side: it stops running its own attention/MLP
+and becomes a renormalized accumulator of <code>W_cross</code> injections.
+</p>
+
+<!-- ============================================================ -->
+<h2 id="why">5. Why this shape &mdash; and the trade-offs</h2>
+
+<ul>
+  <li><strong>Tiny trainable footprint.</strong> Per layer: <code>cross_stream.lora_A [R,H]</code> +
+    <code>cross_stream.lora_B [H,R]</code> + one RMSNorm <code>&gamma; [H]</code>. No Q/K/V/O/gate/up/down LoRA at all.</li>
+  <li><strong>RMSNorm bounds the stream.</strong> The carry is renormalized every layer, so the adapter
+    state stays unit-scale no matter how many injections accumulate or how large <code>h_base_output</code>
+    grows in deep layers. Trade-off: early-layer injections are repeatedly renormalized as later ones stack
+    on, so the stream is biased toward <em>recent</em> (deeper-layer) base information.</li>
+  <li><strong>A linear read-out of the base trajectory.</strong> The whole bet is that a learned low-rank
+    read-out of the base's layerwise outputs &mdash; with cross-position mixing done entirely by the frozen
+    base &mdash; is expressive enough for the target tasks. If it isn't, the lever is rank <em>R</em> (or
+    re-admitting adapter attention).</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="impl">6. Implementation sketch &amp; open questions</h2>
+
+<p>These are the concrete hooks a later implementation would touch &mdash; recorded here so the
+design can be critiqued before any code is written.</p>
+
+<table>
+  <tr><th>Concern</th><th>Where / how</th></tr>
+  <tr><td>Drop adapter attention + MLP</td><td><code>decoder_hf.py</code>: the adapter branch stops calling <code>self_attn</code> / <code>mlp</code> on <code>normed_adapt</code>; it only computes the carry. Base branch unchanged. Shared K/V stays (computed from the base stream).</td></tr>
+  <tr><td>Inter-layer RMSNorm</td><td>New per-layer <code>GraniteMoeHybridRMSNorm(H)</code> applied to <code>h_adapt</code> at layer entry, before the <code>W_cross</code> add.</td></tr>
+  <tr><td><code>W_cross</code> site</td><td>Unchanged &mdash; already a stock-LoRA-wrapped frozen zero-init <code>nn.Linear</code> (<code>CrossStream</code>). Reads <code>h_base_output</code> (post-MLP), same injection point as today.</td></tr>
+  <tr><td>Target modules</td><td><code>target_modules=["cross_stream"]</code> only. No <code>q/o/gate/up/down</code>. K/V LoRA still rejected.</td></tr>
+</table>
+
+<div class="warn">
+  <strong>The RMSNorm &gamma; is the one new trainable that isn't LoRA.</strong> <code>W_cross</code> fits
+  the stock-PEFT "adapter = LoRA on <code>target_modules</code>" mould, but the per-layer RMSNorm &gamma;
+  is a plain trainable parameter. It would need either a <code>modules_to_save</code> entry in the
+  <code>LoraConfig</code> (so PEFT saves/loads it alongside the LoRA tensors) or a small custom module.
+  This is the main packaging question to resolve before implementing.
+</div>
+
+<h3>Open design points (as originally posed)</h3>
+<ul>
+  <li><strong>Non-residual carry, on purpose?</strong> As written, <code>RMSNorm(h_adapt_l)</code> replaces
+    the running sum rather than adding to it. An alternative keeps a true residual
+    (<code>h_adapt_l + &hellip;</code>). Current spec is the renormalized-carry (non-residual) form.</li>
+  <li><strong>RMSNorm scope.</strong> One &gamma; per layer (as drawn) vs. a single shared &gamma;.</li>
+  <li><strong>Seed.</strong> <code>h_adapt_0</code> is the embedding clone (matches current SR); the
+    alternative seed is zero (&ldquo;truly empty&rdquo; adapter stream).</li>
+</ul>
+<p class="small">All three are resolved in &sect;6b below. The spec as drawn was implemented as-is:
+renormalized carry, one &gamma; per layer, embedding seed.</p>
+
+<!-- ============================================================ -->
+<h2 id="resolved">6b. Design decisions (resolved)</h2>
+
+<table>
+  <tr><th>Question</th><th>Decision</th><th>Why</th></tr>
+  <tr><td>Carry form</td>
+      <td><strong>Renormalized (non-residual)</strong>: <code>h<sub>l+1</sub> = RMSNorm<sub>l</sub>(h<sub>l</sub>) + W<sub>cross,l</sub>(hb<sub>l</sub>)</code></td>
+      <td>This is the design under test. A residual variant would be a different experiment; it is
+          listed as a follow-up ablation, not mixed in.</td></tr>
+  <tr><td>&gamma; scope</td>
+      <td><strong>One &gamma; per layer</strong> (<code>[H]</code>, 40 of them on 4.2-3B), initialised to <strong>1</strong></td>
+      <td>As drawn. Init 1 = an identity RMSNorm, the standard init. Per-layer &gamma; also lets the model
+          learn how much of the carry each layer keeps vs. overwrites, which offsets the
+          &ldquo;recent-layer bias&rdquo; trade-off (&sect;5).</td></tr>
+  <tr><td>Seed</td>
+      <td><strong>Embedding clone</strong>, as current SR</td>
+      <td>It keeps the token identity in the stream (it reaches the head through 40 renormalizations, scaled by
+          &prod;&gamma;). A zero seed would make layer 0's <code>RMSNorm(0)</code> degenerate
+          (it is <code>0 &middot; rsqrt(eps)</code> = 0, but the gradient path is poor). It is kept as a follow-up ablation.</td></tr>
+  <tr><td>Where W<sub>cross</sub> reads</td>
+      <td><code>h_base_output<sub>l</sub></code>: the base residual <em>after</em> attention + MLP of layer l</td>
+      <td>Same site as current SR (<code>decoder_hf.py</code>: <code>cross_stream(h_base)</code> after the MLP add).</td></tr>
+  <tr><td>Init &rArr; what the untrained model computes</td>
+      <td>LoRA B = 0, so W<sub>cross</sub> = 0, and with &gamma; = 1 the adapter stream is
+          <code>RMSNorm<sup>40</sup>(embeds)</code>: the head sees normalized <em>embeddings</em>, not the base output.</td>
+      <td><strong>Important difference from current SR.</strong> At init, current SR's adapter stream equals the base
+          stream (its own attention/MLP run the frozen weights, so it reproduces the base model exactly), and training starts from
+          base-model quality. The read-out stream starts from a bigram-like model (logits from embeddings only) and must
+          <em>learn</em> to inject the base trajectory through W<sub>cross</sub>. This is inherent to the design
+          (&ldquo;the adapter stream carries no activations of its own&rdquo;). It is the main risk, and the reason for the
+          learning-rate and rank choices below.</td></tr>
+  <tr><td>Bare model / <code>disable_adapter()</code></td>
+      <td>Unchanged: the single-stream <code>forward_bare</code> path</td>
+      <td>Invariant 3 (bare == unadapted base) holds. The read-out flag only changes the <em>dual-stream</em> branch.</td></tr>
+  <tr><td>K/V</td>
+      <td>Base-only, one cache (unchanged)</td>
+      <td>The adapter stream has no Q, so K/V is consumed only by the base stream. The KV cache is identical
+          to an unadapted base model's.</td></tr>
+  <tr><td>Packaging the &gamma; (the &sect;6 warning)</td>
+      <td><strong>Stock PEFT <code>modules_to_save=["readout_norm"]</code></strong></td>
+      <td>Each decoder layer owns a <code>readout_norm</code> RMSNorm (frozen, &gamma;=1, a no-op until wrapped).
+          PEFT's stock <code>ModulesToSaveWrapper</code> makes a trainable copy per adapter, saves it as
+          <code>...readout_norm.weight</code> in <code>adapter_model.safetensors</code>, and restores it on
+          <code>PeftModel.from_pretrained</code>. There is <strong>no custom PEFT code</strong>, which keeps the repo's
+          &ldquo;100% stock PEFT&rdquo; property. The frozen original stays at &gamma;=1, so
+          <code>disable_adapter()</code> falls back to it.</td></tr>
+  <tr><td>How the forward knows it is in read-out mode</td>
+      <td><code>config.adapter_stream = "readout"</code> (model-config attribute, set by <code>build_sr_config</code>)</td>
+      <td>Like <code>share_moe_routing</code>: it is a forward-path choice, not a weight. train.py records
+          <code>"adapter_stream": "readout"</code> in <code>adapter_config.json</code>, and the serving path
+          (<code>generation_utils.read_adapter_stream_from_adapter</code>) reads it back, so the adapter describes itself.
+          Loading a read-out adapter onto a <code>full</code> base fails loudly (the <code>readout_norm</code> key and
+          the missing q/o/MLP LoRA keys do not match).</td></tr>
+  <tr><td>Compute saved</td>
+      <td>The adapter stream does no attention and no MLP</td>
+      <td>Per layer, current SR runs ~2&times; the base FLOPs (two attention Q/O paths + two MLPs). Read-out runs
+          ~1&times; base + one rank-R injection + one RMSNorm. Activations are about half of current SR's.</td></tr>
+</table>
+
+<h3>Trainable parameter budget (Granite 4.2 3B: H = 2560, 40 layers)</h3>
+<table>
+  <tr><th>Variant</th><th>Per layer</th><th>Total</th></tr>
+  <tr><td>Current SR (q,o,gate,up,down r=32 + cross r=32)</td>
+      <td>q 2&middot;32&middot;2560 + o 2&middot;32&middot;2560 + gate/up 2&times;32&middot;(2560+8192) + down 32&middot;(8192+2560) + cross 2&middot;32&middot;2560 &asymp; 1.52 M</td>
+      <td>&asymp; <strong>60.9 M</strong></td></tr>
+  <tr><td>Read-out, cross r=32</td><td>cross 2&middot;32&middot;2560 + &gamma; 2560 = 166 400</td><td>&asymp; 6.7 M</td></tr>
+  <tr><td><strong>Read-out, cross r=256 (the arm run here)</strong></td><td>cross 2&middot;256&middot;2560 + &gamma; 2560 = 1 313 280</td><td>&asymp; <strong>52.5 M</strong></td></tr>
+</table>
+<p>
+<strong>Why rank 256 for the main arm.</strong> The read-out's only lever is the rank of W<sub>cross</sub>
+(&sect;5: &ldquo;if it isn't [expressive enough], the lever is rank R&rdquo;). At r=32 the arm has 9&times; fewer
+trainable parameters than vanilla SR, so a loss would be confounded with capacity. r=256 brings the read-out to about
+86% of vanilla SR's budget (52.5 M vs 60.9 M). The comparison then mostly tests the <em>architecture</em> (a read-out of
+the base trajectory vs. a second transformer), not parameter count. Four GPUs per job and no short or queued runs leave room
+for exactly one arm per intrinsic, so the near-parameter-matched arm is the most informative single choice.
+</p>
+
+<!-- ============================================================ -->
+<h2 id="implementation">7. Implementation</h2>
+
+<table>
+  <tr><th>File</th><th>Change</th></tr>
+  <tr><td><code>shadow_residual/decoder_hf.py</code></td>
+      <td>Each layer gets a frozen <code>readout_norm</code> (<code>GraniteMoeHybridRMSNorm(H)</code>, &gamma;=1, <code>requires_grad=False</code>).
+          New <code>forward_readout</code>: the base stream runs exactly the existing base computation
+          (<code>_base_only</code> Q/K/V/O, <code>mlp.forward_base_only</code>; MoE routing on <code>normed_base</code>),
+          then <code>h_adapt = readout_norm(h_adapt) + cross_stream(h_base)</code>. The layer is still a
+          <code>GradientCheckpointingLayer</code> with a single stacked <code>[2,B,S,H]</code> tensor in and out, so HF
+          checkpointing recompute stays exact. <code>forward</code> dispatches on <code>config.adapter_stream</code>.</td></tr>
+  <tr><td><code>shadow_residual/attention_hf.py</code></td>
+      <td><code>forward_base</code>: base-only Q/K/V/O with the shared KV cache. It is the base half of the dual-stream forward
+          with no adapter Q (the adapter stream never attends).</td></tr>
+  <tr><td><code>shadow_residual/build.py</code></td>
+      <td><code>build_sr_config(..., adapter_stream="full")</code> / <code>build_sr_base(..., adapter_stream=...)</code>: stores the mode on the config.</td></tr>
+  <tr><td><code>shadow_residual/modeling_hf.py</code></td>
+      <td><code>_init_weights</code> keeps <code>readout_norm</code> at &gamma;=1 and frozen. The dual-stream loop is unchanged (the layer dispatches).</td></tr>
+  <tr><td><code>training/factory.py</code></td>
+      <td>In read-out mode: rejects any LoRA target other than <code>cross_stream</code> (q/o/MLP LoRA on the adapter
+          stream would never fire, so they would be trained but dead), requires <code>"cross_stream"</code>, requires
+          <code>readout_norm</code> in <code>modules_to_save</code>, and after the meta-materialize resets every
+          <code>readout_norm</code> (original + PEFT copy) to &gamma;=1. That last step is the same garbage-after-<code>to_empty</code>
+          bug class as the CrossStream re-zero and RoPE reinit.</td></tr>
+  <tr><td><code>config/training_config.py</code>, <code>config/adapters.py</code></td>
+      <td><code>adapter.adapter_stream: full | readout</code> (default <code>full</code>). <code>to_peft_config</code> adds
+          <code>modules_to_save=["readout_norm"]</code> in read-out mode. The JSON schema is regenerated.</td></tr>
+  <tr><td><code>training/train.py</code></td>
+      <td>Passes the mode to the factory and records <code>adapter_stream</code> into <code>adapter_config.json</code>.</td></tr>
+  <tr><td><code>training/generation_utils.py</code>, <code>generate.py</code>, <code>eval/answerability_eval.py</code></td>
+      <td><code>read_adapter_stream_from_adapter()</code>; the serving builds pass it to <code>build_sr_base</code>.</td></tr>
+  <tr><td><code>config/sr-readout-c256-g42.yaml</code></td>
+      <td>The arm's config: <code>target_modules: {cross_stream: 256}</code>, <code>alpha: 512</code> (scale 2, as the r32/&alpha;64 vanilla),
+          <code>adapter_stream: readout</code>. Everything else (data, optimizer, LR 2e-4, cosine, warmup 0.05, 2 epochs,
+          effective batch 32, max_length 4096, seed 2, ChatML markers) is identical to vanilla <code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code>.</td></tr>
+  <tr><td><code>scripts/readout_bench_eval.py</code></td>
+      <td>Eval driver: for each intrinsic, writes a <code>hf_generate</code> job for the harness and runs it on 1 GPU, then scores with the harness's own scorer (&sect;8).</td></tr>
+  <tr><td><code>tests/shadow_residual/test_readout_stream.py</code></td>
+      <td>CPU invariants (&sect;7b).</td></tr>
+</table>
+
+<h3>7b. Invariants checked on CPU (pytest)</h3>
+<ul>
+  <li><strong>Frozen base stream.</strong> In read-out mode with a trained (perturbed) adapter, the base-stream state
+      after every layer is bit-identical to the bare model's layer outputs.</li>
+  <li><strong>The recurrence is exactly the spec.</strong> A hand-written reference
+      (<code>h = norm_l(h) + cross_l(hb_l)</code>, head on <code>norm(h_N)</code>) matches the model's logits.</li>
+  <li><strong>Bare / disabled == base.</strong> <code>disable_adapter()</code> logits equal the bare model.</li>
+  <li><strong>Only cross_stream + &gamma; train.</strong> The trainable set is exactly <code>cross_stream.lora_A/B</code> +
+      <code>readout_norm.modules_to_save.default.weight</code>. Every one gets a gradient; nothing else does.</li>
+  <li><strong>Save/load round-trip.</strong> <code>save_pretrained</code> &rarr; <code>build_sr_base(adapter_stream="readout")</code> +
+      <code>PeftModel.from_pretrained</code> gives identical logits, and &gamma; survives.</li>
+  <li><strong>Gradient checkpointing is exact.</strong> Loss and gradients are equal with and without HF checkpointing.</li>
+  <li><strong>KV-cache generation == full recompute.</strong> Greedy decode with the cache equals step-by-step decode without it.</li>
+  <li><strong>Rejected configs.</strong> q/o/MLP targets in read-out mode, and read-out without <code>cross_stream</code> or without <code>readout_norm</code>.</li>
+  <li><strong>Meta-init path.</strong> After the FSDP-style meta build + rank-0 materialize, every <code>readout_norm</code> is exactly 1.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="experiment">8. Experiment &amp; evaluation protocol</h2>
+
+<h3>Arms</h3>
+<table>
+  <tr><th>Arm</th><th>Who runs it</th><th>Config</th></tr>
+  <tr><td><strong>Vanilla SR</strong> (control)</td><td>another Claude instance, which reports results back here (not re-run by this one, to avoid duplicate training)</td>
+      <td><code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code></td></tr>
+  <tr><td><strong>Read-out SR</strong> (this design)</td><td>this instance, 4 Vela jobs</td>
+      <td><code>sr-readout-c256-g42.yaml</code></td></tr>
+</table>
+
+<h3>Data: the adapter benchmark's 4 intrinsics (Granite 4.2 3B)</h3>
+<table>
+  <tr><th>Intrinsic</th><th>Train / val rows</th><th>Training set (on <code>danieloh-cos</code>, under <code>/danieloh_cos/granite-switch/adapter-bench/</code>)</th><th>Eval set (rows)</th></tr>
+  <tr><td>answerability</td><td>11 979 / 1 351</td><td><code>datasets/train/answerability/g42-alora-4.1-split/</code></td><td><code>granite-4.2-3b/v1/eval/answerability/evaluation.jsonl</code> (3 565)</td></tr>
+  <tr><td>guardian_core</td><td>12 000 / 577</td><td><code>datasets/train/guardian_core/guardian-ood-12k/</code></td><td><code>…/eval/guardian_core/</code> (11 347)</td></tr>
+  <tr><td>query_clarification</td><td>2 153 / 240</td><td><code>datasets/train/query_clarification/unified-compare-data-v4/</code></td><td><code>…/eval/query_clarification/</code> (279)</td></tr>
+  <tr><td>requirement_check</td><td>11 882 / 500</td><td><code>datasets/train/requirement_check/core-library-train-v2/</code></td><td><code>…/eval/requirement_check/</code> (2 409)</td></tr>
+</table>
+<p class="small"><strong>Exactly the vanilla arm's training rows:</strong> <code>/danieloh_cos/granite-switch/sr_shared_a/data_v1/&lt;intrinsic&gt;/{train,val}.jsonl</code>.
+These are the datasets above, with documents split out as the benchmark's <code>render.py</code> does and put back with the benchmark's own
+<code>prompts.with_documents(&hellip;, "tool_json_after_question")</code> (the SR prompt style in <code>adapters.yaml</code>), so the training
+prompts are byte-identical to the eval prompts. The vanilla session rendered them (<code>scripts/prepare_bench_sr_data.py</code>; manifest: 0 rows dropped). Both arms read the same files.
+Eval uses the same harness copy, <code>/danieloh_cos/granite-switch/sr_shared_a/bench_harness_2506b7c</code>, whose scorers, <code>prompts.py</code>, <code>hf_generate.py</code> and
+<code>staged.py</code> were hash-checked identical to a fresh clone of <code>granite-switch@2506b7c</code>.</p>
+
+<h3>Training (per intrinsic, one job)</h3>
+<ul>
+  <li>4&times; A100-80GB, DDP (<code>accelerate launch --multi_gpu</code>), bf16, 2 epochs, per-device batch 2 &times; grad-accum 4 &times; 4 GPUs = effective batch 32 (same as vanilla).</li>
+  <li><code>--skip-post-train-generate</code>; the eval runs afterwards, in the same pod, as a separate single-GPU process (CLAUDE.md FSDP/DDP guidance).</li>
+  <li>The job exits with the trainer's exit code (a crash cannot pass as <code>Succeeded</code>).</li>
+</ul>
+
+<h3>Evaluation = the adapter benchmark's own HF + PEFT reference path</h3>
+<ul>
+  <li>Harness: <code>generative-computing/granite-switch@2506b7c</code>, <code>benchmarks/adapter_eval/</code>, cloned into the pod.
+      Its scorers, <code>prompts.py</code> and <code>hf_generate.py</code> were hash-checked identical to the local harness checkout.</li>
+  <li>Generation: <code>hf_generate.run(job)</code> with exactly the reference column's settings: greedy, bf16, sdpa,
+      <code>max_model_len 32768</code>, <code>token_budget 262144</code>, <code>max_batch 64</code>,
+      <code>documents: tool_json_after_question</code>, <code>chat_template_kwargs: {enable_thinking: false}</code>, and
+      <code>max_new_tokens</code> per intrinsic from <code>adapters.yaml</code> (200 / 24 / 160 / 200).
+      The only difference from the reference job is that the SR model is built with this branch's code, so the
+      read-out adapter loads with <code>adapter_stream</code> read from its <code>adapter_config.json</code>. The harness's own
+      &ldquo;every saved LoRA weight loaded with its value&rdquo; check runs unchanged.</li>
+  <li>Scoring: <code>benchmarks.adapter_eval.scorers.get_scorer(...)</code>. Headlines: answerability <code>accuracy</code>,
+      guardian <code>accuracy</code> (mean over its ood_safety datasets), query clarification <code>overall_accuracy</code>,
+      requirement check <code>balanced_accuracy</code>.</li>
+  <li>Published reference row for context (dashboard, <code>reference_version 2</code>, bench v3, older SR trainer 488f8e7):
+      SR 0.634 / 0.802 / 0.932 / 0.652; LoRA 0.844 / 0.813 / 0.921 / 0.682; base 0.738 / 0.643 / 0.301 / 0.548.
+      The like-for-like comparison is against the vanilla run trained alongside this one, not these.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="results">9. Results</h2>
+<div class="note" id="results-status"><strong>Pending.</strong> Jobs submitted; this section is filled in as they finish.</div>
+
+<!-- ============================================================ -->
+<h2 id="issues">10. Issues &amp; notes log</h2>
+<ul id="issues-log">
+  <li><strong>Untrained read-out &ne; base model.</strong> See &sect;6b (&ldquo;Init&rdquo;). Expect a much higher step-0 loss than vanilla
+      SR (vanilla starts at the base model's loss). This is not a bug; the CPU tests pin the exact recurrence.</li>
+  <li><strong>The local harness checkout's <code>local.env</code> was not read</strong> (it holds secrets). The harness is pinned by commit instead,
+      and its scorer files were hash-compared against the local checkout.</li>
+  <li><strong>bf16 &gamma; cannot train.</strong> &gamma; sits near 1.0, where bf16 spacing is 2<sup>-7</sup> &asymp; 0.0078. Adam steps of about lr = 2e-4 round
+      to zero, so a bf16 &gamma; never moves. Fix: the factory keeps the trainable &gamma; copy in fp32 (DDP is fine with mixed dtypes). Under FSDP it warns,
+      and the run needs <code>model.param_dtype: fp32</code>.</li>
+  <li><strong>The harness only checks LoRA weights after loading.</strong> <code>hf_generate.unloaded_weights</code> covers only <code>lora_A/B</code>, so a
+      &gamma; that silently failed to load would go unnoticed. <code>scripts/readout_bench_eval.py</code> adds its own check that every saved &gamma; loaded
+      (tested both ways on CPU).</li>
+  <li><strong>Several Claude sessions share one working tree.</strong> The shared-A session edits <code>training/train.py</code> (multi-task) in the same
+      checkout. This session's train.py change is two additive lines (pass <code>adapter_stream</code>, record it in <code>adapter_config.json</code>),
+      but committing the file as it stands would sweep in the other session's uncommitted hunks.</li>
+  <li><strong>Blocker: getting the code to the pods.</strong> Vela pods clone from GitHub. The repo's CLAUDE.md says never commit or push, while
+      the task asked to push only this session's code, and train.py holds another session's unfinished edits. Training waits on that decision.</li>
+</ul>
+
+</div>
+</body>
+</html>

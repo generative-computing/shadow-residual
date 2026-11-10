@@ -34,6 +34,7 @@ def build_sr_config(
     torch_dtype: Optional[torch.dtype] = None,
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
+    adapter_stream: str = "full",
 ) -> ShadowResidualConfig:
     """Build the SR config by reading the upstream HF config (no weights).
 
@@ -90,6 +91,10 @@ def build_sr_config(
     # forward-path choice, not a weight, so a saved adapter carries no record of
     # it; train and serve must pass the same value (see build_sr_base).
     sr_config.share_moe_routing = bool(share_moe_routing)
+    # Adapter-stream topology ("full" = today's dual transformer, "readout" =
+    # norm-carry + W_cross only). Like share_moe_routing it is a forward-path
+    # choice recorded in adapter_config.json; serve with the trained value.
+    sr_config.adapter_stream = adapter_stream
     if torch_dtype is not None:
         sr_config.torch_dtype = torch_dtype
     if attn_implementation is not None:
@@ -103,6 +108,7 @@ def build_sr_base(
     torch_dtype: Optional[torch.dtype] = None,
     attn_implementation: Optional[str] = None,
     share_moe_routing: bool = True,
+    adapter_stream: str = "full",
 ) -> ShadowResidualForCausalLM:
     """Single-process SR base build (no FSDP / meta machinery).
 
@@ -128,6 +134,7 @@ def build_sr_base(
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         share_moe_routing=share_moe_routing,
+        adapter_stream=adapter_stream,
     )
     sr_model = ShadowResidualForCausalLM(sr_config)
     if torch_dtype is not None:

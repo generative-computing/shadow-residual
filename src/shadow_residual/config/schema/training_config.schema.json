@@ -85,6 +85,15 @@
           "default": true,
           "title": "Share Moe Routing",
           "type": "boolean"
+        },
+        "adapter_stream": {
+          "default": "full",
+          "enum": [
+            "full",
+            "readout"
+          ],
+          "title": "Adapter Stream",
+          "type": "string"
         }
       },
       "title": "AdapterConfig",

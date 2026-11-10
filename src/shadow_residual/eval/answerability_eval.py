@@ -297,6 +297,7 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
 
     from shadow_residual.shadow_residual.build import build_sr_base
     from shadow_residual.training.generation_utils import (
+        read_adapter_stream_from_adapter,
         read_share_moe_routing_from_adapter,
     )
 
@@ -335,6 +336,7 @@ def run_inference_peft(base_model_name, adapter_path, all_messages, all_document
     print(f"share_moe_routing (from adapter_config.json): {share_moe_routing}")
     base_model = build_sr_base(
         base_model_name, torch_dtype=dtype, share_moe_routing=share_moe_routing,
+        adapter_stream=read_adapter_stream_from_adapter(adapter_path),
     )
     model = PeftModel.from_pretrained(base_model, adapter_path)
     model = model.to(device)

@@ -578,6 +578,7 @@ def run_generation_under_fsdp(
             cfg.model.base,
             torch_dtype=torch.bfloat16,
             attn_implementation=cfg.model.attn_implementation,
+            adapter_stream=cfg.adapter.adapter_stream,
         )
         rebuilt = _build_sr_peft_model_meta(
             sr_config,
@@ -673,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from shadow_residual.shadow_residual.build import build_sr_base
     from shadow_residual.training.generation_utils import (
+        read_adapter_stream_from_adapter,
         read_share_moe_routing_from_adapter,
     )
 
@@ -701,6 +703,7 @@ def main(argv: list[str] | None = None) -> int:
         torch_dtype=torch.bfloat16,
         attn_implementation=cfg.model.attn_implementation,
         share_moe_routing=share_moe_routing,
+        adapter_stream=read_adapter_stream_from_adapter(str(checkpoint_path)),
     )
     model = PeftModel.from_pretrained(base_model, str(checkpoint_path))
     if torch.cuda.is_available():

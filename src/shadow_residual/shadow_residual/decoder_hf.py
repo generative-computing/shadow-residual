@@ -49,6 +49,8 @@ from ._stream_gated_linear import _StreamGatedLinear, _base_only
 from .attention_hf import ShadowResidualAttention
 from .cross_stream import CrossStream
 
+ADAPTER_STREAMS = ("full", "readout")
+
 
 class ShadowResidualMLP(nn.Module):
     """Per-layer FFN for Shadow Residual — dense SwiGLU **or** frozen sparse MoE.
@@ -241,6 +243,22 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         # zero to h_adapt.
         self.cross_stream = CrossStream(config.hidden_size)
 
+        # Read-out stream (``config.adapter_stream == "readout"``): the adapter
+        # stream runs no attention/MLP; it is h = readout_norm(h) + W_cross(h_base).
+        # The norm is frozen at gamma=1 here; PEFT's stock modules_to_save makes
+        # the trainable per-adapter copy. Built only in read-out mode so the
+        # "full" module tree (and its checkpoints) are unchanged.
+        self.adapter_stream = getattr(config, "adapter_stream", "full")
+        if self.adapter_stream not in ADAPTER_STREAMS:
+            raise ValueError(
+                f"unknown adapter_stream {self.adapter_stream!r}; expected one of {ADAPTER_STREAMS}"
+            )
+        if self.adapter_stream == "readout":
+            self.readout_norm = GraniteMoeHybridRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps,
+            )
+            self.readout_norm.weight.requires_grad_(False)
+
     def forward(
         self,
         hs: torch.Tensor,
@@ -260,6 +278,14 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         loop keeps its own reference).
         """
         del kwargs
+        if self.adapter_stream == "readout":
+            return self._forward_readout(
+                hs,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
         h_base, h_adapt = hs[0], hs[1]
         bsz = h_base.shape[0]
 
@@ -305,6 +331,61 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
 
         return torch.stack([h_base, h_adapt], dim=0)
 
+    def _forward_readout(
+        self,
+        hs: torch.Tensor,
+        *,
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache],
+        cache_position: Optional[torch.LongTensor],
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Read-out stream: ``h_adapt' = readout_norm(h_adapt) + W_cross(h_base_out)``.
+
+        The base stream is the frozen layer on ``base_layer`` weights (owner of the
+        single KV cache); the adapter stream runs no attention and no MLP.
+        """
+        h_base, h_adapt = hs[0], hs[1]
+        h_base = self._base_layer(
+            h_base,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=past_key_values is not None,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            base_only=True,
+        )
+        # gamma may be kept in fp32 (see factory); keep the stream in its dtype.
+        carry = self.readout_norm(h_adapt).to(h_adapt.dtype)
+        h_adapt = carry + self.cross_stream(h_base)
+        return torch.stack([h_base, h_adapt], dim=0)
+
+    def _base_layer(
+        self,
+        h: torch.Tensor,
+        *,
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache],
+        use_cache: bool,
+        cache_position: Optional[torch.LongTensor],
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        base_only: bool,
+    ) -> torch.Tensor:
+        normed = self.input_layernorm(h)
+        o, _ = self.self_attn.forward_bare(
+            normed,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            base_only=base_only,
+        )
+        h = h + o * self.residual_multiplier
+        normed = self.post_attention_layernorm(h)
+        mlp = self.mlp.forward_base_only if base_only else self.mlp
+        return h + mlp(normed) * self.residual_multiplier
+
     def forward_bare(
         self,
         h: torch.Tensor,
@@ -321,16 +402,12 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         model. No cross-stream contribution (bare CrossStream returns zero). Returns
         the updated hidden state ``[B, S, H]``.
         """
-        normed = self.input_layernorm(h)
-        o, _ = self.self_attn.forward_bare(
-            normed,
-            position_embeddings=position_embeddings,
+        return self._base_layer(
+            h,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            base_only=False,
         )
-        h = h + o * self.residual_multiplier
-        normed = self.post_attention_layernorm(h)
-        h = h + self.mlp(normed) * self.residual_multiplier
-        return h

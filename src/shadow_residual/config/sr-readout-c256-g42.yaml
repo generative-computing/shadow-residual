@@ -1,0 +1,64 @@
+# Read-out-stream SR (docs/sr_readout_stream_design.html) — Granite 4.2.
+#
+# Identical to sr-qo-mlp-r32-c32-sharedkv-g42.yaml except the adapter block:
+#   - adapter_stream: readout — the adapter stream runs no attention/MLP; each
+#     layer is h = RMSNorm_l(h) + W_cross_l(h_base_out). Trainables: cross_stream
+#     LoRA + one RMSNorm gamma per layer (PEFT modules_to_save, added by
+#     to_peft_config).
+#   - cross_stream rank 256 (alpha 512, scale 2 like the vanilla r32/alpha64): the
+#     read-out's only capacity lever; 52.5M trainables vs vanilla's 60.9M on 3B.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  adapter_stream: readout
+  target_modules:
+    cross_stream: 256
+  alpha: 512
+  dropout: 0.05
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]

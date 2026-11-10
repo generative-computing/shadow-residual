@@ -214,16 +214,20 @@ class ShadowResidualAttention(nn.Module):
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        base_only: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Cache]]:
         """Single-stream attention for a bare (no-adapter) model.
 
         One plain Q/K/V/O pass. On a bare model the projections are ordinary
         ``nn.Linear`` (or LoRA-disabled), so this is exactly the unadapted base
-        model's attention. Returns ``(o, present_kv)``.
+        model's attention. ``base_only=True`` calls each projection's frozen
+        ``base_layer`` (the read-out stream's base half, which must never see a
+        delta even if a projection is wrapped). Returns ``(o, present_kv)``.
         """
-        q = self.q_proj(normed)
-        k = self.k_proj(normed)
-        v = self.v_proj(normed)
+        proj = _base_only if base_only else (lambda m, x: m(x))
+        q = proj(self.q_proj, normed)
+        k = proj(self.k_proj, normed)
+        v = proj(self.v_proj, normed)
         q, k_shaped, v_shaped, cos, sin = self._shape_qkv(q, k, v, position_embeddings)
         if use_cache and past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -231,5 +235,5 @@ class ShadowResidualAttention(nn.Module):
                 k_shaped, v_shaped, self.layer_idx, cache_kwargs,
             )
         attn = self._run_attention(q, k_shaped, v_shaped, attention_mask)
-        o = self.o_proj(attn)
+        o = proj(self.o_proj, attn)
         return o, past_key_values if use_cache else None

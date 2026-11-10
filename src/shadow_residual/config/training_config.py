@@ -164,6 +164,13 @@ class AdapterConfig(_Strict):
     # the serving path (training.generation_utils.read_share_moe_routing_from_adapter)
     # so the adapter self-describes its routing mode.
     share_moe_routing: bool = True
+    # Adapter-stream topology. "full" (default): the adapter stream is a second,
+    # LoRA-adapted transformer (attention + MLP) plus the cross_stream injection.
+    # "readout": the adapter stream runs no attention/MLP — each layer is
+    # h = RMSNorm_l(h) + W_cross_l(h_base_out) (docs/sr_readout_stream_design.html);
+    # target_modules must then be {cross_stream: R} only, and the per-layer RMSNorm
+    # gamma trains via PEFT modules_to_save. Recorded into adapter_config.json.
+    adapter_stream: Literal["full", "readout"] = "full"
 
     @field_validator("target_modules")
     @classmethod
@@ -171,6 +178,17 @@ class AdapterConfig(_Strict):
         if isinstance(v, dict) and not v:
             raise ValueError("target_modules dict cannot be empty")
         return v
+
+    @model_validator(mode="after")
+    def _validate_readout_targets(self):
+        if self.adapter_stream != "readout":
+            return self
+        if not isinstance(self.target_modules, dict) or set(self.target_modules) != {"cross_stream"}:
+            raise ValueError(
+                'adapter_stream="readout" requires target_modules: {cross_stream: <rank>} '
+                "(the read-out stream has no attention/MLP for a q/o/MLP delta to land on)"
+            )
+        return self
 
     @model_validator(mode="after")
     def _default_alpha(self):

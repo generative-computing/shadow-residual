@@ -45,4 +45,20 @@ def read_share_moe_routing_from_adapter(adapter_path: str) -> bool:
         return False
 
 
-__all__ = ["read_share_moe_routing_from_adapter"]
+def read_adapter_stream_from_adapter(adapter_path: str) -> str:
+    """Read the adapter-stream topology (``"full"`` / ``"readout"``) an adapter
+    was trained under, recorded by train.py in ``adapter_config.json``.
+
+    Like ``share_moe_routing`` it is a forward-path choice the serving base must
+    match (``build_sr_base(adapter_stream=...)``). Absent → ``"full"`` (every
+    adapter trained before the read-out stream existed).
+    """
+    cfg_path = os.path.join(adapter_path, "adapter_config.json")
+    try:
+        with open(cfg_path) as f:
+            return str(json.load(f).get("adapter_stream", "full"))
+    except (FileNotFoundError, ValueError):
+        return "full"
+
+
+__all__ = ["read_share_moe_routing_from_adapter", "read_adapter_stream_from_adapter"]

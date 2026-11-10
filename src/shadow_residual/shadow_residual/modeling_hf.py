@@ -107,6 +107,10 @@ class ShadowResidualPreTrainedModel(GraniteMoeHybridPreTrainedModel):
         if isinstance(module, CrossStream):
             nn.init.zeros_(module.weight)
             module.weight.requires_grad_(False)
+        readout_norm = getattr(module, "readout_norm", None)
+        if isinstance(readout_norm, GraniteMoeHybridRMSNorm):
+            nn.init.ones_(readout_norm.weight)
+            readout_norm.weight.requires_grad_(False)
 
 
 class ShadowResidualModel(ShadowResidualPreTrainedModel):
