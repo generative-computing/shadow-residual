@@ -266,6 +266,18 @@ results are posted there.</p>
   rows, so long rows may train in full (memory risk) or be cut at the start (label lost). To be
   checked in the training log. Either way it is the existing SR recipe and applies identically to both
   arms, so it does not bias the comparison.</li>
+  <li>2026-11-10 — <b>AppWrapper killed jobs that were waiting for a node.</b> On a full cluster
+  (0/162 nodes with 4 free GPUs + 16 CPUs) the 4 vanilla pods sat <code>Pending</code>; after the
+  AppWrapper's default warmup grace (~5&nbsp;min) the controller marked them <code>Unhealthy
+  (InsufficientPodsReady)</code> → <code>Resetting</code> → <code>Failed</code> without ever starting.
+  Fix: resubmitted with <code>admissionGracePeriodDuration: 12h</code> +
+  <code>warmupGracePeriodDuration: 12h</code> and 8 CPUs instead of 16, so they wait for placement
+  instead of failing.</li>
+  <li>2026-11-10 — <b>Throughput.</b> Shared-A runs at ~20–22&nbsp;s/step (eff. batch 32, 2&nbsp;376
+  steps ≈ 13&nbsp;h on 4 GPUs): each step is paced by the longest row in its micro-batches, and the
+  long answerability/qc document rows (up to 11k tokens) are mixed into batches that would otherwise
+  hold only short guardian/requirement rows. The 4 vanilla jobs total roughly the same GPU-hours, but
+  in parallel over 4 pods.</li>
   <li>2026-11-10 — <b>Shared working tree.</b> Other sessions edit the same checkout
   (e.g. an <code>adapter_stream</code> field in <code>train.py</code>/<code>factory.py</code>). The
   shared-A commit was built in an isolated clone from <code>c1ca175</code> with only this
