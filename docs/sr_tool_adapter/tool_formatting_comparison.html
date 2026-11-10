@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SR adapter as a tool: two formatting approaches</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --ink: #e6e8ec;
+    --muted: #9aa3b2; --accent: #6ea8fe; --accent2: #7ee2b8; --warn: #f0b354;
+    --line: #2a2f3a; --code-bg: #0b0d11; --pink: #e58fb1;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); line-height: 1.6; font-size: 16px; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 48px 24px 100px; }
+  header.page { border-bottom: 1px solid var(--line); padding-bottom: 24px; }
+  h1 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0; }
+  h2 { font-size: 21px; margin: 48px 0 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+  h3 { font-size: 16px; margin: 22px 0 8px; color: var(--accent2); }
+  p { margin: 10px 0; }
+  code { font-family: var(--mono); font-size: 0.86em; background: var(--panel2); padding: 1px 5px; border-radius: 4px; color: var(--pink); }
+  pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto;
+        font-family: var(--mono); font-size: 12.5px; line-height: 1.5; margin: 12px 0; }
+  pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+  .m { color: var(--muted); } .s { color: var(--accent2); } .e { color: var(--warn); }
+  .muted { color: var(--muted); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+  @media (max-width: 760px) { .cols { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .card h4 { margin: 0 0 8px; font-size: 15px; }
+  .card.ar h4 { color: var(--accent); } .card.ex h4 { color: var(--accent2); }
+  .tag { display: inline-block; font-family: var(--mono); font-size: 11px; padding: 1px 8px; border-radius: 999px;
+         border: 1px solid #244a3a; color: var(--accent2); margin-left: 6px; vertical-align: middle; }
+  ul { margin: 8px 0; padding-left: 20px; } li { margin: 4px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--line); padding: 7px 11px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); }
+  td.num { font-family: var(--mono); }
+  .big { font-weight: 700; color: var(--ink); }
+  .note { background: #1c1810; border: 1px solid #3a2f16; border-left: 3px solid var(--warn); border-radius: 8px;
+          padding: 11px 16px; margin: 14px 0; font-size: 14.5px; }
+  .note b { color: var(--warn); }
+  .lede { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px;
+          padding: 14px 18px; margin: 18px 0; }
+  .pending { display: inline-block; font-family: var(--mono); font-size: 11.5px; padding: 1px 8px; border-radius: 999px;
+             border: 1px dashed var(--warn); color: var(--warn); }
+  tr.ours td { background: #14201b; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="page">
+  <h1>SR adapter as a tool: two formatting approaches</h1>
+  <p class="sub">Granite&nbsp;4.2-3b. Which part of the chat template the adapter writes, how each variant was scored, and what each scored: answerability in both modes, and three more adapters in external mode (pending).</p>
+</header>
+
+<div class="lede">
+  <p style="margin:0">In both approaches the base model calls an <code>answerability</code> tool and the SR adapter produces the tool's result. They differ in where the adapter takes over and what it writes. At full scale they <b>score the same</b>: 0.95 vs 0.954 verdict accuracy, and 100% valid structure for both.</p>
+</div>
+
+<h2>1 &middot; The two structures</h2>
+
+<div class="cols">
+  <div class="card ar">
+    <h4>Autoregressive (<code>autoregressive_tool_formatting</code>)</h4>
+    <ul>
+      <li>The adapter takes over right after the base's <code>&lt;/tool_call&gt;</code>.</li>
+      <li>It writes the whole tool-response turn itself, then the opener of the next assistant turn.</li>
+      <li>Its output omits the <code>&lt;|im_end|&gt;</code> separators the stock template would put between those turns.</li>
+    </ul>
+  </div>
+  <div class="card ex">
+    <h4>External (<code>external_tool_formatting</code>)<span class="tag">default</span></h4>
+    <ul>
+      <li>The serving environment writes the template up to <code>&lt;tool_response&gt;\n</code>.</li>
+      <li>The adapter writes only the verdict dict, then stops on <code>&lt;|im_end|&gt;</code>.</li>
+      <li>The environment closes the tag. The full transcript is byte-identical to the stock 4.2 template.</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Autoregressive: what the adapter writes</h3>
+<pre><code><span class="m">…&lt;tool_call&gt;&lt;function=answerability&gt;…&lt;/function&gt;
+&lt;/tool_call&gt;                                   ← base; adapter takes over here</span>
+<span class="s">&lt;|im_start|&gt;user
+&lt;tool_response&gt;
+{"answerable": true}
+&lt;/tool_response&gt;
+&lt;|im_start|&gt;assistant
+"answerable"&lt;|im_end|&gt;                        ← adapter (trained span)</span></code></pre>
+
+<h3>External: what the adapter writes</h3>
+<pre><code><span class="m">…&lt;/tool_call&gt;                                   ← base
+&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+&lt;tool_response&gt;                               ← environment; adapter takes over here</span>
+<span class="s">{"answerable": true}&lt;|im_end|&gt;                ← adapter (trained span)</span>
+<span class="e">&lt;/tool_response&gt;
+&lt;|im_end|&gt;                                    ← environment closes the turn</span></code></pre>
+
+<h2>2 &middot; How they were trained</h2>
+<p>Both used the same recipe, so only the formatting differs:</p>
+<ul>
+  <li><b>Base model:</b> <code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>.</li>
+  <li><b>Adapter:</b> SR r32 on q/o and the MLP projections plus <code>cross_stream</code>, thinking off.</li>
+  <li><b>Compute:</b> 2 epochs (750 optimizer steps) on 4 GPUs (DDP) on Vela.</li>
+  <li><b>Data:</b> generated inside the job from <code>unified_compare/data_v4</code>, 11,978 training rows and 1,350 held-out rows. The gold verdict is each row's final assistant turn.</li>
+</ul>
+
+<h2>3 &middot; How they were evaluated</h2>
+<p>Both were scored by <code>scripts/eval_tool_adapter.py</code> on the held-out <code>data_v4</code> rows. Each row's prompt is cut where the adapter takes over. The model then generates freely: greedy decoding, stock <code>generate()</code>, stopping on <code>&lt;|im_end|&gt;</code>. Each output is checked two ways:</p>
+<ul>
+  <li><b>Structure:</b> does the output parse into a dict with a true/false <code>answerable</code>?</li>
+  <li><b>Accuracy:</b> does that value match the gold verdict? An output that fails the structure check also counts as wrong.</li>
+</ul>
+
+<table>
+  <tr><th></th><th>Autoregressive</th><th>External</th></tr>
+  <tr><td>Prompt cut at</td><td>after <code>&lt;/tool_call&gt;</code></td><td>after <code>&lt;tool_response&gt;\n</code></td></tr>
+  <tr><td>Structure check</td><td>the first JSON object with <code>"answerable"</code> inside the <code>&lt;tool_response&gt;</code> block</td><td>the <em>entire</em> output up to <code>&lt;|im_end|&gt;</code> must be the dict, with nothing extra</td></tr>
+  <tr><td>Extra check</td><td>consistency: the label in the next assistant turn matches the verdict</td><td>EOS stop: the output ended on <code>&lt;|im_end|&gt;</code>, not at the token cap</td></tr>
+  <tr><td>Rows scored</td><td>first 500 of the 1,350 held-out rows (<code>--limit 500</code>)</td><td>all 1,350 held-out rows</td></tr>
+  <tr><td>Max new tokens</td><td class="num">160</td><td class="num">32</td></tr>
+</table>
+
+<h2>4 &middot; Results</h2>
+<table>
+  <tr><th>Metric</th><th>Autoregressive</th><th>External</th></tr>
+  <tr><td><b>Verdict accuracy</b></td><td class="num big">0.95</td><td class="num big">0.9541</td></tr>
+  <tr><td><b>Structural validity</b></td><td class="num big">1.00 (500/500)</td><td class="num big">1.00 (1350/1350)</td></tr>
+  <tr><td>Extra check</td><td class="num">consistency 1.00</td><td class="num">EOS stop 1.00</td></tr>
+  <tr><td>Held-out loss, epoch 1 &rarr; 2</td><td class="num">0.00596 &rarr; 0.00516</td><td class="num">0.0191 &rarr; 0.0167</td></tr>
+</table>
+
+<h3>Confusion (gold &rarr; predicted)</h3>
+<table>
+  <tr><th></th><th>Autoregressive (500)</th><th>External (1350)</th></tr>
+  <tr><td>answerable &rarr; answerable</td><td class="num">249</td><td class="num">630</td></tr>
+  <tr><td>answerable &rarr; unanswerable</td><td class="num">15</td><td class="num">35</td></tr>
+  <tr><td>unanswerable &rarr; answerable</td><td class="num">10</td><td class="num">27</td></tr>
+  <tr><td>unanswerable &rarr; unanswerable</td><td class="num">226</td><td class="num">658</td></tr>
+</table>
+<p>Both make about as many wrong refusals as wrong accepts. Every output had valid structure in both modes, so all errors are wrong verdicts, not formatting failures.</p>
+
+<h3>Against the plain (non-tool) adapter</h3>
+<table>
+  <tr><th>Adapter, same <code>data_v4</code> held-out split</th><th>Verdict accuracy</th><th>Rows</th></tr>
+  <tr><td>Plain: one-word verdict, no tool call</td><td class="num">0.9444</td><td class="num">1,350</td></tr>
+  <tr><td>Tool, autoregressive</td><td class="num">0.95</td><td class="num">500</td></tr>
+  <tr><td>Tool, external</td><td class="num">0.9541</td><td class="num">1,350</td></tr>
+</table>
+<p>All three land at 0.94&ndash;0.95: wrapping answerability in the tool protocol costs essentially no accuracy.</p>
+<p class="muted">The held-out losses differ in scale because of what each mode supervises. Autoregressive trains on its whole turn, which is mostly fixed template tokens that are easy to predict. External trains on only the ~7-token dict, where the uncertain verdict token makes up a larger share. The free-generation scores are the comparable numbers.</p>
+
+<h2>5 &middot; Three more adapters (external mode) <span class="pending">pending</span></h2>
+<p>The same external approach applied to the other three intrinsics of the adapter benchmark. Unlike answerability above, these are scored on the <b>benchmark's own eval sets</b> with its <b>own scorers</b>, so they compare directly with the benchmark's LoRA, aLoRA and SR columns.</p>
+
+<h3>What changes per adapter</h3>
+<p>The base calls the tool with the intrinsic's instruction as its argument, taken out of the <code>&lt;guardian&gt;</code> / <code>&lt;requirements&gt;</code> user turn. The adapter writes exactly the dict its scorer parses.</p>
+<table>
+  <tr><th>Intrinsic</th><th>Tool call arguments</th><th>Adapter writes</th><th>Training data (train / val)</th></tr>
+  <tr><td>guardian_core</td><td><code>criteria</code>, <code>target</code> (last <code>user</code> or <code>assistant</code> turn)</td><td><code>{"score": "yes"|"no"}</code></td><td class="num">guardian-ood-12k: 12,000 / 577</td></tr>
+  <tr><td>requirement_check</td><td><code>requirements</code></td><td><code>{"score": "yes"|"no"}</code></td><td class="num">core-library-train-v2: 11,882 / 500</td></tr>
+  <tr><td>query_clarification</td><td><code>query</code> (the user's last turn); documents as a tool message</td><td><code>{"clarification": "CLEAR"|&lt;question&gt;}</code></td><td class="num">unified-compare-data-v4: 2,153 / 240</td></tr>
+</table>
+<p class="muted">Each row is checked against the stock 4.2 template: with the environment's closing text appended, it is byte-identical (<code>tests/training/test_tool_intrinsics.py</code>). Training: same SR recipe as answerability, 2 epochs, 4 GPUs on Vela, <code>--max-length 12288</code>. Some query-clarification rows reach 11k tokens and would otherwise be cut, losing their labels.</p>
+
+<h3>How they are evaluated</h3>
+<ul>
+  <li><b>Rows:</b> every row of the benchmark's eval set for that intrinsic (<code>adapter-bench/granite-4.2-3b/v1/eval/</code>).</li>
+  <li><b>Prompt:</b> built by the same code as training, cut after <code>&lt;tool_response&gt;\n</code>. Greedy decoding in bf16, stopping on <code>&lt;|im_end|&gt;</code>.</li>
+  <li><b>Score:</b> the harness's own scorer and headline metric. The scorer code is byte-identical to the harness copy on COS.</li>
+  <li><b>Runs on Vela:</b> scoring is a separate single-GPU step after training.</li>
+</ul>
+
+<h3>Results</h3>
+<table>
+  <tr><th>Intrinsic (headline metric)</th><th>Eval rows</th><th>LoRA</th><th>aLoRA</th><th>SR</th><th>SR as tool, external</th></tr>
+  <tr><td>guardian_core (accuracy)</td><td class="num">11,347</td><td class="num">0.8128</td><td class="num">0.7998</td><td class="num">0.8016</td><td><span class="pending">pending</span></td></tr>
+  <tr><td>query_clarification (overall accuracy)</td><td class="num">279</td><td class="num">0.9211</td><td class="num">0.9176</td><td class="num">0.9283</td><td><span class="pending">pending</span></td></tr>
+  <tr><td>requirement_check (balanced accuracy)</td><td class="num">2,409</td><td class="num">0.6822</td><td class="num">0.6748</td><td class="num">0.6557</td><td><span class="pending">pending</span></td></tr>
+</table>
+<p class="muted">LoRA, aLoRA and SR come from the latest full benchmark run on Granite&nbsp;4.2-3b (bench v3, granite-switch commit <code>a3d43fd</code>, 2026-10-22, all rows). Those columns are served through granite-switch with vLLM. The new column is scored with HF&nbsp;+&nbsp;PEFT, on the same rows with the same scorer.</p>
+
+<table>
+  <tr><th>Per adapter, once run</th><th>guardian_core</th><th>query_clarification</th><th>requirement_check</th></tr>
+  <tr class="ours"><td>Headline score</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
+  <tr class="ours"><td>Parse failures / invalid outputs</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
+  <tr class="ours"><td>EOS stop rate</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
+  <tr class="ours"><td>Held-out loss, epoch 1 &rarr; 2</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
+  <tr class="ours"><td>Vela job</td><td><span class="pending">not submitted</span></td><td><span class="pending">not submitted</span></td><td><span class="pending">not submitted</span></td></tr>
+</table>
+
+<h2>6 &middot; Reading the numbers</h2>
+<div class="note"><b>Tied on accuracy and structure.</b> 0.95 and 0.954 are within one or two errors of each other for these sample sizes. External is the default for its other properties: the adapter learns only the payload, the transcript is stock ChatML, and it stops cleanly on EOS.</div>
+<div class="note"><b>Different row counts.</b> The autoregressive score covers the first 500 held-out rows, the external one all 1,350. The autoregressive run's in-job eval hung, and its standalone re-eval was capped at 500 rows. A same-rows comparison would need autoregressive re-scored on all 1,350.</div>
+<div class="note"><b>Not the canonical benchmark.</b> The held-out rows come from the same <code>data_v4</code> source as the training data, and <code>eval_tool_adapter.py</code> scored them. So neither number is comparable to the ~0.89 from the answerability benchmark and its own scorer.</div>
+
+<footer>
+  Runs: autoregressive <code>antonp-sr-tooladapter-42-3b</code> (training, commit <code>dc837c8</code>), scored by <code>antonp-sr-eval-both-42-3b</code>. External <code>antonp-sr-tooladapter-ext-42-3b</code> (commit <code>b29a377</code>).
+  Artifacts under <code>/danieloh_cos/granite-switch/adapter_training/shadow_residual_runs/</code>: <code>tooladapter_42_3b/…/run_20261103T220821Z/</code> and <code>tooladapter_external_42_3b/…/run_20261104T080120Z/</code>.
+  Fuller design notes: <code>sr_tool_adapter.html</code>.
+</footer>
+
+</div>
+</body>
+</html>

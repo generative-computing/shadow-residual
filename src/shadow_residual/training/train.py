@@ -78,6 +78,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-r", type=int, default=None,
                    help="Override adapter.target_modules to a uniform scalar rank")
     p.add_argument("--lora-alpha", type=int, default=None, help="Override adapter.alpha")
+    p.add_argument("--max-length", type=int, default=None,
+                   help="Override data.max_length (rows longer than this are truncated "
+                        "from the end, which drops their supervised completion)")
     p.add_argument("--batch-size", type=int, default=None, help="Override batch.per_device_train")
     p.add_argument("--grad-accum", type=int, default=None, help="Override batch.gradient_accumulation")
 
@@ -134,6 +137,8 @@ def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
         cfg.adapter.target_modules = args.lora_r
     if args.lora_alpha is not None:
         cfg.adapter.alpha = args.lora_alpha
+    if args.max_length is not None:
+        cfg.data.max_length = args.max_length
     if args.batch_size is not None:
         cfg.batch.per_device_train = args.batch_size
     if args.grad_accum is not None:

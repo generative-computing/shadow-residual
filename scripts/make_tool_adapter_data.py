@@ -32,7 +32,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tool_intrinsics import INTRINSICS, build_training_row  # noqa: E402
 
 ANSWERABILITY_TOOL = {
     "type": "function",
@@ -216,7 +220,14 @@ def build_row(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="answerability jsonl (messages/documents/ground_truth)")
+    ap.add_argument("--input", required=True, help="source jsonl (answerability: messages/documents/ground_truth)")
+    ap.add_argument(
+        "--intrinsic",
+        choices=["answerability", *INTRINSICS],
+        default="answerability",
+        help="Which tool to build rows for. The adapter-bench intrinsics "
+             f"({', '.join(INTRINSICS)}) support {EXTERNAL} only.",
+    )
     ap.add_argument("--base-model", required=True, help="tokenizer source (for rendering the context)")
     ap.add_argument("--out-train", required=True)
     ap.add_argument("--out-val", required=True)
@@ -246,6 +257,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.tool_formatting == EXTERNAL and args.thinking != "off":
         ap.error(f"--thinking applies only to {AUTOREGRESSIVE}")
+    if args.intrinsic != "answerability" and args.tool_formatting != EXTERNAL:
+        ap.error(f"--intrinsic {args.intrinsic} supports {EXTERNAL} only")
 
     from transformers import AutoTokenizer
 
@@ -257,10 +270,14 @@ def main() -> None:
             line = line.strip()
             if not line:
                 continue
-            r = build_row(
-                json.loads(line), tokenizer,
-                thinking=args.thinking, tool_formatting=args.tool_formatting,
-            )
+            obj = json.loads(line)
+            if args.intrinsic == "answerability":
+                r = build_row(
+                    obj, tokenizer,
+                    thinking=args.thinking, tool_formatting=args.tool_formatting,
+                )
+            else:
+                r = build_training_row(args.intrinsic, obj, tokenizer)
             if r is not None:
                 rows.append(r)
     if args.limit:

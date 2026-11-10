@@ -84,6 +84,7 @@ def test_overrides_apply_when_set(config_path):
         "--lora-alpha", "16",
         "--batch-size", "2",
         "--grad-accum", "4",
+        "--max-length", "12288",
         "--output-dir", "/tmp/override",
         "--train-data", "/tmp/t.jsonl",
         "--val-data", "/tmp/v.jsonl",
@@ -96,6 +97,7 @@ def test_overrides_apply_when_set(config_path):
     assert cfg.adapter.alpha == 16
     assert cfg.batch.per_device_train == 2
     assert cfg.batch.gradient_accumulation == 4
+    assert cfg.data.max_length == 12288
     assert cfg.save.output_dir == "/tmp/override"
     assert cfg.data.train_path == "/tmp/t.jsonl"
     assert cfg.data.val_path == "/tmp/v.jsonl"
