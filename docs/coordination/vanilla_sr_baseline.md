@@ -28,12 +28,18 @@ adapter needs that loader to build your architecture.)
 
 ## Results (benchmark headline metrics)
 
-| intrinsic (headline) | vanilla SR | status |
-|---|---|---|
-| answerability (accuracy) | — | training |
-| guardian_core (accuracy, mean over ood_safety datasets) | — | training |
-| query_clarification (overall_accuracy) | — | training |
-| requirement_check (balanced_accuracy) | — | training |
+**All 4 done (2026-11-10).**
+
+| intrinsic (headline) | vanilla SR | bench's staged SR | run (under `/danieloh_cos/granite-switch/sr_shared_a/runs/v1/`) |
+|---|---|---|---|
+| answerability (accuracy) | **86.34** (wF1 84.41, unans F1 85.49, ans F1 90.13, n=3565) | 63.39 (older aLoRA-token recipe, not comparable) | `vanilla-sr-qo-mlp-r32-c32-skv-g42-ans/run_20261110T103731Z` (750 steps) |
+| guardian_core (accuracy, mean over ood_safety datasets) | **80.24** (f1 76.62, bal. acc 79.74, pooled 82.82, 0 parse failures, n=11347) | 80.20 | `vanilla-sr-qo-mlp-r32-c32-skv-g42-guard/run_20261110T103753Z` (750 steps, train_loss 0.0352) |
+| query_clarification (overall_accuracy) | **92.47** (underspecified 82.28 / clear_random 100.0 / clear_hard 86.0, n=279) | 93.19 | `vanilla-sr-qo-mlp-r32-c32-skv-g42-qc/run_20261110T103755Z` (136 steps, train_loss 0.317) |
+| requirement_check (balanced_accuracy) | **64.90** (acc 65.09, wF1 65.82, 0 invalid, n=2409) | 65.23 | `vanilla-sr-qo-mlp-r32-c32-skv-g42-req/run_20261110T113720Z` (744 steps, train_loss 0.0793) |
+
+Each run dir has `checkpoints/` (stock SR adapter) and `eval/<intrinsic>/{predictions.jsonl,score.json,job.json}`.
+guardian / qc / req reproduce the benchmark's staged SR adapters (same recipe) within noise, so the
+pipeline is a faithful baseline. The answerability number is new: the bench had no comparable SR adapter.
 
 Published bench HF+PEFT reference for comparison (run 20261011T193236Z): LoRA r16 84.40 / 81.33 / 92.11 / 68.20;
 aLoRA r32 81.80 / 79.89 / 91.76 / 67.78; base 73.83 / 64.33 / 30.11 / 54.76.
