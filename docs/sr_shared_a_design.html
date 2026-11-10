@@ -24,7 +24,7 @@
 
 <h1>Shadow Residual with a shared LoRA&nbsp;A and per-intrinsic B</h1>
 
-<p class="status"><b>Status:</b> <span id="status">implemented and tested; 4 vanilla SR baselines trained and scored (§5); shared-A job training (2&nbsp;376 steps, ~14&nbsp;h).</span>
+<p class="status"><b>Status:</b> <span id="status"><b>complete.</b> Shared-A vs vanilla SR on the 4 bench intrinsics: −0.65 / −0.50 / +0.36 / −1.37 pt (ans / guard / qc / req) for −33% params; see §5.</span>
 Branch <code>feature/different-arch</code>. Owner: Claude session <code>3a884bc0</code>.
 Last update: 2026-11-10.</p>
 
@@ -197,14 +197,60 @@ staged SR adapters were trained by <code>main@488f8e7</code> with exactly the re
 our vanilla re-runs should land near them; that is the pipeline sanity check.</p>
 
 <h2>5. Results</h2>
-<p id="results-pending"><i>Vanilla baselines done (2026-11-10). Shared-A still training.</i></p>
+<p class="note"><b>Verdict.</b> Sharing one A across the 4 intrinsics costs a small but real amount of
+accuracy: −0.5 to −1.4 pt on three intrinsics (two of them outside the 95% CI), ±0 on the smallest one,
+for 33% fewer trainable parameters across the family (163.2M vs 243.8M). The idea works as a
+compression trade-off, not as a free lunch: on these tasks A is <i>not</i> task-agnostic enough at
+r=32 to be shared without loss.</p>
 <table id="results">
-<tr><th>intrinsic (headline)</th><th>vanilla SR (ours)</th><th>bench staged SR</th><th>shared-A SR</th><th>Δ (shared − vanilla)</th></tr>
-<tr><td>answerability (acc)</td><td class="num">86.34</td><td class="num">63.39*</td><td class="num">—</td><td class="num">—</td></tr>
-<tr><td>guardian_core (acc)</td><td class="num">80.24</td><td class="num">80.20</td><td class="num">—</td><td class="num">—</td></tr>
-<tr><td>query_clarification (acc)</td><td class="num">92.47</td><td class="num">93.19</td><td class="num">—</td><td class="num">—</td></tr>
-<tr><td>requirement_check (bal. acc)</td><td class="num">64.90</td><td class="num">65.23</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><th>intrinsic (headline)</th><th>vanilla SR (ours)</th><th>bench staged SR</th><th>shared-A SR</th><th>Δ (shared − vanilla)</th><th>paired-bootstrap 95% CI</th><th>p</th></tr>
+<tr><td>answerability (acc, n=3565)</td><td class="num">86.34</td><td class="num">63.39*</td><td class="num">85.69</td><td class="num">−0.65</td><td class="num">[−1.29, +0.03]</td><td class="num">0.07</td></tr>
+<tr><td>guardian_core (acc, n=11347)</td><td class="num">80.24</td><td class="num">80.20</td><td class="num">79.73</td><td class="num"><b>−0.50</b></td><td class="num">[−0.78, −0.23]</td><td class="num">0.002</td></tr>
+<tr><td>query_clarification (acc, n=279)</td><td class="num">92.47</td><td class="num">93.19</td><td class="num">92.83</td><td class="num">+0.36</td><td class="num">[−1.43, +2.15]</td><td class="num">0.85</td></tr>
+<tr><td>requirement_check (bal. acc, n=2409)</td><td class="num">64.90</td><td class="num">65.23</td><td class="num">63.53</td><td class="num"><b>−1.37</b></td><td class="num">[−2.63, −0.05]</td><td class="num">0.04</td></tr>
+<tr><td>trainable params (4 adapters)</td><td class="num">243.8M</td><td></td><td class="num">163.2M</td><td class="num">−33%</td><td></td><td></td></tr>
 </table>
+<p>Bootstrap: 1&nbsp;000 paired resamples of eval rows, each resample re-scored with the benchmark's own
+scorer (so guardian's mean-over-datasets and requirement_check's balanced accuracy are bootstrapped
+correctly). Per-row outputs are identical between the arms on 96% / 98% / 77% / 90% of rows
+(ans / guard / qc / req). Results file:
+<code>/danieloh_cos/granite-switch/sr_shared_a/runs/v1/paired_bootstrap_shareda_vs_vanilla.json</code>.
+Shared-A run: <code>…/shareda-sr-qo-mlp-r32-c32-skv-g42-4task/run_20261110T093316Z/</code> (2&nbsp;376 steps,
+13h20m on 4 GPUs; adapters in <code>checkpoints/&lt;intrinsic&gt;/</code>).</p>
+
+<h3>Sanity checks on the trained shared-A export</h3>
+<ul>
+  <li>All 240 <code>lora_A</code> tensors are byte-identical across the 4 exported adapters (sharing held
+  through DDP training and export); each export is a stock SR adapter (r=32, α=64, same 6 target
+  modules, <code>last_context_token=&lt;/think&gt;</code>) and loaded through the benchmark's unmodified
+  <code>hf_generate</code> (which checks every saved weight was loaded).</li>
+  <li>Per-task B matrices are nearly orthogonal (mean cosine over the 240 B tensors 0.01–0.03), except
+  <b>guardian ↔ requirement_check: 0.15</b> — the two judge tasks that both answer
+  <code>{"score": "yes"|"no"}</code> found partly shared write directions.</li>
+  <li>query_clarification's B has 2–3× the norm of the others' (1.39 vs 0.43–0.62): it receives
+  ~2&nbsp;000 Adam updates in the joint run vs 136 in its vanilla run (caveat in §6). It did not hurt
+  its score (+0.36, n.s.).</li>
+</ul>
+
+<h3>Interpretation and next steps</h3>
+<ul>
+  <li>The loss is largest on requirement_check and guardian, the two tasks whose B's overlap most —
+  consistent with <b>competition for the 32 shared input directions</b> rather than with the Adam /
+  step-count caveat (which affects the small qc task most, and qc is the one that did not lose).</li>
+  <li>The comparison confounds "A is shared" with "trained jointly in one mixed run" (2&nbsp;376-step
+  cosine schedule, Adam moving absent tasks' B). A <b>joint run with A untied</b> (same trainer,
+  <code>setup_shared_a</code> without the tie) would split the two effects — the cheapest next run.</li>
+  <li>Cheapest ways to buy the accuracy back while keeping a saving: a <b>larger shared rank</b>
+  (A r=64, B r=64: 4 tasks ≈ 40·(1.34M + 4·1.70M) = 326M — no longer smaller, so instead A r=48 /
+  B r=48 ≈ 245M ≈ break-even; the saving shrinks quickly); or share A only on the
+  <b>cross_stream</b> site, whose input <code>h_base</code> is identical for every task (the one place where
+  sharing also amortizes compute at serving).</li>
+  <li>For the "add a 5th adapter cheaply" use case the result is encouraging: a frozen shared A plus a
+  new B is a 34.1M-param adapter (56% of a full one) that, on this evidence, should land within
+  ~1 pt of a full SR adapter.</li>
+</ul>
+
+<h3>Vanilla baseline</h3>
 <p>The vanilla re-runs reproduce the benchmark's staged SR adapters on the three intrinsics where the
 recipe matches (+0.04 / −0.72 / −0.33 pt), so the data rendering, trainer and eval path are faithful.
 Vanilla runs: <code>/danieloh_cos/granite-switch/sr_shared_a/runs/v1/vanilla-sr-qo-mlp-r32-c32-skv-g42-{ans,guard,qc,req}/</code>

@@ -41,5 +41,12 @@ Each run dir has `checkpoints/` (stock SR adapter) and `eval/<intrinsic>/{predic
 guardian / qc / req reproduce the benchmark's staged SR adapters (same recipe) within noise, so the
 pipeline is a faithful baseline. The answerability number is new: the bench had no comparable SR adapter.
 
+### Shared-A result (same data / recipe / eval), for reference
+
+`shareda-sr-qo-mlp-r32-c32-skv-g42-4task/run_20261110T093316Z` — one jointly trained LoRA A shared by
+the 4 adapters, per-task B: ans **85.69** (−0.65), guard **79.73** (−0.50, sig.), qc **92.83** (+0.36),
+req **63.53** (−1.37, sig.); paired-bootstrap CIs in `docs/sr_shared_a_design.html` §5 and
+`/danieloh_cos/granite-switch/sr_shared_a/runs/v1/paired_bootstrap_shareda_vs_vanilla.json`.
+
 Published bench HF+PEFT reference for comparison (run 20261011T193236Z): LoRA r16 84.40 / 81.33 / 92.11 / 68.20;
 aLoRA r32 81.80 / 79.89 / 91.76 / 67.78; base 73.83 / 64.33 / 30.11 / 54.76.
