@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SR-FrozenA: shared, compression-derived LoRA A matrices for Shadow Residual</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 1040px; margin: 2em auto; padding: 0 1.2em; line-height: 1.55; color: #1d1d1f; }
+  h1 { font-size: 1.75em; border-bottom: 2px solid #333; padding-bottom: .3em; }
+  h2 { margin-top: 2.2em; border-bottom: 1px solid #ccc; padding-bottom: .2em; }
+  h3 { margin-top: 1.6em; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .9em; }
+  pre { background: #f5f5f7; padding: .9em 1em; overflow-x: auto; border-radius: 6px; }
+  table { border-collapse: collapse; margin: 1em 0; width: 100%; }
+  th, td { border: 1px solid #bbb; padding: .4em .6em; text-align: left; vertical-align: top; }
+  th { background: #eef; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .box { border-left: 4px solid #36c; background: #f2f6ff; padding: .7em 1em; margin: 1em 0; }
+  .warn { border-left: 4px solid #c80; background: #fff8ec; padding: .7em 1em; margin: 1em 0; }
+  .bad { border-left: 4px solid #c33; background: #fff0f0; padding: .7em 1em; margin: 1em 0; }
+  .ok { border-left: 4px solid #393; background: #f0fff2; padding: .7em 1em; margin: 1em 0; }
+  .status { font-weight: bold; }
+  svg text { font-family: -apple-system, Helvetica, Arial, sans-serif; }
+  small { color: #555; }
+</style>
+</head>
+<body>
+
+<h1>SR-FrozenA: Shadow Residual with shared, compression-derived, frozen LoRA <code>A</code> matrices</h1>
+
+<p><small>Branch <code>feature/different-arch</code>. Status and results are at the bottom (§9–§11). This doc is updated as the work proceeds.</small></p>
+
+<div class="box">
+<b>The idea.</b> In a normal SR adapter every LoRA site <code>W + (α/r)·B·A</code> learns both <code>A</code> (r×in) and <code>B</code> (out×r).
+Here <b><code>A</code> is not learned</b>. It is <b>precomputed once from the frozen base model with a model-compression method</b> and frozen. Only the <code>B</code>
+matrices are trained. The same <code>A</code> is <b>shared by every LoRA site that reads the same input tensor</b>. Then the four benchmark adapters
+(answerability, guardian_core, query_clarification, requirement_check) are trained and compared with regular SR.
+</div>
+
+<h2>1. Background: what regular SR trains</h2>
+
+<p>SR runs two streams per decoder layer: a frozen base stream (identical to the unadapted base) and an adapter stream. K/V come from the base stream only and
+are shared. The reference SR config for the benchmark (<code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code>) puts stock PEFT LoRA, r=32 and α=64, on these sites in every layer:</p>
+
+<table>
+<tr><th>Site</th><th>Input it reads (adapter stream)</th><th>W shape (out×in) Granite-4.2-3B</th></tr>
+<tr><td><code>q_proj</code></td><td><code>x₁ = input_layernorm(h_adapt)</code></td><td>2560×2560</td></tr>
+<tr><td><code>o_proj</code></td><td><code>x₂ = attention output (concat heads)</code></td><td>2560×2560</td></tr>
+<tr><td><code>gate_proj</code></td><td><code>x₃ = post_attention_layernorm(h_adapt)</code></td><td>8192×2560</td></tr>
+<tr><td><code>up_proj</code></td><td><code>x₃</code> (same tensor as gate)</td><td>8192×2560</td></tr>
+<tr><td><code>down_proj</code></td><td><code>x₄ = silu(gate)·up</code></td><td>2560×8192</td></tr>
+<tr><td><code>cross_stream</code></td><td><code>x₅ = h_base</code> at the end of the layer (base residual)</td><td>2560×2560, W≡0 (frozen zero site)</td></tr>
+</table>
+
+<p>Base model: <code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>. Dense, 40 layers, hidden 2560, MLP 8192, 40 Q heads and 8 KV heads, untied lm_head.
+Regular SR has about 30.5M trainable parameters. The saved vanilla SR adapter is 121,961,048 bytes in fp32, which matches.</p>
+
+<h2>2. Literature: how to pick a frozen <code>A</code></h2>
+
+<p>Before choosing, I searched the model-compression literature and the frozen-<code>A</code> PEFT literature. These are the relevant results:</p>
+
+<table>
+<tr><th>Work</th><th>What it says</th><th>Use here</th></tr>
+<tr><td><b>LoRA-FA</b> (Zhang et al. 2023, arXiv 2308.03303)</td><td>Freeze the down-projection <code>A</code> (random init) and train only <code>B</code>. Accuracy is close to LoRA and activation memory is lower.</td><td>Supports training only <code>B</code>. Their <code>A</code> is random, not derived from the model.</td></tr>
+<tr><td><b>Asymmetry in LoRA</b> (Zhu et al. 2024)</td><td><code>A</code> mostly extracts features from the input and <code>B</code> uses them to produce the output. Tuning <code>B</code> matters more, and a random <code>A</code> is close to as good.</td><td>A frozen <code>A</code> is reasonable. A well-chosen <code>A</code> should beat a random one.</td></tr>
+<tr><td><b>SVD-LLM</b> (Wang et al., ICLR 2025, arXiv 2403.07378)</td><td>Compress <code>W ≈ U_k Σ_k V_kᵀ S⁻¹</code>, where <code>S</code> is the Cholesky factor of the calibration input covariance <code>XᵀX</code> ("truncation-aware data whitening"). Then each truncated singular value maps directly to the output-reconstruction loss <code>‖WX − W'X‖_F</code>, which is optimal for that loss.</td><td><b>Chosen per-matrix core.</b> Its right factor <code>V_kᵀS⁻¹</code> is exactly an r×in "down projection" of the input.</td></tr>
+<tr><td><b>ASVD</b> (Yuan et al. 2023)</td><td>Activation-aware SVD: scale input channels by their activation magnitude before SVD.</td><td>A diagonal-scaling special case of SVD-LLM. Not used.</td></tr>
+<tr><td><b>Basis Sharing</b> (Wang et al., ICLR 2025, arXiv 2410.03765)</td><td>Several weight matrices share one SVD basis. Concatenate them, whiten with the input covariance from the stacked inputs, run one SVD, and keep a shared basis plus per-matrix coefficients. Sharing helps <code>W_Q, W_K, W_V, W_Up, W_Gate</code>. It hurts <code>W_Down</code> and <code>W_O</code> across layers.</td><td><b>Chosen sharing rule.</b> Matrices that read the same input share one whitened basis. Following their finding, I share only within a layer and within the same input (gate+up), never across layers for down/o.</td></tr>
+<tr><td><b>ESPACE</b> (Sakr &amp; Khailany, NeurIPS 2024, arXiv 2410.05437)</td><td>Project activations onto pre-calibrated principal components of the input, <code>W·x ≈ (W P)(Pᵀx)</code>, where <code>P</code> holds the top eigenvectors of <code>E[xxᵀ]</code>. The model can be retrained through the frozen projection.</td><td>A weight-agnostic alternative (<code>A = Pᵀ</code>). Used for <code>cross_stream</code>, which has no base weight (W≡0), and kept as an ablation.</td></tr>
+<tr><td><b>CorDA</b> (Yang et al., NeurIPS 2024) / <b>EVA</b> (Paischer et al. 2024) / <b>PiSSA</b></td><td>Initialize LoRA from an SVD of W·Cov (CorDA), of the activations (EVA, built into PEFT as <code>init_lora_weights="eva"</code>), or of W (PiSSA). They still <i>train</i> A.</td><td>Confirms that whitened or activation SVD directions are good LoRA subspaces. Here they are frozen instead of being only an initialization.</td></tr>
+<tr><td><b>VeRA</b> / <b>ShareLoRA</b></td><td>Share a frozen random matrix across layers (VeRA), or share <code>A</code> across layers with layer-specific <code>B</code> (ShareLoRA).</td><td>Shows that sharing <code>A</code> works. My sharing is narrower (same input tensor only) so each <code>A</code> stays well matched to its input.</td></tr>
+</table>
+
+<h3>2.1 The chosen method: input-whitened truncated SVD, with a shared basis per input tensor</h3>
+
+<p>For a linear map <code>y = W x</code> with calibration inputs <code>X ∈ ℝ^{N×in}</code>, SVD-LLM solves</p>
+<pre>  min_{rank(W')≤r} ‖ W Xᵀ − W' Xᵀ ‖_F      with  C = XᵀX / N = S Sᵀ  (Cholesky, S lower-triangular)
+  W S = U Σ Vᵀ   ⇒   W' = U_r Σ_r · (V_rᵀ S⁻¹)
+                          └─B₀─┘   └──A──┘   (out×r)·(r×in)</pre>
+<p>So the compressed layer is "down-project with <code>A = V_rᵀ S⁻¹</code>, then up-project with <code>B₀ = U_rΣ_r</code>". <code>A</code> is the
+<b>r-dimensional input subspace that matters most for this weight's output, measured on real activations</b>. That is the projection to freeze. In SR-FrozenA,
+<code>B</code> starts at zero (LoRA init, so step 0 is identical to the base), learns in the subspace <code>A</code> selects, and <code>B₀</code> is discarded.</p>
+
+<p><b>Shared basis for a group of weights reading the same input</b> (Basis Sharing):</p>
+<pre>  W_G = [W₁; W₂; …] (stacked along out)      e.g. gate+up → 16384×2560
+  W_G S = U Σ Vᵀ   ⇒   A_G = V_rᵀ S⁻¹   is shared by every site in G
+  Exact identity: ‖(W_G − W_G') Xᵀ‖² = Σᵢ ‖(Wᵢ − Wᵢ') Xᵀ‖², so A_G is the best
+  shared rank-r input projection for the group's combined output error.</pre>
+
+<p><b>Scaling.</b> <code>V_rᵀS⁻¹</code> maps whitened inputs to an orthonormal basis: <code>A C Aᵀ = I_r</code>. Over the calibration data, each of the r
+features <code>A x</code> has unit variance and they are uncorrelated. That is the right conditioning for training <code>B</code> alone, because every feature
+reaches <code>B</code> at the same scale. Kaiming-random <code>A</code> gives features whose scale depends on the input norm.</p>
+
+<p><b>Sites with no informative weight</b>, namely <code>cross_stream</code> (W≡0, reads <code>h_base</code>): whitened SVD is undefined because <code>WS=0</code>. Here I use the
+ESPACE/EVA choice, the top-r principal components of the input, scaled to unit variance: <code>A = Λ_r^{-1/2} P_rᵀ</code> with <code>C = P Λ Pᵀ</code>. This is the same
+"unit-variance, max-energy subspace" criterion with the weight term dropped.</p>
+
+<h2>3. Design: which sites share which <code>A</code></h2>
+
+<svg width="1000" height="330" viewBox="0 0 1000 330" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#333"/></marker></defs>
+  <rect x="10" y="10" width="980" height="310" rx="10" fill="#fafafa" stroke="#999"/>
+  <text x="20" y="32" font-size="15" font-weight="bold">One decoder layer ℓ, adapter stream (base stream unchanged and frozen)</text>
+  <!-- inputs -->
+  <rect x="30" y="60" width="150" height="40" rx="6" fill="#dde8ff" stroke="#36c"/><text x="40" y="85" font-size="13">x₁ = norm₁(h_adapt)</text>
+  <rect x="30" y="130" width="150" height="40" rx="6" fill="#dde8ff" stroke="#36c"/><text x="40" y="155" font-size="13">x₂ = attn out</text>
+  <rect x="30" y="200" width="150" height="40" rx="6" fill="#dde8ff" stroke="#36c"/><text x="40" y="225" font-size="13">x₃ = norm₂(h_adapt)</text>
+  <rect x="30" y="260" width="150" height="40" rx="6" fill="#dde8ff" stroke="#36c"/><text x="40" y="285" font-size="13">x₄ = silu(g)·u</text>
+  <rect x="560" y="260" width="150" height="40" rx="6" fill="#ffe8cc" stroke="#c80"/><text x="572" y="285" font-size="13">x₅ = h_base (end)</text>
+  <!-- A boxes -->
+  <rect x="240" y="60" width="170" height="40" rx="6" fill="#e9e9e9" stroke="#555"/><text x="250" y="85" font-size="13">A_q  (WS-SVD of W_q)</text>
+  <rect x="240" y="130" width="170" height="40" rx="6" fill="#e9e9e9" stroke="#555"/><text x="250" y="155" font-size="13">A_o  (WS-SVD of W_o)</text>
+  <rect x="240" y="200" width="170" height="40" rx="6" fill="#e9e9e9" stroke="#555"/><text x="246" y="225" font-size="13">A_gu (shared, [W_g;W_u])</text>
+  <rect x="240" y="260" width="170" height="40" rx="6" fill="#e9e9e9" stroke="#555"/><text x="250" y="285" font-size="13">A_d  (WS-SVD of W_d)</text>
+  <rect x="770" y="260" width="200" height="40" rx="6" fill="#e9e9e9" stroke="#555"/><text x="778" y="285" font-size="13">A_c  (PCA of h_base, unit var)</text>
+  <!-- B boxes -->
+  <rect x="470" y="60" width="110" height="40" rx="6" fill="#d6f5d6" stroke="#393"/><text x="480" y="85" font-size="13">B_q (train)</text>
+  <rect x="470" y="130" width="110" height="40" rx="6" fill="#d6f5d6" stroke="#393"/><text x="480" y="155" font-size="13">B_o (train)</text>
+  <rect x="470" y="185" width="110" height="30" rx="6" fill="#d6f5d6" stroke="#393"/><text x="480" y="205" font-size="13">B_gate (train)</text>
+  <rect x="470" y="222" width="110" height="30" rx="6" fill="#d6f5d6" stroke="#393"/><text x="480" y="242" font-size="13">B_up (train)</text>
+  <rect x="640" y="200" width="110" height="40" rx="6" fill="#d6f5d6" stroke="#393"/><text x="650" y="225" font-size="13">B_d (train)</text>
+  <rect x="770" y="200" width="200" height="40" rx="6" fill="#d6f5d6" stroke="#393"/><text x="790" y="225" font-size="13">B_cross (train) → h_adapt</text>
+  <line x1="180" y1="80" x2="238" y2="80" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="410" y1="80" x2="468" y2="80" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="180" y1="150" x2="238" y2="150" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="410" y1="150" x2="468" y2="150" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="180" y1="220" x2="238" y2="220" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="410" y1="215" x2="468" y2="200" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="410" y1="225" x2="468" y2="237" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="180" y1="280" x2="238" y2="280" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="410" y1="280" x2="638" y2="230" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="710" y1="280" x2="768" y2="280" stroke="#333" marker-end="url(#ar)"/>
+  <line x1="870" y1="260" x2="870" y2="242" stroke="#333" marker-end="url(#ar)"/>
+  <text x="600" y="60" font-size="12" fill="#555">grey = frozen, precomputed (one tensor per group)</text>
+  <text x="600" y="78" font-size="12" fill="#555">green = trained (zero-init, as stock LoRA)</text>
+  <text x="600" y="96" font-size="12" fill="#555">gate and up literally hold the same A values</text>
+  <text x="600" y="114" font-size="12" fill="#555">every layer has its own A set (no cross-layer sharing)</text>
+</svg>
+
+<table>
+<tr><th>Group (per layer)</th><th>Sites</th><th>Calibration input covariance</th><th>Weight used</th><th><code>A</code> recipe</th></tr>
+<tr><td>attn-in</td><td>q_proj</td><td><code>C₁</code> of x₁</td><td>W_q</td><td>whitened SVD (SVD-LLM)</td></tr>
+<tr><td>attn-out</td><td>o_proj</td><td><code>C₂</code> of x₂</td><td>W_o</td><td>whitened SVD</td></tr>
+<tr><td>mlp-in</td><td>gate_proj, up_proj (<b>shared A</b>)</td><td><code>C₃</code> of x₃</td><td>[W_g; W_u]</td><td>whitened SVD of the stacked weights (Basis Sharing)</td></tr>
+<tr><td>mlp-out</td><td>down_proj</td><td><code>C₄</code> of x₄ (8192×8192)</td><td>W_d</td><td>whitened SVD</td></tr>
+<tr><td>cross</td><td>cross_stream</td><td><code>C₅</code> of h_base</td><td>(W≡0)</td><td>unit-variance PCA (ESPACE/EVA)</td></tr>
+</table>
+
+<p><b>Why share only within the same input tensor.</b> A single A for every site in the adapter is not possible: o_proj and down_proj read different spaces
+(attention output; 8192-dimensional MLP hidden), so one matrix cannot be a projection for both. The user's "shared A for all LoRA matrices" therefore becomes:
+<b>no A is learned, and one A is shared by all sites that read the same tensor</b>. Within a layer, gate and up already read the same <code>x₃</code>.
+Basis Sharing found that sharing across layers works for input-side projections (Q/K/V/gate/up) and hurts for O/down. A cross-layer A for q/gate/up/cross is
+recorded in §8 as a follow-up ablation. It is not in the main run.</p>
+
+<p><b>Calibration set.</b> The covariance is computed from the base stream of the unadapted base model on a <b>task-agnostic mix of all four intrinsics'
+training rows</b>: an equal share of each, 512 rows per intrinsic, 2048 rows total, truncated to 2048 tokens, all non-pad positions, in fp64.
+<b>One A set serves all four adapters</b>, which is what makes it a property of the base model and not of each adapter. Each adapter still trains its own B.
+Using the base stream for the adapter-stream inputs is exact at step 0 (the streams are identical when B=0). It stays close later because the adapter is a
+low-rank perturbation. This is the standard calibration choice in SVD-LLM, ESPACE and CorDA.</p>
+
+<p><b>Numerics.</b> <code>C + εI</code> with ε = 1e-6·mean(diag C) before Cholesky, as in the SVD-LLM fix for non-positive-definite cases. The SVD of <code>W·S</code> runs in fp64 on GPU and
+<code>A = V_rᵀ S⁻¹</code> uses a triangular solve, never an explicit inverse. A is stored in fp32 and cast to the model dtype at load.</p>
+
+<h2>4. What changes in training (implementation)</h2>
+
+<ul>
+<li><b>The PEFT model stays 100% stock.</b> A is installed into the existing <code>lora_A.default.weight</code> parameters and given
+<code>requires_grad=False</code>. The saved adapter is an ordinary PEFT LoRA checkpoint (A and B both saved), so <code>PeftModel.from_pretrained</code> on a
+<code>build_sr_base</code> base loads it with no new code. The benchmark's HF+PEFT SR path (<code>hf_generate.py</code>) and its loaded-weights check work unchanged.</li>
+<li><b>New config field</b> <code>adapter.frozen_a: {path: &lt;dir&gt;}</code>. The dir holds <code>frozen_a.safetensors</code> (keys <code>layers.{ℓ}.{site}</code>, fp32 r×in) and
+<code>manifest.json</code> (recipe, rank, calibration stats, per-group retained output energy).</li>
+<li><b>Where A is installed:</b> after <code>get_shadow_residual_peft_model</code>. On the FSDP rank-0-materialize path A is copied after the LoRA reset and
+before FSDP's <code>sync_module_states</code> broadcast. On every non-FSDP rank it is copied directly. Freezing is applied on every rank before the
+Trainer builds the optimizer, so A never enters AdamW. <code>fsdp_use_orig_params: true</code> (already set) lets FSDP flat-params mix frozen and trainable parameters.</li>
+<li><b>Guard:</b> after training, rank 0 checks that the saved <code>lora_A</code> tensors equal the installed A exactly. A frozen A that moved means a bug, and the job fails.</li>
+<li><b>New script</b> <code>shadow_residual.training.compute_frozen_a</code> (one GPU). It runs forward hooks on the base model to accumulate <code>XᵀX</code> per
+input group, then whitened SVD or PCA per group, and writes the A dir and manifest. It also reports the fraction of the whitened output energy each r-dim A keeps
+(<code>Σ_{i≤r} σᵢ² / Σ σᵢ²</code>), a cheap diagnostic of how much the frozen subspace can express.</li>
+</ul>
+
+<h2>5. Training recipe (identical to vanilla SR except A)</h2>
+
+<table>
+<tr><th>Setting</th><th>Vanilla SR (benchmark)</th><th>SR-FrozenA</th></tr>
+<tr><td>Targets / rank</td><td>q,o,gate,up,down + cross_stream; r=32, cross r=32</td><td>same</td></tr>
+<tr><td>α, dropout</td><td>64, 0.05</td><td>same</td></tr>
+<tr><td>A</td><td>kaiming-uniform, trained</td><td><b>precomputed (§2–3), frozen</b></td></tr>
+<tr><td>B</td><td>zero-init, trained</td><td>zero-init, trained</td></tr>
+<tr><td>Trainable params</td><td>≈30.5M</td><td><b>≈18.4M</b> (B only, −40%)</td></tr>
+<tr><td>LR / sched / epochs</td><td>2e-4 AdamW, cosine, 5% warmup, 2 epochs, seed 2</td><td>same</td></tr>
+<tr><td>Batch</td><td>4 GPUs × 2 × grad-accum 4 = 32</td><td>same</td></tr>
+<tr><td>Data</td><td>per intrinsic, the same train/val files the staged SR adapters were trained on</td><td>same files</td></tr>
+<tr><td>Eval</td><td>benchmark HF+PEFT path, benchmark scorers</td><td>same path, same scorers</td></tr>
+</table>
+
+<p>Because B starts at 0 and the frozen A features have unit variance, a step on B at LR 2e-4 has about the same size as in vanilla LoRA, where
+<code>‖A x‖</code> under kaiming init is similar. LR is not retuned, so the comparison isolates the effect of A. Parameter count: A is 40·(2560·32·3 + 8192·32 + 2560·32)…
+it is frozen and not counted. B is 40·32·(2560+2560+8192+8192+2560+2560) = 34.1M at fp32 elements…</p>
+<p><small>The exact numbers come from <code>print_trainable_parameters</code> in the job logs. See §10.</small></p>
+
+<h2>6. Data and evaluation</h2>
+
+<table>
+<tr><th>Intrinsic</th><th>Training data (same rows as the staged vanilla SR adapter)</th><th>Train/val rows</th><th>Eval set (bench v1)</th><th>Scorer / headline</th></tr>
+<tr><td>answerability</td><td><code>adapter-bench/datasets/train/answerability/g42-alora-4.1-split</code> (docs as tool turns)</td><td>11979 / 1351</td><td>3565</td><td><code>answerability</code> / accuracy</td></tr>
+<tr><td>guardian_core</td><td><code>.../output/guardian_compare/guardian_ood_12k</code></td><td>12000 / 577</td><td>11347</td><td><code>guardian</code> / accuracy</td></tr>
+<tr><td>query_clarification</td><td><code>.../output/unified_compare/query_clarification/data_v4</code></td><td>2153 / 240</td><td>279</td><td><code>query_clarification</code> / overall_accuracy</td></tr>
+<tr><td>requirement_check</td><td><code>.../Core_Library/Requirement_Check/train_v2</code></td><td>11882 / 500</td><td>2409</td><td><code>requirements</code> / balanced_accuracy</td></tr>
+</table>
+
+<p>Evaluation uses the benchmark's own reference generation (<code>benchmarks/adapter_eval/hf_generate.py</code>) and scorers, copied unchanged from the harness
+checkout into the job. Settings: SR on <code>build_sr_base</code> + <code>PeftModel</code>, greedy, bf16, SR prompt style <code>tool_json_after_question</code>,
+<code>enable_thinking=false</code>, the per-intrinsic <code>max_new_tokens</code> from <code>adapters.yaml</code>, and <code>max_model_len 32768</code>. These numbers are directly comparable with
+the dashboard's "HF + PEFT / SR" reference column and with the vanilla SR run that another session is training.</p>
+
+<h2>7. Hypotheses</h2>
+<ol>
+<li><b>H1 (main).</b> SR-FrozenA comes within about 1 point of vanilla SR on each intrinsic while training 40% fewer parameters. All four tasks are
+short label or short-output classification-style tasks, which earlier SR sweeps found saturate at low rank (see the rank-grid notes).</li>
+<li><b>H2.</b> The whitened-SVD A beats a random frozen A (LoRA-FA). Planned ablation, §8.</li>
+<li><b>H3 (risk).</b> <code>down_proj</code> and <code>cross_stream</code> lose the most. Their inputs are high-dimensional or heavy-tailed, so a fixed 32-dim subspace keeps a small energy fraction.
+The manifest's retained-energy numbers will show whether this is plausible.</li>
+</ol>
+
+<h2>8. Follow-ups not in this run</h2>
+<ul>
+<li>Random-frozen-A control (LoRA-FA) at the same rank, which isolates "compression-derived" from "frozen".</li>
+<li>Cross-layer shared A for the input-side groups (Basis Sharing groups of 2–4 adjacent layers).</li>
+<li>Per-task calibration (A from each task's own rows, CorDA "instruction-previewed") compared with the shared task-agnostic A.</li>
+<li>Higher rank at equal trainable budget. B-only at r=53 equals vanilla's parameter count.</li>
+</ul>
+
+<h2>9. Execution log and issues</h2>
+<p class="status">Status: design written. Implementation in progress.</p>
+<ul>
+<li><b>Coordination.</b> Several Claude sessions share branch <code>feature/different-arch</code>. Another session trains vanilla SR, so I do not run it. A
+utility pod <code>antonp-shareda-util</code> already existed. I only read COS through it and use my own job names (<code>antonp-frza-*</code>) and COS root
+(<code>…/adapter-bench/sr-frozen-a/</code>).</li>
+<li><b>Tooling.</b> At first, Claude Code's auto-mode classifier blocked <code>oc exec</code>, <code>helm</code> and the Vela skill. The user added allow rules in
+<code>.claude/settings.local.json</code>. Shell reads outside this repo are still blocked, so the harness files were read with the file-read tool.</li>
+<li><b>Docs drift.</b> <code>ADAPTER_TRAINING.md</code> places the eval sets at <code>datasets/eval/</code>. On COS they are at <code>adapter-bench/granite-4.2-3b/v1/eval/</code>, which is what the benchmark reads.</li>
+</ul>
+
+<h2>10. Results</h2>
+<p class="status">Pending.</p>
+
+<h2>11. Conclusion</h2>
+<p class="status">Pending.</p>
+
+</body>
+</html>
