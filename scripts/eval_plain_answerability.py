@@ -32,7 +32,10 @@ def main() -> None:
     from peft import PeftModel
     from shadow_residual.shadow_residual.build import build_sr_base
 
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = (
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available() else "cpu"
+    )
     tok = AutoTokenizer.from_pretrained(args.base_model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
