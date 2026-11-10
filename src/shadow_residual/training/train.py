@@ -26,9 +26,40 @@ from shadow_residual.config.adapters import (
     to_peft_config,
     to_training_arguments,
 )
-from shadow_residual.config.training_config import TrainingConfig
+from shadow_residual.config.training_config import ToolFormatting, TrainingConfig
+from shadow_residual.training.tool_data.formatting import TOOL_FORMATTING_MARKERS
 
 logger = logging.getLogger(__name__)
+
+
+def apply_tool_formatting(cfg: TrainingConfig) -> None:
+    """Set the boundary markers implied by ``cfg.data.tool_formatting`` (no-op if unset).
+
+    Each mode fixes ``data.assistant_marker`` / ``adapter.last_context_token`` /
+    ``adapter.last_token`` (see ``tool_data.TOOL_FORMATTING_MARKERS``). Setting
+    any of them alongside ``tool_formatting`` is rejected rather than silently
+    overridden, so the mode is the single source of truth for the boundary.
+    """
+    mode = cfg.data.tool_formatting
+    if mode is None:
+        return
+    markers = TOOL_FORMATTING_MARKERS[mode]
+    explicit = {
+        "data.assistant_marker": cfg.data.assistant_marker,
+        "adapter.last_context_token": cfg.adapter.last_context_token,
+        "adapter.last_token": cfg.adapter.last_token,
+    }
+    set_fields = {k: v for k, v in explicit.items() if v is not None}
+    if set_fields:
+        implied = dict(zip(explicit, markers))
+        detail = ", ".join(f"{k}={v!r} (mode implies {implied[k]!r})" for k, v in set_fields.items())
+        raise ValueError(
+            f"data.tool_formatting={mode!r} sets the boundary markers itself; remove "
+            f"{detail} from the config. See docs/tool_formatting.md."
+        )
+    cfg.data.assistant_marker = markers.assistant_marker
+    cfg.adapter.last_context_token = markers.last_context_token
+    cfg.adapter.last_token = markers.last_token
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -55,6 +86,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-r", type=int, default=None,
                    help="Override adapter.target_modules to a uniform scalar rank")
     p.add_argument("--lora-alpha", type=int, default=None, help="Override adapter.alpha")
+    p.add_argument("--max-length", type=int, default=None,
+                   help="Override data.max_length (rows longer than this are truncated "
+                        "from the end, which drops their supervised completion)")
     p.add_argument("--batch-size", type=int, default=None, help="Override batch.per_device_train")
     p.add_argument("--grad-accum", type=int, default=None, help="Override batch.gradient_accumulation")
 
@@ -76,6 +110,16 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Set data.instruction_as_user_message=True — inject RAG documents "
                         "before the first assistant turn (judge/guardian data) instead of "
                         "after the last user turn. ChatML (Granite 4.2) only.")
+    p.add_argument("--tool-formatting", dest="tool_formatting", nargs="?",
+                   const=ToolFormatting.EXTERNAL.value, default=None,
+                   choices=[m.value for m in ToolFormatting],
+                   help="Opt in to SR-adapter-as-tool training (data.tool_formatting; "
+                        "Granite 4.2 only). A bare flag selects external_tool_formatting "
+                        "(the adapter emits only the tool-response payload after an "
+                        "env-written '<tool_response>\\n'); autoregressive_tool_formatting "
+                        "has the adapter emit the whole tool-response turn after "
+                        "'</tool_call>'. Either way the adapter stops before the "
+                        "assistant answer. See docs/tool_formatting.md.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", action="store_true",
                    help="Periodically log a decoded training example + labels from the collator. "
@@ -103,6 +147,8 @@ def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
         cfg.adapter.target_modules = args.lora_r
     if args.lora_alpha is not None:
         cfg.adapter.alpha = args.lora_alpha
+    if args.max_length is not None:
+        cfg.data.max_length = args.max_length
     if args.batch_size is not None:
         cfg.batch.per_device_train = args.batch_size
     if args.grad_accum is not None:
@@ -113,6 +159,8 @@ def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
         cfg.data.enable_thinking = True
     if args.instruction_as_user_message:
         cfg.data.instruction_as_user_message = True
+    if args.tool_formatting is not None:
+        cfg.data.tool_formatting = args.tool_formatting
     if args.debug_collator:
         cfg.trainer.debug_collator = True
         # Also turn on generation debug printing at the same rate, unless the
@@ -232,6 +280,7 @@ def _run_post_training_generation(
         gen_config=cfg.generation,
         data_path=cfg.generation.input_path,
         out_path=gen_out,
+        tool_formatting=cfg.data.tool_formatting,
     )
 
 
@@ -276,6 +325,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     cfg = load_training_config(args.config)
     apply_cli_overrides(cfg, args)
+    apply_tool_formatting(cfg)
+    if cfg.data.tool_formatting is not None:
+        logger.info(
+            "Tool formatting: %s (assistant_marker=%r last_context_token=%r last_token=%r)",
+            cfg.data.tool_formatting, cfg.data.assistant_marker,
+            cfg.adapter.last_context_token, cfg.adapter.last_token,
+        )
 
     logger.info("Adapter activation: unconditional (always active)")
     logger.info("Base model:   %s", cfg.model.base)
@@ -304,6 +360,9 @@ def main(argv: list[str] | None = None) -> int:
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
+    if cfg.data.tool_formatting is not None:
+        from shadow_residual.training.tool_data import check_tool_formatting_support
+        check_tool_formatting_support(tok, cfg.model.base)
 
     # 2. Resolve the two optional single-token markers (each must encode to
     # exactly one token id). They shape the data/labels and are recorded into
@@ -386,12 +445,14 @@ def main(argv: list[str] | None = None) -> int:
         enable_thinking=cfg.data.enable_thinking,
         last_token=cfg.adapter.last_token,
         instruction_as_user_message=cfg.data.instruction_as_user_message,
+        tool_formatting=cfg.data.tool_formatting,
     )
     val_ds = load_jsonl_dataset(
         cfg.data.val_path, tok,
         enable_thinking=cfg.data.enable_thinking,
         last_token=cfg.adapter.last_token,
         instruction_as_user_message=cfg.data.instruction_as_user_message,
+        tool_formatting=cfg.data.tool_formatting,
     )
     logger.info("Train rows: %d, Val rows: %d", len(train_ds), len(val_ds))
 
@@ -521,6 +582,8 @@ def main(argv: list[str] | None = None) -> int:
                 adapter_cfg["last_token"] = cfg.adapter.last_token
                 adapter_cfg["last_token_id"] = last_token_id
             adapter_cfg["share_moe_routing"] = bool(cfg.adapter.share_moe_routing)
+            if cfg.data.tool_formatting is not None:
+                adapter_cfg["tool_formatting"] = cfg.data.tool_formatting
             with adapter_cfg_path.open("w") as f:
                 _json.dump(adapter_cfg, f, indent=2)
             logger.info(

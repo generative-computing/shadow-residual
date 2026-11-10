@@ -1,0 +1,240 @@
+# SR adapters as tools: `data.tool_formatting`
+
+An SR adapter can be exposed to the base model as a **tool**. The base decides
+when to call it (it emits a `<tool_call>`), the serving environment routes the
+next tokens to the adapter, and the adapter produces the tool's
+`<tool_response>` payload. **The adapter never writes the assistant answer.**
+After the tool turn, the base (or another adapter) resumes and answers.
+
+`data.tool_formatting` selects which of two handoff contracts the adapter is
+trained for. It is opt-in. Unset (the default), training is standard chat SFT
+with no tool logic.
+
+| | `external_tool_formatting` (bare `--tool-formatting`) | `autoregressive_tool_formatting` |
+|---|---|---|
+| who writes the tool-turn scaffolding | the serving environment | the adapter |
+| adapter takes over after | env-written `<tool_response>\n` | the base's `</tool_call>` |
+| adapter emits | `{payload}<\|im_end\|>` | `\n<\|im_start\|>user\n<tool_response>\n{payload}\n</tool_response>\n<\|im_end\|>` |
+| adapter stops on | `<\|im_end\|>` (EOS), which the env discards | `<\|im_end\|>` (EOS), which closes the tool turn |
+| transcript the base re-reads | byte-identical to the stock template | stock, except the base turn's `<\|im_end\|>` after `</tool_call>` is missing |
+| `assistant_marker` / `last_context_token` / `last_token` | `<tool_response>\n` / `\n` / `<\|im_end\|>` | `</tool_call>` / `</tool_call>` / `<\|im_end\|>` |
+
+**Granite 4.2 only.** Both modes rely on Granite 4.2's ChatML tool-turn
+rendering (for example `ibm-granite/granite-4.2-3b`). Any other base is
+rejected at startup. See [Model support](#model-support).
+
+---
+
+## 1. Data: one row shape for both modes
+
+A tool row is a stock chat row. Its `messages` end with the **trigger** (an
+assistant turn carrying exactly one `tool_call`) and, for training, the **gold
+tool response** (a `tool` message whose content is the payload the adapter must
+produce). The row's `tools` must define the called tool. Optional RAG
+`documents` are injected the same way as for every Granite 4.2 row: as a
+`tool` message after the last user turn.
+
+```json
+{"messages": [
+   {"role": "system", "content": "You are a helpful enterprise assistant. ..."},
+   {"role": "user", "content": "How long is parental leave?"},
+   {"role": "assistant", "content": "", "tool_calls": [
+      {"type": "function", "function": {"name": "answerability",
+                                        "arguments": {"question": "How long is parental leave?"}}}]},
+   {"role": "tool", "content": "{\"answerable\": true}"}
+ ],
+ "tools": [{"type": "function", "function": {"name": "answerability", "...": "..."}}],
+ "documents": [{"document_id": "hr-14", "content": "16 weeks paid leave."}],
+ "ground_truth": "answerable"}
+```
+
+The rows don't depend on the mode. The trainer renders each row for whichever
+mode it runs in, so one data file trains either mode. Eval and generation rows
+are the same row without the trailing `tool` message; gold, if any, goes in
+`ground_truth`. A trailing gold `tool` message is also accepted at generation
+time and is dropped from the prompt.
+
+### Building rows: `python -m shadow_residual.training.tool_data`
+
+The `shadow_residual.training.tool_data` package converts task source rows into
+tool rows. No tokenizer is needed.
+
+```bash
+# training: gold kept, shuffled train/val split
+python -m shadow_residual.training.tool_data --task answerability \
+  --input src.jsonl --out-train train.jsonl --out-val val.jsonl
+
+# eval prompts: gold tool message dropped (gold stays in ground_truth)
+python -m shadow_residual.training.tool_data --task guardian_core \
+  --input evaluation.jsonl --eval --out eval.jsonl
+```
+
+| `--task` | tool call arguments | payload |
+|---|---|---|
+| `answerability` | `{"question": <last user turn>}` | `{"answerable": true\|false}` (`partial` counts as answerable; `conversational` rows are dropped) |
+| `guardian_core` | `{"criteria", "target"}`, lifted out of the `<guardian>` instruction turn | `{"score": "yes"\|"no"}` |
+| `requirement_check` | `{"requirements"}`, lifted out of the `<requirements>` instruction turn | `{"score": "yes"\|"no"}` |
+| `query_clarification` | `{"query": <last user turn>}` | `{"clarification": "CLEAR" \| <question>}` |
+
+To add a task, write a converter that returns the row shape above. The
+formatting layer is task-agnostic.
+
+---
+
+## 2. `external_tool_formatting`
+
+The environment owns the chat template. The adapter only produces the payload.
+
+```
+[ctx]  ...<|im_start|>assistant\n<think></think>\n<tool_call>...</tool_call>   <- base
+[ctx]  \n<|im_end|>\n<|im_start|>user\n                                       <- env (stock template glue)
+[ctx]  <tool_response>\n                                                      <- env; last context token = "\n"
+       >>> mask boundary: supervision starts here <<<
+[sup]  {"answerable": true}                                                   <- adapter
+[sup]  <|im_end|>                                                             <- adapter stop (EOS); env discards it
+       \n</tool_response>\n<|im_end|>\n                                       <- env appends; base resumes
+```
+
+Serving loop:
+
+1. The base generates until it closes its `</tool_call>`, which names the adapter's tool.
+2. The env appends `\n<|im_end|>\n<|im_start|>user\n<tool_response>\n` and
+   switches to the adapter.
+3. The adapter generates until `<|im_end|>`. Everything before it is the payload.
+4. The env drops the EOS and appends `\n</tool_response>\n<|im_end|>\n`, then
+   hands back to the base. The base opens the next assistant turn and writes
+   the answer.
+
+**Why the span ends in `<|im_end|>` and not `\n</tool_response>`.** Under stock
+`generate()` the only stop is EOS. Training the adapter to emit the payload
+followed by `<|im_end|>` gives an engine-native stop. The env treats that EOS
+as "payload done" and writes the closing tag itself.
+
+**Properties.**
+- Once the env suffix is appended, the transcript is byte-identical to
+  `apply_chat_template([..., assistant(tool_calls), tool(payload)])`. There
+  are no off-template seams.
+- The supervised span is only `{payload}<|im_end|>`, so the adapter spends its
+  capacity on the decision and none on scaffolding.
+- `--thinking` does not apply, because there is no assistant turn.
+
+## 3. `autoregressive_tool_formatting`
+
+The adapter takes over straight after the base's `</tool_call>` and writes the
+whole tool-response turn itself, with no env glue.
+
+```
+[ctx]  ...<|im_start|>assistant\n<think></think>\n<tool_call>...</tool_call>   <- base; last context token = </tool_call>
+       >>> mask boundary: supervision starts here <<<
+[sup]  \n<|im_start|>user\n<tool_response>\n                                  <- adapter (no <|im_end|> before it)
+[sup]  {"answerable": true}                                                   <- adapter
+[sup]  \n</tool_response>\n<|im_end|>                                         <- adapter; <|im_end|> = stop (EOS)
+       \n<|im_start|>assistant\n...                                           <- base resumes and answers
+```
+
+Serving loop:
+
+1. The base generates until `</tool_call>`.
+2. The env switches to the adapter without writing anything.
+3. The adapter generates until `<|im_end|>`, which closes the tool turn. The
+   payload is the text between `<tool_response>\n` and `\n</tool_response>`
+   (`tool_data.extract_tool_payload`).
+4. The env hands back to the base, which opens the next assistant turn.
+
+**The single-EOS seam.** The stock template closes the base's tool-call turn
+with `\n<|im_end|>` before the tool turn. That `<|im_end|>` is omitted, because
+`<|im_end|>` is the stop token: an adapter trained to emit it right after
+`</tool_call>` halts immediately and produces nothing. An earlier attempt
+trained on the fully stock stream did exactly that. The adapter therefore emits
+exactly one `<|im_end|>`, the one that closes its own turn. This is the only
+deviation from the stock template.
+
+**Properties.**
+- A single `generate()` call covers the tool turn, and no env glue is needed.
+- The adapter must learn the scaffolding as well as the payload. In the
+  answerability experiments (Granite 4.2-3b) this cost essentially nothing in
+  accuracy: 0.95 autoregressive vs 0.954 external. That autoregressive run used
+  an earlier span that also emitted an answer-label turn; the shipped span
+  stops at the tool turn's `<|im_end|>`.
+- The base re-reads one non-stock seam (`</tool_call>\n<|im_start|>user`).
+
+---
+
+## 4. How training uses the mode
+
+`apply_tool_formatting` (in `train.py`) sets the three boundary markers from
+the mode (`tool_data.TOOL_FORMATTING_MARKERS`):
+
+- `data.assistant_marker` is the collator's response template. Everything up
+  to and including its **last** occurrence is masked.
+- `adapter.last_context_token` is the token right before the supervised
+  region. `validate_last_context_token_boundary` checks this on real rows
+  before training starts.
+- `adapter.last_token` (`<|im_end|>`) is the end-of-completion marker.
+
+**Do not set those three fields when `tool_formatting` is set.** The mode is
+the single source of truth for the boundary, so setting any of them is a
+startup error that names the conflicting field and the value the mode implies.
+
+`load_jsonl_dataset(..., tool_formatting=mode)` renders each row with
+`tool_data.render_tool_example`: the mode's prompt followed by the supervised
+span. Rendering goes through the real chat template, and every row is checked
+against the expected Granite 4.2 seams. A row that doesn't match (no trigger,
+more than one tool call, an undefined tool, or a template that renders tool
+turns differently) fails with its file and line number.
+`data.enable_thinking` and `data.instruction_as_user_message` do not apply to
+tool rows.
+
+Because masking cuts at the **last** marker, the trigger must be the last
+`</tool_call>` (autoregressive), and the env opener the last `<tool_response>\n`
+(external), in the row. Retrieved documents and the system prompt's
+tool-format instructions come earlier, so this holds for well-formed rows. A
+payload that itself contains `<tool_response>\n` would break it.
+
+The mode is recorded in the saved `adapter_config.json` as `tool_formatting`
+(read it back with `generation_utils.read_tool_formatting_from_adapter`).
+
+## 5. Generation and eval
+
+`run_generation(..., tool_formatting=mode)`, which covers post-training,
+FSDP and the `sr-generate` CLI:
+
+- renders each eval row up to the mode's handoff point
+  (`tool_data.render_tool_prompt`);
+- decodes the generation with special tokens kept;
+- writes the extracted tool-response payload as `generated_content`
+  (`tool_data.extract_tool_payload`). In autoregressive mode the payload is
+  unwrapped from the emitted turn. A malformed generation is kept verbatim, so
+  it scores as invalid instead of vanishing.
+
+`sr-generate` reads the mode from the adapter's `adapter_config.json`, falling
+back to the config's `data.tool_formatting`.
+
+## 6. Model support
+
+`tool_data.check_tool_formatting_support` runs right after the tokenizer loads
+(training and generation). It fails, with an error that names the model, unless
+all of the following hold:
+
+- the tokenizer is ChatML (`<|im_start|>` is in the vocabulary);
+- `<|im_end|>`, `</tool_call>`, `<tool_response>` and `</tool_response>` are
+  single tokens;
+- a probe conversation renders with Granite 4.2's tool-turn seams
+  (`</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\n{payload}\n</tool_response>\n<|im_end|>\n`).
+
+The check probes the template's behaviour, not the model name, so any Granite
+4.2 checkpoint (3b, 8b, local paths) passes and Granite 4.1 is rejected.
+
+## 7. Quick start
+
+```bash
+python -m shadow_residual.training.tool_data --task answerability \
+  --input answerability.jsonl --out-train data/train.jsonl --out-val data/val.jsonl
+
+BASE_MODEL=ibm-granite/granite-4.2-3b DATA_ROOT=data RUN_DIR=runs/tool EVAL_DATA=data/val.jsonl \
+sr-train --config src/shadow_residual/config/sr-tool-g42.yaml           # external (config default)
+#        --tool-formatting autoregressive_tool_formatting               # or the other mode
+```
+
+The reference config is
+[`src/shadow_residual/config/sr-tool-g42.yaml`](../src/shadow_residual/config/sr-tool-g42.yaml).

@@ -146,6 +146,23 @@ Named CLI flags override matching YAML fields; see
 [`src/shadow_residual/training/README.md`](src/shadow_residual/training/README.md)
 for the full reference.
 
+### SR adapters as tools (Granite 4.2)
+
+An SR adapter can be trained to be called as a **tool**. The base emits a
+`<tool_call>`, the adapter produces the `<tool_response>` payload and stops, and
+the base then writes the answer. Two modes are available:
+`external_tool_formatting`, where the serving environment writes the tool-turn
+scaffolding, and `autoregressive_tool_formatting`, where the adapter writes it.
+
+```bash
+python -m shadow_residual.training.tool_data --task answerability \
+  --input src.jsonl --out-train data/train.jsonl --out-val data/val.jsonl
+BASE_MODEL=ibm-granite/granite-4.2-3b DATA_ROOT=data RUN_DIR=runs/tool EVAL_DATA=data/val.jsonl \
+  sr-train --config src/shadow_residual/config/sr-tool-g42.yaml
+```
+
+See [`docs/tool_formatting.md`](docs/tool_formatting.md) for both modes in full.
+
 ### On Vela
 
 Vela is the OpenShift GPU cluster; jobs are AppWrappers wrapping PyTorchJobs,

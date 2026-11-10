@@ -1,0 +1,86 @@
+# Reference config: an SR adapter trained to be invoked as a TOOL (Granite 4.2).
+#
+# The base emits a <tool_call> for the adapter's tool; the serving environment
+# routes to the SR adapter, which produces the <tool_response> payload and
+# stops. The adapter never writes the assistant answer — the base (or another
+# adapter) resumes after the tool turn. Full design: docs/tool_formatting.md.
+#
+# Granite 4.2 only (ChatML tool turns, e.g. ibm-granite/granite-4.2-3b); any
+# other base is rejected at startup.
+#
+# Data: messages/tools rows ending with the trigger tool call + gold tool
+# response. Build them from task source rows with
+#   python -m shadow_residual.training.tool_data --task <task> --input src.jsonl \
+#     --out-train ${DATA_ROOT}/train.jsonl --out-val ${DATA_ROOT}/val.jsonl
+# The same files train either mode.
+#
+# Boundary markers: do NOT set data.assistant_marker, adapter.last_context_token
+# or adapter.last_token — data.tool_formatting fixes them and setting them too is
+# an error. Switch mode with `--tool-formatting autoregressive_tool_formatting`.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}                # e.g. ibm-granite/granite-4.2-3b
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  tool_formatting: external_tool_formatting
+
+adapter:
+  target_modules:
+    q_proj: 32
+    o_proj: 32
+    gate_proj: 32
+    up_proj: 32
+    down_proj: 32
+    cross_stream: 32
+  alpha: 64
+  dropout: 0.05
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 1
+  gradient_accumulation: 8
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 1
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 5
+  dataloader_num_workers: 2
+  report_to: []
+
+# Post-training generation renders each eval row (messages ending with the
+# trigger tool call; build with `tool_data --eval`) up to the mode's handoff
+# point and writes the generated tool-response payload as generated_content.
+generation:
+  input_path: ${EVAL_DATA}
+  max_new_tokens: 64
+  do_sample: false
+  batch_size: 8
+  output_filename: predictions.jsonl

@@ -39,6 +39,7 @@ src/shadow_residual/
 ├── config/                 # training_config.py schema, adapters.py, reference *.yaml
 ├── training/               # train.py, generate.py, data.py, collator.py, add_labels.py,
 │   │                       #   pack_stats.py, chat_render.py, README.md
+│   ├── tool_data/          SR-adapter-as-tool: mode rendering + task converters (+ CLI)
 │   └── factory.py          get_shadow_residual_peft_model: FSDP meta-init/materialize + PEFT-wrap
 └── eval/                   # answerability_eval.py (standalone --mode peft eval)
 tests/                      # run with pytest (CPU-only cases pass without a GPU)
@@ -78,6 +79,17 @@ Config essentials:
   into `adapter_config.json`.
 - **`data.enable_thinking` / `--thinking`** → forwarded to
   `apply_chat_template(enable_thinking=...)`. CLI wins over YAML. Default False.
+- **`data.tool_formatting` / `--tool-formatting`** (opt-in, **Granite 4.2 only**)
+  → trains the adapter to be called as a tool. It emits the `<tool_response>`
+  payload and stops, and **never writes the assistant answer**. The two modes
+  are `external_tool_formatting` (the env writes `<tool_response>\n`; the
+  adapter emits the payload and EOS) and `autoregressive_tool_formatting` (the
+  adapter emits the whole tool turn after `</tool_call>`). The mode sets
+  `assistant_marker` / `last_context_token` / `last_token`; setting any of them
+  too raises. A non-4.2 base raises. Rows are `messages` + `tools` ending with
+  the trigger call and the gold `tool` message, built with
+  `python -m shadow_residual.training.tool_data`. Reference config:
+  `sr-tool-g42.yaml`. Details: [`docs/tool_formatting.md`](docs/tool_formatting.md).
 
 **How checkpointing works.** The decoder layer is a `GradientCheckpointingLayer`
 with a single stacked-tensor (`[2,B,S,H]`) dual-stream forward and a pure

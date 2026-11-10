@@ -172,6 +172,17 @@
           "default": false,
           "title": "Instruction As User Message",
           "type": "boolean"
+        },
+        "tool_formatting": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolFormatting"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -420,6 +431,15 @@
         "constant_with_warmup"
       ],
       "title": "SchedulerType",
+      "type": "string"
+    },
+    "ToolFormatting": {
+      "description": "How an SR adapter invoked as a tool relates to the chat template.\n\nGranite 4.2 (ChatML) only. In both modes the adapter produces the tool\nresponse and stops; it never writes the assistant answer (the base, or\nanother adapter, resumes after the tool turn).\n\n- EXTERNAL (bare ``--tool-formatting``): the serving environment owns the\n  template. It closes the base's tool-call turn, writes\n  ``<|im_start|>user\\n<tool_response>\\n`` and hands over; the adapter emits\n  only the tool-response payload and stops on EOS (``<|im_end|>``). The\n  environment then appends ``\\n</tool_response>\\n<|im_end|>\\n``.\n- AUTOREGRESSIVE: the adapter takes over right after the base's\n  ``</tool_call>`` and emits the whole tool-response turn,\n  ``\\n<|im_start|>user\\n<tool_response>\\n{payload}\\n</tool_response>\\n<|im_end|>``,\n  stopping on that ``<|im_end|>``.\n\nEach mode fixes the boundary markers; see ``docs/tool_formatting.md``.",
+      "enum": [
+        "autoregressive_tool_formatting",
+        "external_tool_formatting"
+      ],
+      "title": "ToolFormatting",
       "type": "string"
     },
     "TrainerConfig": {

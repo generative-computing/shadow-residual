@@ -65,6 +65,29 @@ class Bias(str, Enum):
     LORA_ONLY = "lora_only"
 
 
+class ToolFormatting(str, Enum):
+    """How an SR adapter invoked as a tool relates to the chat template.
+
+    Granite 4.2 (ChatML) only. In both modes the adapter produces the tool
+    response and stops; it never writes the assistant answer (the base, or
+    another adapter, resumes after the tool turn).
+
+    - EXTERNAL (bare ``--tool-formatting``): the serving environment owns the
+      template. It closes the base's tool-call turn, writes
+      ``<|im_start|>user\\n<tool_response>\\n`` and hands over; the adapter emits
+      only the tool-response payload and stops on EOS (``<|im_end|>``). The
+      environment then appends ``\\n</tool_response>\\n<|im_end|>\\n``.
+    - AUTOREGRESSIVE: the adapter takes over right after the base's
+      ``</tool_call>`` and emits the whole tool-response turn,
+      ``\\n<|im_start|>user\\n<tool_response>\\n{payload}\\n</tool_response>\\n<|im_end|>``,
+      stopping on that ``<|im_end|>``.
+
+    Each mode fixes the boundary markers; see ``docs/tool_formatting.md``.
+    """
+    AUTOREGRESSIVE = "autoregressive_tool_formatting"
+    EXTERNAL = "external_tool_formatting"
+
+
 # --- Sub-models ---------------------------------------------------------------
 
 
@@ -113,6 +136,13 @@ class DataConfig(_Strict):
     # No-op for non-ChatML (Granite 4.1) rendering and for rows without documents.
     # Overridable from the CLI via `--instruction-as-user-message` (CLI wins).
     instruction_as_user_message: bool = False
+    # Opt-in SR-adapter-as-tool training (Granite 4.2 only). None (default) =
+    # standard chat SFT with no tool logic. When set, rows end with the trigger
+    # tool call + gold tool response and are rendered for the mode, and the mode
+    # sets assistant_marker / last_context_token / last_token itself (setting
+    # any of them too is an error). Overridable from the CLI via
+    # `--tool-formatting [MODE]` (CLI wins; a bare flag selects external).
+    tool_formatting: ToolFormatting | None = None
 
 
 class AdapterConfig(_Strict):

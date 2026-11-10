@@ -244,6 +244,49 @@ def test_instruction_as_user_message_accepts_true():
     assert cfg.data.instruction_as_user_message is True
 
 
+def test_tool_formatting_defaults_none():
+    cfg = TrainingConfig.model_validate(_minimal())
+    assert cfg.data.tool_formatting is None
+
+
+@pytest.mark.parametrize(
+    "mode", ["autoregressive_tool_formatting", "external_tool_formatting"]
+)
+def test_tool_formatting_accepts_modes(mode):
+    cfg = TrainingConfig.model_validate(
+        _minimal(data={"train_path": "/tmp/t.jsonl", "val_path": "/tmp/v.jsonl",
+                       "tool_formatting": mode})
+    )
+    assert cfg.data.tool_formatting == mode
+
+
+def test_tool_formatting_rejects_unknown_mode():
+    with pytest.raises(ValidationError):
+        TrainingConfig.model_validate(
+            _minimal(data={"train_path": "/tmp/t.jsonl", "val_path": "/tmp/v.jsonl",
+                           "tool_formatting": "bogus"})
+        )
+
+
+def test_tool_reference_config_opts_in_without_markers(monkeypatch):
+    """The reference tool config sets the mode and leaves the markers to it
+    (setting them too is rejected by train.apply_tool_formatting)."""
+    from shadow_residual.training.train import apply_tool_formatting
+
+    for var in ("DATA_ROOT", "RUN_DIR", "EVAL_DATA", "BASE_MODEL"):
+        monkeypatch.setenv(var, "/x")
+    cfg = load_training_config(EXAMPLES / "sr-tool-g42.yaml")
+    assert cfg.data.tool_formatting == "external_tool_formatting"
+    assert cfg.data.assistant_marker is None
+    assert cfg.adapter.last_context_token is None
+    assert cfg.adapter.last_token is None
+    assert "cross_stream" in cfg.adapter.target_modules
+    apply_tool_formatting(cfg)
+    assert cfg.data.assistant_marker == "<tool_response>\n"
+    assert cfg.adapter.last_context_token == "\n"
+    assert cfg.adapter.last_token == "<|im_end|>"
+
+
 # --- validation block (formerly `eval:`) --------------------------------------
 
 def test_validation_block_replaces_eval():
