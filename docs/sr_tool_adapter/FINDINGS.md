@@ -123,9 +123,27 @@ This is the like-for-like counterpart to the external-mode run below (same
 **0.9541** — effectively tied, so emitting the full scaffolding (autoregressive)
 costs essentially nothing in accuracy versus the minimal external payload.
 
-> Plain-flow comparison on the same `data_v4` split is pending a re-eval (the plain
-> leg of the standalone eval job did not complete; checkpoint
-> `run_20261103T220822Z` is intact).
+### Plain-flow baseline on the same split (2026-11-10)
+
+The plain (vanilla) answerability adapter — reads question + docs, emits the
+one-word verdict, no tool framing — evaluated on the same `data_v4` val set (full
+1,350 rows, `eval_plain_answerability.py`). (The first standalone attempt died on a
+transient `CUDA: unspecified launch failure` after 1 row; the retry on a fresh GPU
+ran clean.)
+
+| metric | plain | tool autoregressive | tool external |
+|---|---|---|---|
+| verdict accuracy | **0.9444** (1,350) | **0.95** (500 sample) | **0.9541** (1,350) |
+
+|  | →answerable | →unanswerable |
+|---|---|---|
+| **answerable** (665) | 626 | 39 |
+| **unanswerable** (685) | 36 | 649 |
+
+Balanced (39 false-refusals, 36 false-accepts). **Headline: all three flows land at
+~0.94–0.95 — wrapping the answerability capability in the tool protocol costs
+essentially nothing versus the plain adapter.** The tool framing buys native
+tool-calling ergonomics for free.
 
 Artifacts: `/danieloh_cos/granite-switch/adapter_training/shadow_residual_runs/tooladapter_42_3b/sr-tooladapter-ans-42-3b/run_20261103T220821Z/`
 (`checkpoints/` adapter, `eval.json`, `eval_dump.jsonl` — 500 rows).
