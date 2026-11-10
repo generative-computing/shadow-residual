@@ -527,6 +527,31 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
   </div>
 </div>
 
+<h3>Autoregressive tool formatting &mdash; full-scale Vela run</h3>
+<p>Job <code>antonp-sr-tooladapter-42-3b</code> (2026-11-04, commit <code>dc837c8</code>): the autoregressive mode (adapter emits the <code>&lt;tool_response&gt;</code> block + the assistant-turn opener, then stops) re-run at full scale. Granite&nbsp;4.2-3b, SR r32 q/o/MLP + <code>cross_stream</code>, 4-GPU DDP, 2 epochs (750 steps); data generated in-pod from <code>unified_compare/data_v4</code> (11,978 train / 1,350 val), <code>--thinking off</code>, boundary 8/8 per rank. The in-job eval hit the FSDP/accelerate-barrier hang (generation must run as a standalone single-GPU process); re-run standalone over a <b>500-row sample</b>.</p>
+<div class="tbl-wrap">
+<table class="cmp">
+  <tr><th>Metric</th><th>120-row flow-check</th><th>full-scale (500-row sample)</th></tr>
+  <tr><td>Free-gen verdict accuracy</td><td>0.58 (0.66 of valid)</td><td><b>0.95</b></td></tr>
+  <tr><td>Structural validity</td><td>0.88</td><td><b>1.00</b> (500/500)</td></tr>
+  <tr><td>Consistency rate</td><td>0.93</td><td><b>1.00</b></td></tr>
+  <tr><td>Held-out <code>eval_loss</code>, epoch 1 &rarr; 2</td><td>&mdash;</td><td>0.00596 &rarr; 0.00516</td></tr>
+  <tr><td>Held-out token accuracy, epoch 2</td><td>&mdash;</td><td>0.998</td></tr>
+</table>
+</div>
+<div class="cols">
+  <div class="card base">
+    <h4>Confusion (500-row sample)</h4>
+    <table>
+      <tr><th></th><th>&rarr;ans</th><th>&rarr;unans</th></tr>
+      <tr><td><b>answerable</b> (264)</td><td>249</td><td>15</td></tr>
+      <tr><td><b>unanswerable</b> (236)</td><td>10</td><td>226</td></tr>
+    </table>
+    <p class="muted" style="margin-bottom:0">Balanced (15 false-refusals, 10 false-accepts) &mdash; the flow-check's heavy unanswerable bias is gone at scale.</p>
+  </div>
+</div>
+<div class="oneliner"><b>Autoregressive vs. external, like-for-like.</b> Same <code>data_v4</code> split, same <code>eval_tool_adapter.py</code>: autoregressive <b>0.95</b> vs external <b>0.9541</b> &mdash; effectively tied. Emitting the full ChatML scaffolding (autoregressive) costs essentially nothing in accuracy versus the minimal external payload. <span class="muted">Plain-flow comparison on this split is pending a re-eval; the plain leg of the standalone job did not complete (checkpoint intact).</span></div>
+
 <h3>External tool formatting &mdash; full-scale Vela run</h3>
 <p>Job <code>antonp-sr-tooladapter-ext-42-3b</code> (2026-11-04, commit <code>b29a377</code>): Granite&nbsp;4.2-3b, SR r32 q/o/MLP + <code>cross_stream</code>, 4-GPU DDP, 2 epochs (750 steps). The data was generated in the pod from <code>unified_compare/data_v4</code> (11,978 train / 1,350 val). The boundary check passed on 8/8 rows per rank.</p>
 <div class="tbl-wrap">

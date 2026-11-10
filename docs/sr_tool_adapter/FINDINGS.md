@@ -88,6 +88,48 @@ tool_response + answer into one turn).
    verdict — the synthetic answer was noise. Switching the completion to the gold
    verdict label (`"answerable"`/`"unanswerable"`) lifted verdict accuracy to 0.66.
 
+## Full-scale autoregressive Vela run (2026-11-04, job `antonp-sr-tooladapter-42-3b`, commit `dc837c8`)
+
+The autoregressive mode (adapter emits the `<tool_response>` block + the next
+assistant-turn opener, then stops at `<|im_start|>assistant\n`) re-run at full
+scale, so the flow-check numbers above can be read against a real quality scale.
+Granite 4.2-3b prerelease, SR r32 q/o/MLP + cross_stream, 4-GPU DDP, 2 epochs (750
+steps). Data generated in-pod from `unified_compare/data_v4` (11,978 train / 1,350
+val); verdict derived from the final assistant turn. `--thinking off`. Boundary
+validated 8/8 per rank.
+
+The in-job eval hung (the known FSDP/accelerate-barrier trap — generation must run
+as a separate single-GPU process, per CLAUDE.md); re-run standalone
+(`antonp-sr-eval-both-42-3b`) over a **500-row sample** of the val set.
+
+| metric | 120-row flow-check | full-scale (500-row sample) |
+|---|---|---|
+| free-gen verdict accuracy | 0.58 (0.66 of valid) | **0.95** |
+| structural validity | 0.88 | **1.00** (500/500) |
+| consistency rate | 0.93 | **1.00** |
+| held-out `eval_loss`, ep1 → ep2 | — | 0.00596 → 0.00516 |
+| held-out `eval_mean_token_accuracy`, ep2 | — | 0.998 |
+
+|  | →answerable | →unanswerable |
+|---|---|---|
+| **answerable** (264) | 249 | 15 |
+| **unanswerable** (236) | 10 | 226 |
+
+Balanced error profile (15 false-refusals, 10 false-accepts) — the flow-check's
+heavy unanswerable bias is **gone** at scale, and structural validity is perfect
+(every generation produced a parseable `<tool_response>` + the assistant opener).
+This is the like-for-like counterpart to the external-mode run below (same
+`data_v4` split, same `eval_tool_adapter.py`): autoregressive **0.95** vs external
+**0.9541** — effectively tied, so emitting the full scaffolding (autoregressive)
+costs essentially nothing in accuracy versus the minimal external payload.
+
+> Plain-flow comparison on the same `data_v4` split is pending a re-eval (the plain
+> leg of the standalone eval job did not complete; checkpoint
+> `run_20261103T220822Z` is intact).
+
+Artifacts: `/danieloh_cos/granite-switch/adapter_training/shadow_residual_runs/tooladapter_42_3b/sr-tooladapter-ans-42-3b/run_20261103T220821Z/`
+(`checkpoints/` adapter, `eval.json`, `eval_dump.jsonl` — 500 rows).
+
 ## External tool formatting (`external_tool_formatting`)
 
 A second mode in which the environment owns the template: it writes
