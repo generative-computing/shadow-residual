@@ -37,4 +37,14 @@ def convert(task: str, row: dict, *, include_response: bool) -> dict | None:
     return intrinsics.to_tool_row(task, row, include_response=include_response)
 
 
-__all__ = ["TASKS", "convert", "tool_name"]
+def to_vanilla(task: str, row: dict) -> dict:
+    """The source row as a plain chat training row (``data.vanilla_frac``):
+    ``messages`` ending with the gold assistant turn, plus ``documents``."""
+    if task not in TASKS:
+        raise ValueError(f"unknown tool task {task!r}; known: {TASKS}")
+    if task == "answerability":
+        return answerability.to_vanilla_row(row)
+    return intrinsics.to_vanilla_row(task, row)
+
+
+__all__ = ["TASKS", "convert", "to_vanilla", "tool_name"]

@@ -77,6 +77,62 @@ the train rows instead of reading `data.val_path`. Set exactly one of the two.
 tool, it has already been converted, so loading it with `tool_task` set raises
 an error. For pre-converted files, unset `tool_task`.
 
+Answerability source rows may carry their documents as inline `tool` turns (the
+adapter-bench `g42-alora-4.1-split` shape) instead of a `documents` field. The
+converter moves them into `documents` as `{"document_id": <index>, "content":
+...}`, the same records the benchmark's own renderer builds.
+
+### Hybrid: tool rows + vanilla rows, `data.vanilla_frac`
+
+With `data.vanilla_frac: F` (`--vanilla-frac F`, needs `tool_task`) a seeded
+(`runtime.seed`) `round(F * n)` of the usable source rows train as **vanilla
+SR** chat rows; the rest train as tool rows for the mode. One adapter then
+serves both ways: as a tool, and by last-context-token activation after the
+plain generation prompt. The reference config sets `vanilla_frac: 0.5`;
+`--vanilla-frac 0` trains tool rows only. Each source row is used once, in one
+of the two formats.
+
+A vanilla row is the source row as a plain chat row (documents after the last
+user turn, thinking off), and it supervises the source row's own final
+assistant turn. The response formats differ. For answerability the vanilla gold
+is the quoted label and the tool gold is the dict:
+
+```
+vanilla  ...<|im_start|>assistant\n<think></think>   "unanswerable"<|im_end|>\n
+tool     ...<|im_start|>user\n<tool_response>\n       {"answerable": false}<|im_end|>
+```
+
+| row kind | marker (masked through) | last context token |
+|---|---|---|
+| vanilla | `<\|im_start\|>assistant\n<think></think>` | `</think>` |
+| tool, external | `<tool_response>\n` | `\n` |
+| tool, autoregressive | `</tool_call>` | `</tool_call>` |
+
+TRL passes only token ids to the collator, so a row's kind is not available
+there. The collator gets both markers and cuts after the one whose last
+occurrence **ends last**. That is always the row's own marker: a vanilla row's
+documents `<tool_response>\n` comes before its final assistant opener, and a
+tool row's trigger-turn assistant opener comes before its tool marker. The
+loader checks this on every row with the real tokenization and names the line
+of a row that would be cut elsewhere. The dataset gets a `kind` column, and the
+boundary validator runs per kind, each against its own last context token.
+`adapter_config.json` records `vanilla_frac` and `vanilla_last_context_token`.
+
+Notes:
+- The split is exact per file, before a `--val-frac` split; train and val then
+  each hold about F vanilla rows.
+- Rows the tool converter drops (answerability `conversational`) are dropped for
+  both kinds. A vanilla row keeps the source label as is (answerability
+  `"partial"` stays `"partial"`); a row with only `ground_truth` gets its gold
+  turn built from it.
+- In tool mode (with or without vanilla rows), rows of at least
+  `data.max_length` tokens are dropped and counted in the log. The trainer would
+  truncate them from the end, which cuts off the supervised span and leaves an
+  earlier marker (the documents, the trigger turn) as the cut point.
+- Post-training generation and `sr-generate` render the tool prompt. Evaluate the
+  vanilla side with the plain generation prompt (for example the adapter
+  benchmark's own HF+PEFT runner).
+
 ### Building rows by hand: `python -m shadow_residual.training.tool_data`
 
 The CLI writes the converted rows to files, so you can inspect them or reuse

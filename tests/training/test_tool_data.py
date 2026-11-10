@@ -137,6 +137,24 @@ def test_answerability_drops_unusable_rows(row):
     assert answerability.to_tool_row(row) is None
 
 
+def test_answerability_lifts_inline_document_turns():
+    # adapter-bench g42-alora-4.1-split rows carry their documents as tool turns.
+    row = {"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "tool", "content": "doc A"},
+        {"role": "tool", "content": "doc B"},
+        {"role": "user", "content": "q?"},
+        {"role": "assistant", "content": '"unanswerable"'},
+    ]}
+    out = answerability.to_tool_row(row)
+    assert out["documents"] == [
+        {"document_id": 0, "content": "doc A"},
+        {"document_id": 1, "content": "doc B"},
+    ]
+    assert [m["role"] for m in out["messages"]] == ["system", "user", "assistant", "tool"]
+
+
 def test_answerability_eval_row_has_no_response():
     row = answerability.to_tool_row(ANS_SRC[1], include_response=False)
     assert row["messages"][-1]["role"] == "assistant"

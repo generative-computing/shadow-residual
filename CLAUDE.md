@@ -92,8 +92,14 @@ Config essentials:
   command; `--val-frac F` (`data.val_frac`, exclusive with `val_path`) splits
   validation off the train rows. Without `tool_task`, rows must already be tool
   rows (`messages` + `tools` ending with the trigger call and the gold `tool`
-  message, from `python -m shadow_residual.training.tool_data`). Reference
-  config: `sr-tool-g42.yaml` (`tool_task: answerability`). Details:
+  message, from `python -m shadow_residual.training.tool_data`).
+  **`data.vanilla_frac` / `--vanilla-frac F`** (needs `tool_task`; hybrid): a
+  seeded fraction F of the source rows trains as plain vanilla-SR chat rows
+  (answer after `<|im_start|>assistant\n<think></think>`, last context token
+  `</think>`), the rest as tool rows; the collator cuts each row after whichever
+  of the two markers ends last, and every row is checked for that at load.
+  `--vanilla-frac 0` = tool rows only. Reference config: `sr-tool-g42.yaml`
+  (`tool_task: answerability`, `vanilla_frac: 0.5`). Details:
   [`docs/tool_formatting.md`](docs/tool_formatting.md).
 
 **How checkpointing works.** The decoder layer is a `GradientCheckpointingLayer`

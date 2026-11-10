@@ -61,6 +61,8 @@ most-edited fields.
                         bare flag = external_tool_formatting, or autoregressive_tool_formatting
 --tool-task TASK        rows are TASK source rows, converted to tool rows on load (data.tool_task;
                         answerability | guardian_core | requirement_check | query_clarification)
+--vanilla-frac F        hybrid: train a seeded fraction F of the source rows as plain vanilla-SR chat
+                        rows, the rest as tool rows (data.vanilla_frac; needs --tool-task; 0 = off)
 --wandb                 set runtime.report_to=['wandb']
 --debug-collator [PROB] log a decoded training example + labels: the first batch, then ~PROB of
                         batches (default trainer.debug_probability = 0.001)
