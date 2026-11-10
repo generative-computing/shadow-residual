@@ -268,6 +268,38 @@ def test_tool_formatting_rejects_unknown_mode():
         )
 
 
+def test_tool_task_defaults_none_and_accepts_tasks():
+    assert TrainingConfig.model_validate(_minimal()).data.tool_task is None
+    for task in ("answerability", "guardian_core", "requirement_check", "query_clarification"):
+        cfg = TrainingConfig.model_validate(
+            _minimal(data={"train_path": "/t", "val_path": "/v", "tool_task": task}))
+        assert cfg.data.tool_task == task
+    with pytest.raises(ValidationError):
+        TrainingConfig.model_validate(_minimal(data={"train_path": "/t", "val_path": "/v", "tool_task": "x"}))
+
+
+def test_tool_task_enum_matches_converters():
+    from shadow_residual.config.training_config import ToolTask
+    from shadow_residual.training.tool_data.convert import TASKS
+    assert tuple(t.value for t in ToolTask) == TASKS
+
+
+@pytest.mark.parametrize("data", [
+    {"train_path": "/t"},
+    {"train_path": "/t", "val_path": "/v", "val_frac": 0.1},
+    {"train_path": "/t", "val_frac": 0.0},
+    {"train_path": "/t", "val_frac": 1.0},
+])
+def test_exactly_one_val_source(data):
+    with pytest.raises(ValidationError):
+        TrainingConfig.model_validate(_minimal(data=data))
+
+
+def test_val_frac_alone_is_valid():
+    cfg = TrainingConfig.model_validate(_minimal(data={"train_path": "/t", "val_frac": 0.1}))
+    assert (cfg.data.val_path, cfg.data.val_frac) == (None, 0.1)
+
+
 def test_tool_reference_config_opts_in_without_markers(monkeypatch):
     """The reference tool config sets the mode and leaves the markers to it
     (setting them too is rejected by train.apply_tool_formatting)."""
@@ -277,6 +309,7 @@ def test_tool_reference_config_opts_in_without_markers(monkeypatch):
         monkeypatch.setenv(var, "/x")
     cfg = load_training_config(EXAMPLES / "sr-tool-g42.yaml")
     assert cfg.data.tool_formatting == "external_tool_formatting"
+    assert cfg.data.tool_task == "answerability"
     assert cfg.data.assistant_marker is None
     assert cfg.adapter.last_context_token is None
     assert cfg.adapter.last_token is None

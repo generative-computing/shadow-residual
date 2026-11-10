@@ -237,6 +237,72 @@ def test_explicit_markers_allowed_without_tool_formatting(config_path):
     assert cfg.adapter.last_context_token == "\n"
 
 
+def test_tool_task_flag_sets_config(config_path):
+    cfg = load_training_config(config_path)
+    assert cfg.data.tool_task is None
+    args = _build_parser().parse_args(
+        ["--config", str(config_path), "--tool-formatting", "--tool-task", "guardian_core"]
+    )
+    apply_cli_overrides(cfg, args)
+    apply_tool_formatting(cfg)
+    assert cfg.data.tool_task == "guardian_core"
+
+
+def test_tool_task_rejects_unknown_task(config_path):
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["--config", str(config_path), "--tool-task", "bogus"])
+
+
+def test_tool_task_requires_tool_formatting(config_path):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(["--config", str(config_path), "--tool-task", "answerability"])
+    apply_cli_overrides(cfg, args)
+    with pytest.raises(ValueError, match=r"tool_task='answerability' requires data\.tool_formatting"):
+        apply_tool_formatting(cfg)
+
+
+def test_val_frac_replaces_val_path(config_path):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(["--config", str(config_path), "--val-frac", "0.1"])
+    apply_cli_overrides(cfg, args)
+    assert (cfg.data.val_path, cfg.data.val_frac) == (None, 0.1)
+
+
+def test_val_frac_and_val_data_are_exclusive(config_path):
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            ["--config", str(config_path), "--val-frac", "0.1", "--val-data", "/v.jsonl"]
+        )
+
+
+@pytest.mark.parametrize("frac", ["0", "1", "1.5"])
+def test_val_frac_out_of_range(config_path, frac):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(["--config", str(config_path), "--val-frac", frac])
+    with pytest.raises(ValueError, match="--val-frac"):
+        apply_cli_overrides(cfg, args)
+
+
+def test_debug_collator_flag_forms(config_path):
+    cfg = load_training_config(config_path)
+    apply_cli_overrides(cfg, _build_parser().parse_args(["--config", str(config_path)]))
+    assert (cfg.trainer.debug_collator, cfg.trainer.debug_probability) == (False, 0.001)
+
+    cfg = load_training_config(config_path)
+    apply_cli_overrides(cfg, _build_parser().parse_args(["--config", str(config_path), "--debug-collator"]))
+    assert (cfg.trainer.debug_collator, cfg.trainer.debug_probability) == (True, 0.001)
+
+    cfg = load_training_config(config_path)
+    apply_cli_overrides(cfg, _build_parser().parse_args(
+        ["--config", str(config_path), "--debug-collator", "0.25"]))
+    assert (cfg.trainer.debug_collator, cfg.trainer.debug_probability) == (True, 0.25)
+
+    cfg = load_training_config(config_path)
+    with pytest.raises(ValueError, match="--debug-collator"):
+        apply_cli_overrides(cfg, _build_parser().parse_args(
+            ["--config", str(config_path), "--debug-collator", "2"]))
+
+
 def test_quantize_flag_does_not_touch_config(config_path):
     """--quantize is consumed inside main(), not by apply_cli_overrides."""
     cfg = load_training_config(config_path)

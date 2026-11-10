@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from shadow_residual.config import load_training_config
-from shadow_residual.config.training_config import TrainingConfig
+from shadow_residual.config.training_config import ToolTask, TrainingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    metavar="PROB",
                    help="Override generation.debug_probability (e.g. 0.01 logs "
                         "decoded prompt + generated text for ~1%% of batches).")
+    p.add_argument("--tool-task", default=None, choices=[t.value for t in ToolTask],
+                   help="Treat --data rows as this task's source rows and convert them to "
+                        "tool rows on load (overrides data.tool_task).")
     return p
 
 
@@ -205,6 +208,7 @@ def run_generation(
     out_path: str | Path,
     limit: int | None = None,
     tool_formatting: str | None = None,
+    tool_task: str | None = None,
 ) -> int:
     """Run generation given an already-loaded model + tokenizer.
 
@@ -228,6 +232,10 @@ def run_generation(
             in (Granite 4.2 only). Each row is rendered up to the mode's handoff
             point (:func:`tool_data.render_tool_prompt`) and
             ``generated_content`` holds the extracted tool-response payload.
+        tool_task: ``data.tool_task`` (requires ``tool_formatting``). Rows are
+            task source rows, converted to gold-free tool rows before rendering;
+            the converted row (which keeps ``ground_truth``) is what gets
+            written, and rows the converter drops are skipped.
 
     Returns:
         Number of predictions written.
@@ -247,6 +255,16 @@ def run_generation(
 
     try:
         rows = _load_jsonl_rows(data_path)
+        if tool_task is not None:
+            if tool_formatting is None:
+                raise ValueError("tool_task requires tool_formatting")
+            from shadow_residual.training.tool_data.convert import convert
+            converted = [convert(tool_task, r, include_response=False) for r in rows]
+            rows = [r for r in converted if r is not None]
+            logger.info(
+                "Converted %d %s source rows to tool rows (%d dropped as unusable)",
+                len(rows), tool_task, len(converted) - len(rows),
+            )
         if limit is not None:
             rows = rows[:limit]
         logger.info("Loaded %d generation rows from %s", len(rows), data_path)
@@ -648,6 +666,7 @@ def run_generation_under_fsdp(
                 out_path=out_path,
                 limit=limit,
                 tool_formatting=cfg.data.tool_formatting,
+                tool_task=cfg.data.tool_task,
             )
             _cuda_mem_snapshot("rank0/after-generation", device=0)
         except Exception:
@@ -710,6 +729,11 @@ def main(argv: list[str] | None = None) -> int:
     tool_formatting = read_tool_formatting_from_adapter(str(checkpoint_path)) or cfg.data.tool_formatting
     if tool_formatting is not None:
         logger.info("Tool formatting: %s", tool_formatting)
+    # The task describes the eval file's row format, not the adapter, so the CLI
+    # and config decide it; an already-converted eval file needs neither.
+    tool_task = args.tool_task or cfg.data.tool_task
+    if tool_task is not None:
+        logger.info("Tool task: %s (eval source rows converted on load)", tool_task)
 
     # Load tokenizer (prefer the one saved next to the adapter; some adapters
     # carry tokenizer changes worth preserving).
@@ -749,6 +773,7 @@ def main(argv: list[str] | None = None) -> int:
         out_path=out_path,
         limit=args.limit,
         tool_formatting=tool_formatting,
+        tool_task=tool_task,
     )
     return 0
 

@@ -243,6 +243,7 @@ def test_dispatch_passes_tool_formatting_to_run_generation(config_path, monkeypa
 
     cfg = load_training_config(config_path)
     cfg.data.tool_formatting = "autoregressive_tool_formatting"
+    cfg.data.tool_task = "guardian_core"
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setattr(train_mod, "_FSDP_CLASS", _FakeFsdpModel, raising=False)
     plain_runner = MagicMock(return_value=1)
@@ -254,6 +255,7 @@ def test_dispatch_passes_tool_formatting_to_run_generation(config_path, monkeypa
         output_dir=tmp_path,
     )
     assert plain_runner.call_args.kwargs["tool_formatting"] == "autoregressive_tool_formatting"
+    assert plain_runner.call_args.kwargs["tool_task"] == "guardian_core"
 
 
 def test_dispatch_skips_non_rank0_when_not_fsdp(
@@ -509,6 +511,41 @@ def test_run_generation_tool_mode_prompts_and_payload(tmp_path, mode, continuati
     written = [json.loads(l) for l in out_path.read_text().splitlines()]
     assert [w["generated_content"] for w in written] == ['{"answerable": false}'] * 2
     assert written[0]["messages"] == rows[0]["messages"]  # input row preserved
+
+
+def test_run_generation_tool_task_converts_eval_source_rows(tmp_path):
+    """tool_task converts eval source rows on load (gold dropped, unusable rows
+    skipped) and writes the converted row, keeping ground_truth for the scorer."""
+    import json
+    pytest.importorskip("torch")
+    from shadow_residual.training import generate as gen_mod
+    from shadow_residual.training.tool_data import answerability, render_tool_prompt
+
+    tok = _g42_tokenizer()
+    mode = "external_tool_formatting"
+    src = {"messages": [{"role": "user", "content": "What is the CEO's salary?"}],
+           "documents": [{"document_id": "d", "content": "Vacation is 20 days."}],
+           "ground_truth": "unanswerable"}
+    conversational = {"messages": [{"role": "user", "content": "hi"}], "ground_truth": "conversational"}
+    data_path = tmp_path / "eval_src.jsonl"
+    data_path.write_text("".join(json.dumps(r) + "\n" for r in [src, conversational]))
+    out_path = tmp_path / "preds.jsonl"
+    model = _ScriptedModel(tok, '{"answerable": false}<|im_end|>')
+
+    n = gen_mod.run_generation(
+        model=model, tokenizer=tok,
+        gen_config=SimpleNamespace(batch_size=2, max_new_tokens=32, do_sample=False,
+                                   debug_probability=0.0),
+        data_path=data_path, out_path=out_path, tool_formatting=mode, tool_task="answerability",
+    )
+
+    assert n == 1
+    eval_row = answerability.to_tool_row(src, include_response=False)
+    assert model.prompts == [render_tool_prompt(tok, eval_row["messages"], tools=eval_row["tools"],
+                                                documents=eval_row["documents"], mode=mode)]
+    written = [json.loads(l) for l in out_path.read_text().splitlines()]
+    assert written[0]["ground_truth"] == "unanswerable"
+    assert written[0]["generated_content"] == '{"answerable": false}'
 
 
 def test_run_generation_tool_mode_rejects_non_g42_tokenizer(tmp_path):

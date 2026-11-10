@@ -54,10 +54,34 @@ are the same row without the trailing `tool` message; gold, if any, goes in
 `ground_truth`. A trailing gold `tool` message is also accepted at generation
 time and is dropped from the prompt.
 
-### Building rows: `python -m shadow_residual.training.tool_data`
+### Train from source rows: `data.tool_task`
 
-The `shadow_residual.training.tool_data` package converts task source rows into
-tool rows. No tokenizer is needed.
+Set `data.tool_task` (or `--tool-task`) and the trainer converts each task
+**source** row to a tool row on load, then renders it for the mode. You don't
+need a separate data-prep step. Rows the converter can't use are dropped and
+counted in the log (`converted N answerability source rows to tool rows (M
+dropped as unusable)`). Post-training generation and `sr-generate` convert eval
+source rows the same way: the gold tool message is dropped, and `ground_truth`
+is kept for the scorer.
+
+```bash
+# one command; one source file, validation split held out in the trainer
+sr-train --config src/shadow_residual/config/sr-tool-g42.yaml \
+  --tool-formatting external_tool_formatting --tool-task answerability \
+  --train-data src.jsonl --val-frac 0.1
+```
+
+`--val-frac F` (`data.val_frac`) holds out a seeded (`runtime.seed`) fraction of
+the train rows instead of reading `data.val_path`. Set exactly one of the two.
+`tool_task` requires `tool_formatting`. If a row already defines the task's
+tool, it has already been converted, so loading it with `tool_task` set raises
+an error. For pre-converted files, unset `tool_task`.
+
+### Building rows by hand: `python -m shadow_residual.training.tool_data`
+
+The CLI writes the converted rows to files, so you can inspect them or reuse
+them. No tokenizer is needed. The CLI and `data.tool_task` use the same
+converter (`tool_data/convert.py`).
 
 ```bash
 # training: gold kept, shuffled train/val split
@@ -227,14 +251,23 @@ The check probes the template's behaviour, not the model name, so any Granite
 
 ## 7. Quick start
 
-```bash
-python -m shadow_residual.training.tool_data --task answerability \
-  --input answerability.jsonl --out-train data/train.jsonl --out-val data/val.jsonl
+One command, straight from answerability source rows (the reference config sets
+`tool_task: answerability`):
 
-BASE_MODEL=ibm-granite/granite-4.2-3b DATA_ROOT=data RUN_DIR=runs/tool EVAL_DATA=data/val.jsonl \
+```bash
+BASE_MODEL=ibm-granite/granite-4.2-3b DATA_ROOT=/path/to/src RUN_DIR=runs/tool \
+EVAL_DATA=/path/to/src/val.jsonl \
 sr-train --config src/shadow_residual/config/sr-tool-g42.yaml           # external (config default)
 #        --tool-formatting autoregressive_tool_formatting               # or the other mode
+#        --tool-task guardian_core                                      # or another task
+#        --train-data src.jsonl --val-frac 0.1                          # one source file
+#        --debug-collator 0.05                                          # print training examples
 ```
+
+`DATA_ROOT` holds the source `train.jsonl` / `val.jsonl`. `--debug-collator
+[PROB]` always prints the first collated batch. It then prints about PROB of
+later batches (default 0.001). Each print shows the decoded row, the last
+context token, and the supervised text.
 
 The reference config is
 [`src/shadow_residual/config/sr-tool-g42.yaml`](../src/shadow_residual/config/sr-tool-g42.yaml).

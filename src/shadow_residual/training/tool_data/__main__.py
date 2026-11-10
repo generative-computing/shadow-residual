@@ -12,6 +12,10 @@
 The output rows are plain ``messages`` + ``tools`` (+ ``documents``) rows; the
 trainer renders them for whichever ``data.tool_formatting`` mode it runs, so the
 same file trains either mode. No tokenizer is needed here.
+
+Training does not need this step: set ``data.tool_task`` (``--tool-task``) and
+``sr-train`` / ``sr-generate`` convert source rows on load. Use this CLI to
+inspect converted rows or to build a shuffled split from one source file.
 """
 
 from __future__ import annotations
@@ -22,15 +26,7 @@ import random
 import sys
 from pathlib import Path
 
-from shadow_residual.training.tool_data import answerability, intrinsics
-
-TASKS = ("answerability", *intrinsics.INTRINSICS)
-
-
-def convert(task: str, row: dict, *, include_response: bool) -> dict | None:
-    if task == "answerability":
-        return answerability.to_tool_row(row, include_response=include_response)
-    return intrinsics.to_tool_row(task, row, include_response=include_response)
+from shadow_residual.training.tool_data.convert import TASKS, convert
 
 
 def _build_parser() -> argparse.ArgumentParser:

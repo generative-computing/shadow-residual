@@ -392,6 +392,81 @@ def test_loader_reports_bad_row_location(tok, tmp_path):
         load_jsonl_dataset(path, tok, tool_formatting=EXTERNAL)
 
 
+@pytest.mark.parametrize("mode", MODES)
+def test_loader_converts_source_rows_identically_to_cli(tok, tmp_path, mode):
+    """tool_task on load == running the tool_data CLI first, then loading."""
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    conversational = {"messages": [{"role": "user", "content": "hi"}], "ground_truth": "conversational"}
+    src = _write_jsonl(tmp_path / "src.jsonl", [ANS_SRC[0], conversational, ANS_SRC[1]])
+    pre = _write_jsonl(tmp_path / "pre.jsonl", [answerability.to_tool_row(r) for r in ANS_SRC])
+    last = TOOL_FORMATTING_MARKERS[mode].last_token
+    on_load = load_jsonl_dataset(src, tok, last_token=last, tool_formatting=mode, tool_task="answerability")
+    two_step = load_jsonl_dataset(pre, tok, last_token=last, tool_formatting=mode)
+    assert on_load["text"] == two_step["text"]
+    assert len(on_load) == 2  # the conversational row is dropped
+
+
+@pytest.mark.parametrize("task", intrinsics.INTRINSICS)
+def test_loader_converts_intrinsic_source_rows(tok, tmp_path, task):
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    src = _write_jsonl(tmp_path / "src.jsonl", [INTRINSIC_SRC[task]])
+    ds = load_jsonl_dataset(src, tok, tool_formatting=EXTERNAL, tool_task=task)
+    gold = json.dumps(json.loads(INTRINSIC_SRC[task]["messages"][-1]["content"]))
+    assert ds[0]["text"].endswith("<tool_response>\n" + gold + IM_END)
+
+
+def test_loader_rejects_already_converted_rows(tok, tmp_path):
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    pre = _write_jsonl(tmp_path / "pre.jsonl", [answerability.to_tool_row(ANS_SRC[0])])
+    with pytest.raises(ValueError, match=r"pre\.jsonl:1: .*already defines the 'answerability' tool"):
+        load_jsonl_dataset(pre, tok, tool_formatting=EXTERNAL, tool_task="answerability")
+
+
+def test_loader_reports_source_row_conversion_error(tok, tmp_path):
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    bad = {"messages": [{"role": "user", "content": "<guardian>no criteria"}]}
+    src = _write_jsonl(tmp_path / "src.jsonl", [INTRINSIC_SRC["guardian_core"], bad])
+    with pytest.raises(ValueError, match=r"src\.jsonl:2: guardian_core conversion: .*criteria"):
+        load_jsonl_dataset(src, tok, tool_formatting=EXTERNAL, tool_task="guardian_core")
+
+
+def test_loader_tool_task_requires_tool_formatting(tok, tmp_path):
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    src = _write_jsonl(tmp_path / "src.jsonl", ANS_SRC)
+    with pytest.raises(ValueError, match="tool_task requires tool_formatting"):
+        load_jsonl_dataset(src, tok, tool_task="answerability")
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_debug_collator_prints_first_batch_with_supervised_span(tok, mode, caplog):
+    """The first batch always prints (even at probability 0), showing the last
+    context token and the supervised span; later batches follow the probability."""
+    import logging
+    pytest.importorskip("torch")
+    from shadow_residual.training.data import DebugPrintingCollator, ResponseOnlyCollator
+    from shadow_residual.training.tool_data import render_tool_example
+
+    row = answerability.to_tool_row(ANS_SRC[0])
+    markers = TOOL_FORMATTING_MARKERS[mode]
+    ids = tok.encode(_render(render_tool_example, tok, row, mode), add_special_tokens=False)
+    col = DebugPrintingCollator(ResponseOnlyCollator(tokenizer=tok, response_template=markers.assistant_marker),
+                                tokenizer=tok, probability=0.0)
+    with caplog.at_level(logging.INFO, logger="shadow_residual.training.data"):
+        col([{"input_ids": ids}])
+        col([{"input_ids": ids}])
+    log = caplog.text
+    assert log.count("DEBUG COLLATOR OUTPUT") == 1
+    assert f"Last context token: {markers.last_context_token!r}" in log
+    span = _gold(row) + IM_END if mode == EXTERNAL else (
+        "\n<|im_start|>user\n<tool_response>\n" + _gold(row) + "\n</tool_response>\n" + IM_END)
+    assert f"Supervised text: {span!r}" in log
+
+
 def test_loader_without_tool_formatting_is_unchanged(tok, tmp_path):
     """With tool_formatting unset a tool row renders as a plain stock chat row."""
     pytest.importorskip("datasets")

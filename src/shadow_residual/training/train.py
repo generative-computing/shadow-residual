@@ -26,7 +26,7 @@ from shadow_residual.config.adapters import (
     to_peft_config,
     to_training_arguments,
 )
-from shadow_residual.config.training_config import ToolFormatting, TrainingConfig
+from shadow_residual.config.training_config import ToolFormatting, ToolTask, TrainingConfig
 from shadow_residual.training.tool_data.formatting import TOOL_FORMATTING_MARKERS
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,11 @@ def apply_tool_formatting(cfg: TrainingConfig) -> None:
     """
     mode = cfg.data.tool_formatting
     if mode is None:
+        if cfg.data.tool_task is not None:
+            raise ValueError(
+                f"data.tool_task={cfg.data.tool_task!r} requires data.tool_formatting "
+                "(or --tool-formatting). See docs/tool_formatting.md."
+            )
         return
     markers = TOOL_FORMATTING_MARKERS[mode]
     explicit = {
@@ -75,7 +80,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # Hand-picked overrides for the most-edited fields.
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--train-data", type=str, default=None)
-    p.add_argument("--val-data", type=str, default=None)
+    val = p.add_mutually_exclusive_group()
+    val.add_argument("--val-data", type=str, default=None)
+    val.add_argument("--val-frac", type=float, default=None,
+                     help="Hold out this seeded fraction of the train rows as validation "
+                          "(data.val_frac) instead of reading --val-data.")
     p.add_argument("--lr", type=float, default=None, help="Override optimizer.learning_rate")
     p.add_argument("--epochs", type=int, default=None, help="Override runtime.num_train_epochs")
     p.add_argument("--max-steps", type=int, default=None,
@@ -120,11 +129,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         "has the adapter emit the whole tool-response turn after "
                         "'</tool_call>'. Either way the adapter stops before the "
                         "assistant answer. See docs/tool_formatting.md.")
+    p.add_argument("--tool-task", dest="tool_task", default=None,
+                   choices=[t.value for t in ToolTask],
+                   help="Treat the train/val/generation rows as this task's SOURCE rows and "
+                        "convert them to tool rows on load (data.tool_task; needs "
+                        "--tool-formatting). Replaces running `python -m "
+                        "shadow_residual.training.tool_data` first.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
-    p.add_argument("--debug-collator", action="store_true",
-                   help="Periodically log a decoded training example + labels from the collator. "
-                        "Also enables generation debug printing at the same probability "
-                        "(unless generation.debug_probability is already set in the config).")
+    p.add_argument("--debug-collator", nargs="?", type=float, const=-1.0, default=None,
+                   metavar="PROB",
+                   help="Log a decoded training example + labels from the collator: the first "
+                        "batch, then ~PROB of batches (default trainer.debug_probability, "
+                        "0.001). Also enables generation debug printing at the same "
+                        "probability (unless generation.debug_probability is already set).")
     return p
 
 
@@ -136,6 +153,12 @@ def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
         cfg.data.train_path = args.train_data
     if args.val_data is not None:
         cfg.data.val_path = args.val_data
+        cfg.data.val_frac = None
+    if args.val_frac is not None:
+        if not 0.0 < args.val_frac < 1.0:
+            raise ValueError(f"--val-frac must be in (0, 1), got {args.val_frac}")
+        cfg.data.val_frac = args.val_frac
+        cfg.data.val_path = None
     if args.lr is not None:
         cfg.optimizer.learning_rate = args.lr
     if args.epochs is not None:
@@ -161,13 +184,19 @@ def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
         cfg.data.instruction_as_user_message = True
     if args.tool_formatting is not None:
         cfg.data.tool_formatting = args.tool_formatting
-    if args.debug_collator:
+    if args.tool_task is not None:
+        cfg.data.tool_task = args.tool_task
+    if args.debug_collator is not None:
         cfg.trainer.debug_collator = True
+        if args.debug_collator >= 0.0:
+            if args.debug_collator > 1.0:
+                raise ValueError(f"--debug-collator PROB must be in [0, 1], got {args.debug_collator}")
+            cfg.trainer.debug_probability = args.debug_collator
         # Also turn on generation debug printing at the same rate, unless the
         # config already set it explicitly (don't clobber an explicit choice).
         # No-op when the generation block is absent (post-training gen disabled).
         if cfg.generation is not None and cfg.generation.debug_probability == 0.0:
-            cfg.generation.debug_probability = 0.001
+            cfg.generation.debug_probability = cfg.trainer.debug_probability
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -281,6 +310,7 @@ def _run_post_training_generation(
         data_path=cfg.generation.input_path,
         out_path=gen_out,
         tool_formatting=cfg.data.tool_formatting,
+        tool_task=cfg.data.tool_task,
     )
 
 
@@ -336,7 +366,12 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Adapter activation: unconditional (always active)")
     logger.info("Base model:   %s", cfg.model.base)
     logger.info("Train data:   %s", cfg.data.train_path)
-    logger.info("Val data:     %s", cfg.data.val_path)
+    if cfg.data.val_path is not None:
+        logger.info("Val data:     %s", cfg.data.val_path)
+    else:
+        logger.info("Val data:     %.0f%% of train rows (seed %d)", cfg.data.val_frac * 100, cfg.runtime.seed)
+    if cfg.data.tool_task is not None:
+        logger.info("Tool task:    %s (source rows converted on load)", cfg.data.tool_task)
     logger.info("Output dir:   %s", cfg.save.output_dir)
 
     # Lazy imports — keeps argparse fast, lets unit tests import the module
@@ -440,20 +475,23 @@ def main(argv: list[str] | None = None) -> int:
 
     # 5. Datasets. last_token (when set) is appended to rows that don't already
     # end with it — done at the text level so both masking paths inherit it.
-    train_ds = load_jsonl_dataset(
-        cfg.data.train_path, tok,
-        enable_thinking=cfg.data.enable_thinking,
-        last_token=cfg.adapter.last_token,
-        instruction_as_user_message=cfg.data.instruction_as_user_message,
-        tool_formatting=cfg.data.tool_formatting,
-    )
-    val_ds = load_jsonl_dataset(
-        cfg.data.val_path, tok,
-        enable_thinking=cfg.data.enable_thinking,
-        last_token=cfg.adapter.last_token,
-        instruction_as_user_message=cfg.data.instruction_as_user_message,
-        tool_formatting=cfg.data.tool_formatting,
-    )
+    def _load(path):
+        return load_jsonl_dataset(
+            path, tok,
+            enable_thinking=cfg.data.enable_thinking,
+            last_token=cfg.adapter.last_token,
+            instruction_as_user_message=cfg.data.instruction_as_user_message,
+            tool_formatting=cfg.data.tool_formatting,
+            tool_task=cfg.data.tool_task,
+        )
+
+    train_ds = _load(cfg.data.train_path)
+    if cfg.data.val_path is not None:
+        val_ds = _load(cfg.data.val_path)
+    else:
+        # Seeded, so every rank derives the same split.
+        split = train_ds.train_test_split(test_size=cfg.data.val_frac, seed=cfg.runtime.seed)
+        train_ds, val_ds = split["train"], split["test"]
     logger.info("Train rows: %d, Val rows: %d", len(train_ds), len(val_ds))
 
     # 6. SFTConfig — start from to_training_arguments, add SFT-specific keys
@@ -521,9 +559,12 @@ def main(argv: list[str] | None = None) -> int:
     # ResponseOnlyCollator fallback.
     if cfg.trainer.debug_collator:
         trainer.data_collator = DebugPrintingCollator(
-            trainer.data_collator, tokenizer=tok, probability=0.001
+            trainer.data_collator, tokenizer=tok, probability=cfg.trainer.debug_probability
         )
-        logger.info("Debug collator enabled (logs ~0.1%% of batches).")
+        logger.info(
+            "Debug collator enabled (logs the first batch, then ~%g%% of batches).",
+            cfg.trainer.debug_probability * 100,
+        )
 
     # 8. Train + save
     logger.info("Starting training...")
@@ -584,6 +625,8 @@ def main(argv: list[str] | None = None) -> int:
             adapter_cfg["share_moe_routing"] = bool(cfg.adapter.share_moe_routing)
             if cfg.data.tool_formatting is not None:
                 adapter_cfg["tool_formatting"] = cfg.data.tool_formatting
+            if cfg.data.tool_task is not None:
+                adapter_cfg["tool_task"] = cfg.data.tool_task
             with adapter_cfg_path.open("w") as f:
                 _json.dump(adapter_cfg, f, indent=2)
             logger.info(

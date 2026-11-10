@@ -95,6 +95,7 @@ def load_jsonl_dataset(
     last_token: str | None = None,
     instruction_as_user_message: bool = False,
     tool_formatting: str | None = None,
+    tool_task: str | None = None,
 ) -> "Dataset":
     """Load a JSONL file and apply the model's chat template to each row.
 
@@ -133,6 +134,11 @@ def load_jsonl_dataset(
     adapter must emit. ``enable_thinking`` / ``instruction_as_user_message`` do
     not apply to tool rows. See ``docs/tool_formatting.md``.
 
+    ``tool_task`` (``data.tool_task``; requires ``tool_formatting``) treats each
+    row as a task source row and converts it to a tool row first
+    (:func:`~shadow_residual.training.tool_data.convert.convert`). Rows the
+    converter drops are counted and logged.
+
     Returns a `datasets.Dataset` with a single ``text`` column containing the
     chat-templated string. SFTTrainer reads the ``text`` field directly.
     """
@@ -148,10 +154,14 @@ def load_jsonl_dataset(
             )
         last_token_id = ids[0]
 
+    if tool_task is not None and tool_formatting is None:
+        raise ValueError("tool_task requires tool_formatting")
     if tool_formatting is not None:
         from shadow_residual.training.tool_data import render_tool_example
+        from shadow_residual.training.tool_data.convert import convert
 
     rows: list[dict[str, str]] = []
+    n_dropped = 0
     with Path(path).open("r") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
@@ -160,6 +170,14 @@ def load_jsonl_dataset(
             obj = json.loads(line)
             if "messages" not in obj:
                 raise ValueError(f"{path}: row is missing 'messages' field: {obj!r}")
+            if tool_task is not None:
+                try:
+                    obj = convert(tool_task, obj, include_response=True)
+                except (ValueError, KeyError) as e:
+                    raise ValueError(f"{path}:{lineno}: {tool_task} conversion: {e}") from e
+                if obj is None:
+                    n_dropped += 1
+                    continue
             if tool_formatting is not None:
                 try:
                     text = render_tool_example(
@@ -196,6 +214,11 @@ def load_jsonl_dataset(
                     text = text + last_token
             rows.append({"text": text})
 
+    if tool_task is not None:
+        logger.info(
+            "%s: converted %d %s source rows to tool rows (%d dropped as unusable)",
+            path, len(rows), tool_task, n_dropped,
+        )
     if not rows:
         raise ValueError(f"{path}: empty dataset")
     return Dataset.from_list(rows)
@@ -300,13 +323,16 @@ class DebugPrintingCollator:
         self.base_collator = base_collator
         self.tokenizer = tokenizer
         self.probability = probability
+        self._printed_first = False
 
     def __call__(self, features):
         import random
 
         batch = self.base_collator(features)
-        if random.random() >= self.probability:
+        # The first batch always prints, so even a few-step run shows one example.
+        if self._printed_first and random.random() >= self.probability:
             return batch
+        self._printed_first = True
 
         input_ids = batch.get("input_ids")
         labels = batch.get("labels")
@@ -316,7 +342,8 @@ class DebugPrintingCollator:
         i = 0
         seq = input_ids[i].tolist()
         lbl = labels[i].tolist()
-        trainable = sum(1 for x in lbl if x != -100)
+        supervised = [x for x in lbl if x != -100]
+        first = next((j for j, x in enumerate(lbl) if x != -100), None)
 
         logger.info("=" * 70)
         logger.info("DEBUG COLLATOR OUTPUT")
@@ -325,7 +352,10 @@ class DebugPrintingCollator:
         logger.info("\nInput text:\n%s", self.tokenizer.decode(seq))
         logger.info("\nInput IDs: %s", seq)
         logger.info("\nLabels: %s", lbl)
-        logger.info("\nTrainable tokens: %d/%d", trainable, len(lbl))
+        if first is not None:
+            logger.info("\nLast context token: %r", self.tokenizer.decode(seq[first - 1 : first]))
+        logger.info("\nSupervised text: %r", self.tokenizer.decode(supervised))
+        logger.info("\nTrainable tokens: %d/%d", len(supervised), len(lbl))
         logger.info("=" * 70)
 
         return batch

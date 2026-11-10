@@ -88,6 +88,17 @@ class ToolFormatting(str, Enum):
     EXTERNAL = "external_tool_formatting"
 
 
+class ToolTask(str, Enum):
+    """Task source format converted to tool rows on load (``data.tool_task``).
+
+    Mirrors ``shadow_residual.training.tool_data.convert.TASKS``.
+    """
+    ANSWERABILITY = "answerability"
+    GUARDIAN_CORE = "guardian_core"
+    REQUIREMENT_CHECK = "requirement_check"
+    QUERY_CLARIFICATION = "query_clarification"
+
+
 # --- Sub-models ---------------------------------------------------------------
 
 
@@ -113,7 +124,10 @@ class ModelConfig(_Strict):
 
 class DataConfig(_Strict):
     train_path: str
-    val_path: str
+    # Exactly one of val_path / val_frac. val_frac holds out a seeded
+    # (runtime.seed) fraction of the train rows as the validation set.
+    val_path: str | None = None
+    val_frac: float | None = Field(None, gt=0.0, lt=1.0)
     max_length: PositiveInt = 8192
     # Optional response-template string for label masking. Used only when the
     # tokenizer's chat template lacks `{% generation %}` markers (in which case
@@ -143,6 +157,17 @@ class DataConfig(_Strict):
     # any of them too is an error). Overridable from the CLI via
     # `--tool-formatting [MODE]` (CLI wins; a bare flag selects external).
     tool_formatting: ToolFormatting | None = None
+    # Requires tool_formatting. When set, train/val (and generation) rows are
+    # task SOURCE rows, converted to tool rows on load by the task's converter
+    # (shadow_residual.training.tool_data); unusable rows are dropped. None =
+    # rows are already tool rows. Overridable from the CLI via `--tool-task`.
+    tool_task: ToolTask | None = None
+
+    @model_validator(mode="after")
+    def _one_val_source(self):
+        if (self.val_path is None) == (self.val_frac is None):
+            raise ValueError("set exactly one of data.val_path / data.val_frac")
+        return self
 
 
 class AdapterConfig(_Strict):
@@ -264,6 +289,9 @@ class TrainerConfig(_Strict):
     """SFTTrainer-specific knobs that aren't part of the optimizer/batch story."""
     packing: bool = False
     debug_collator: bool = False
+    # Fraction of collator batches the debug collator prints (the first batch
+    # always prints). `--debug-collator PROB` sets it.
+    debug_probability: float = Field(0.001, ge=0.0, le=1.0)
 
 
 class ValidationConfig(_Strict):
