@@ -259,6 +259,13 @@ results are posted there.</p>
   <li>2026-11-10 — <b>Boundary validator vs. collator order.</b> <code>validate_last_context_token_boundary</code>
   calls the collator with features lacking <code>task_id</code>, so the task-id collator wrapper is
   installed after the check.</li>
+  <li>2026-11-10 — <b>Long rows.</b> Token census of the rendered training sets (4.2 tokenizer):
+  answerability p50 712 / p90 5&nbsp;841 / max 11&nbsp;089 (1&nbsp;565 rows &gt; 4&nbsp;096); qc p50 1&nbsp;111 /
+  max 10&nbsp;979 (76 &gt; 4&nbsp;096); guardian max 1&nbsp;319; requirement max 4&nbsp;049. The g42 config sets
+  <code>max_length: 4096</code>; earlier runs in this repo saw that value not enforced on pre-rendered
+  rows, so long rows may train in full (memory risk) or be cut at the start (label lost). To be
+  checked in the training log. Either way it is the existing SR recipe and applies identically to both
+  arms, so it does not bias the comparison.</li>
   <li>2026-11-10 — <b>Shared working tree.</b> Other sessions edit the same checkout
   (e.g. an <code>adapter_stream</code> field in <code>train.py</code>/<code>factory.py</code>). The
   shared-A commit was built in an isolated clone from <code>c1ca175</code> with only this
