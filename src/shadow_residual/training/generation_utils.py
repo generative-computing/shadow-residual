@@ -45,4 +45,19 @@ def read_share_moe_routing_from_adapter(adapter_path: str) -> bool:
         return False
 
 
-__all__ = ["read_share_moe_routing_from_adapter"]
+def read_tool_formatting_from_adapter(adapter_path: str) -> str | None:
+    """Read the ``tool_formatting`` mode an adapter was trained in, or ``None``.
+
+    ``train.py`` records ``data.tool_formatting`` into ``adapter_config.json``;
+    serving must build prompts for the same mode (see
+    ``shadow_residual.training.tool_data.render_tool_prompt``).
+    """
+    cfg_path = os.path.join(adapter_path, "adapter_config.json")
+    try:
+        with open(cfg_path) as f:
+            return json.load(f).get("tool_formatting")
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+__all__ = ["read_share_moe_routing_from_adapter", "read_tool_formatting_from_adapter"]

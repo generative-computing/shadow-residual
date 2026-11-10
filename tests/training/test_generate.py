@@ -233,6 +233,27 @@ def test_dispatch_calls_run_generation_when_not_wrapped(
     assert kwargs["gen_config"] is cfg.generation
     assert Path(kwargs["data_path"]) == Path("/data/eval.jsonl")
     assert Path(kwargs["out_path"]) == out_dir / "predictions.jsonl"
+    assert kwargs["tool_formatting"] is None
+
+
+def test_dispatch_passes_tool_formatting_to_run_generation(config_path, monkeypatch, tmp_path):
+    """A tool-formatting run generates tool-mode prompts post-training."""
+    from shadow_residual.training import generate as generate_mod
+    from shadow_residual.training import train as train_mod
+
+    cfg = load_training_config(config_path)
+    cfg.data.tool_formatting = "autoregressive_tool_formatting"
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(train_mod, "_FSDP_CLASS", _FakeFsdpModel, raising=False)
+    plain_runner = MagicMock(return_value=1)
+    monkeypatch.setattr(generate_mod, "run_generation", plain_runner)
+
+    train_mod._run_post_training_generation(
+        trainer=SimpleNamespace(model=_FakePlainModel(), accelerator=MagicMock()),
+        cfg=cfg, peft_config=SimpleNamespace(), tokenizer=SimpleNamespace(),
+        output_dir=tmp_path,
+    )
+    assert plain_runner.call_args.kwargs["tool_formatting"] == "autoregressive_tool_formatting"
 
 
 def test_dispatch_skips_non_rank0_when_not_fsdp(
@@ -383,7 +404,7 @@ def test_run_generation_halves_batch_on_oom(tmp_path, monkeypatch):
 
     calls = {"oom": 0}
 
-    def fake_generate_batch(model, tokenizer, prompts, cfg_gen, debug_probability=0.0):
+    def fake_generate_batch(model, tokenizer, prompts, cfg_gen, debug_probability=0.0, **kw):
         if len(prompts) > 2:
             calls["oom"] += 1
             raise torch.cuda.OutOfMemoryError("simulated OOM")
@@ -412,3 +433,109 @@ def test_run_generation_halves_batch_on_oom(tmp_path, monkeypatch):
     written = [json.loads(l) for l in out_path.read_text().splitlines()]
     assert len(written) == 5
     assert all("generated_content" in r for r in written)
+
+
+# --- Tool-formatted generation (SR adapter as a tool) --------------------------
+
+
+def _g42_tokenizer():
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained("ibm-granite/granite-4.2-3b")
+    except Exception as e:  # pragma: no cover - environment dependent
+        pytest.skip(f"granite 4.2 tokenizer unavailable: {e}")
+
+
+class _ScriptedModel:
+    """Fake model whose generate() appends a fixed continuation to every prompt
+    and records the decoded prompts it was given."""
+
+    training = False
+    device = "cpu"
+
+    def __init__(self, tokenizer, continuation: str):
+        self.tok = tokenizer
+        self.cont_ids = tokenizer.encode(continuation, add_special_tokens=False)
+        self.prompts: list[str] = []
+
+    def eval(self):
+        return self
+
+    def train(self):
+        return self
+
+    def generate(self, input_ids, attention_mask=None, **kw):
+        import torch
+        for row, mask in zip(input_ids, attention_mask):
+            self.prompts.append(self.tok.decode(row[mask.bool()]))
+        cont = torch.tensor(self.cont_ids, dtype=input_ids.dtype).expand(input_ids.shape[0], -1)
+        return torch.cat([input_ids, cont], dim=1)
+
+
+@pytest.mark.parametrize("mode, continuation", [
+    ("external_tool_formatting", '{"answerable": false}<|im_end|>'),
+    ("autoregressive_tool_formatting",
+     '\n<|im_start|>user\n<tool_response>\n{"answerable": false}\n</tool_response>\n<|im_end|>'),
+])
+def test_run_generation_tool_mode_prompts_and_payload(tmp_path, mode, continuation):
+    """Tool mode renders the handoff-point prompt (gold tool message dropped) and
+    writes the extracted payload, not the raw generation, as generated_content."""
+    import json
+    pytest.importorskip("torch")
+    from shadow_residual.training import generate as gen_mod
+    from shadow_residual.training.tool_data import answerability, render_tool_prompt
+
+    tok = _g42_tokenizer()
+    src = {"messages": [{"role": "user", "content": "What is the CEO's salary?"}],
+           "documents": [{"document_id": "d", "content": "Vacation is 20 days."}],
+           "ground_truth": "unanswerable"}
+    rows = [answerability.to_tool_row(src), answerability.to_tool_row(src, include_response=False)]
+    data_path = tmp_path / "eval.jsonl"
+    data_path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    out_path = tmp_path / "preds.jsonl"
+    model = _ScriptedModel(tok, continuation)
+
+    n = gen_mod.run_generation(
+        model=model, tokenizer=tok,
+        gen_config=SimpleNamespace(batch_size=2, max_new_tokens=32, do_sample=False,
+                                   debug_probability=0.0),
+        data_path=data_path, out_path=out_path, tool_formatting=mode,
+    )
+
+    assert n == 2
+    expected_prompt = render_tool_prompt(tok, rows[1]["messages"], tools=rows[1]["tools"],
+                                         documents=rows[1]["documents"], mode=mode)
+    assert model.prompts == [expected_prompt, expected_prompt]
+    written = [json.loads(l) for l in out_path.read_text().splitlines()]
+    assert [w["generated_content"] for w in written] == ['{"answerable": false}'] * 2
+    assert written[0]["messages"] == rows[0]["messages"]  # input row preserved
+
+
+def test_run_generation_tool_mode_rejects_non_g42_tokenizer(tmp_path):
+    import json
+    from transformers import AutoTokenizer
+    from shadow_residual.training import generate as gen_mod
+    try:
+        tok41 = AutoTokenizer.from_pretrained("ibm-granite/granite-4.1-3b")
+    except Exception as e:  # pragma: no cover - environment dependent
+        pytest.skip(f"granite 4.1 tokenizer unavailable: {e}")
+    data_path = tmp_path / "eval.jsonl"
+    data_path.write_text(json.dumps({"messages": [{"role": "user", "content": "q"}]}) + "\n")
+    with pytest.raises(ValueError, match=r"requires a Granite 4\.2 base model"):
+        gen_mod.run_generation(
+            model=SimpleNamespace(training=False, eval=lambda: None, train=lambda: None),
+            tokenizer=tok41, gen_config=SimpleNamespace(batch_size=1, debug_probability=0.0),
+            data_path=data_path, out_path=tmp_path / "p.jsonl",
+            tool_formatting="external_tool_formatting",
+        )
+
+
+def test_read_tool_formatting_from_adapter(tmp_path):
+    import json
+    from shadow_residual.training.generation_utils import read_tool_formatting_from_adapter
+
+    assert read_tool_formatting_from_adapter(str(tmp_path)) is None
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 8}))
+    assert read_tool_formatting_from_adapter(str(tmp_path)) is None
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"tool_formatting": "external_tool_formatting"}))
+    assert read_tool_formatting_from_adapter(str(tmp_path)) == "external_tool_formatting"

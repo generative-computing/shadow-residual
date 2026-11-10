@@ -4,7 +4,7 @@ families — used by both training (``data.py``) and eval (``answerability_eval.
 so they render prompts identically.
 
 Granite 4.1's chat template renders a ``documents=`` kwarg into a system message.
-The Granite 4.2 pre-release moved to ChatML and its template ignores
+Granite 4.2 (e.g. ``ibm-granite/granite-4.2-3b``) moved to ChatML and its template ignores
 ``documents=`` entirely, so RAG context silently vanishes from the prompt — fatal
 for an answerability task that must ground its decision in the documents.
 

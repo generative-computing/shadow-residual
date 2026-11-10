@@ -94,7 +94,7 @@ def load_jsonl_dataset(
     enable_thinking: bool = False,
     last_token: str | None = None,
     instruction_as_user_message: bool = False,
-    allow_prerendered: bool = False,
+    tool_formatting: str | None = None,
 ) -> "Dataset":
     """Load a JSONL file and apply the model's chat template to each row.
 
@@ -125,9 +125,13 @@ def load_jsonl_dataset(
     marker (with or without trailing whitespace) are left unchanged. The string
     must encode to exactly one token id (enforced by the caller).
 
-    ``allow_prerendered`` (SR-adapter-as-tool only, set when
-    ``data.tool_formatting`` is on) also accepts rows that carry a ready
-    ``text`` field instead of ``messages``; it is used verbatim.
+    ``tool_formatting`` (``data.tool_formatting``; SR adapter as a tool, Granite
+    4.2 only) renders each row with
+    :func:`~shadow_residual.training.tool_data.render_tool_example` instead: the
+    row's ``messages`` must end with the trigger tool call and the gold ``tool``
+    response, and the text is that mode's prompt followed by the span the
+    adapter must emit. ``enable_thinking`` / ``instruction_as_user_message`` do
+    not apply to tool rows. See ``docs/tool_formatting.md``.
 
     Returns a `datasets.Dataset` with a single ``text`` column containing the
     chat-templated string. SFTTrainer reads the ``text`` field directly.
@@ -144,21 +148,30 @@ def load_jsonl_dataset(
             )
         last_token_id = ids[0]
 
+    if tool_formatting is not None:
+        from shadow_residual.training.tool_data import render_tool_example
+
     rows: list[dict[str, str]] = []
     with Path(path).open("r") as f:
-        for line in f:
+        for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             obj = json.loads(line)
-            # Pre-rendered passthrough (tool-formatting runs only): the
-            # SR-adapter-as-tool generator hand-assembles rows whose turn seams
-            # the stock chat template can't produce. See docs/sr_tool_adapter/.
-            if allow_prerendered and "text" in obj and "messages" not in obj:
-                text = obj["text"]
+            if "messages" not in obj:
+                raise ValueError(f"{path}: row is missing 'messages' field: {obj!r}")
+            if tool_formatting is not None:
+                try:
+                    text = render_tool_example(
+                        tokenizer,
+                        obj["messages"],
+                        tools=obj.get("tools"),
+                        documents=obj.get("documents"),
+                        mode=tool_formatting,
+                    )
+                except ValueError as e:
+                    raise ValueError(f"{path}:{lineno}: {e}") from e
             else:
-                if "messages" not in obj:
-                    raise ValueError(f"{path}: row is missing 'messages' field: {obj!r}")
                 # render_chat folds documents into a system message for ChatML
                 # tokenizers (Granite 4.2, whose template ignores documents=) and
                 # passes them natively otherwise (Granite 4.1). See chat_render.

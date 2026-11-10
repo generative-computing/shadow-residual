@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Evaluate an external-tool-formatting SR adapter on an adapter-bench eval set.
 
-Each benchmark eval row becomes the external prompt (tool_intrinsics.py: the
-conversation, the base's tool call, the env-written `<tool_response>\\n`). The
+Each benchmark eval row becomes the external prompt (the conversation, the
+base's tool call, the env-written `<tool_response>\\n`; built with
+shadow_residual.training.tool_data, the same code that renders training). The
 adapter generates greedily in bf16 until EOS; the generation is the tool's
 payload, scored by the adapter-bench harness's own scorer for the intrinsic
 (loaded from --harness, a checkout holding benchmarks/adapter_eval/scorers).
@@ -20,8 +21,9 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tool_intrinsics import EOS, INTRINSICS, external_context, split_row  # noqa: E402
+from shadow_residual.training.tool_data import EXTERNAL, render_tool_prompt
+from shadow_residual.training.tool_data.formatting import EOS
+from shadow_residual.training.tool_data.intrinsics import INTRINSICS, to_tool_row
 
 SCORERS = {
     "guardian_core": "guardian",
@@ -78,8 +80,9 @@ def main() -> None:
         rows = rows[: args.limit]
     prompts = []
     for r in rows:
-        convo, call_args, _ = split_row(args.intrinsic, r)
-        prompts.append(external_context(args.intrinsic, convo, call_args, tok))
+        t = to_tool_row(args.intrinsic, r, include_response=False)
+        prompts.append(render_tool_prompt(tok, t["messages"], tools=t["tools"],
+                                          documents=t.get("documents"), mode=EXTERNAL))
 
     order = sorted(range(len(rows)), key=lambda i: len(prompts[i]))
     raw = [""] * len(rows)

@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 export HF_HOME=/Users/antonp/models/hf_cache
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export WANDB_MODE=offline WANDB_DISABLED=true
-export BASE_MODEL=ibm-research/granite-4.2-3b-prerelease-r260622a
+export BASE_MODEL=ibm-granite/granite-4.2-3b
 export DATA_ROOT=data/plain_answerability
 export RUN_DIR=runs/plain_answerability_g42_3b
 export EVAL_DATA=data/plain_answerability/val_run.jsonl

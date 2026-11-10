@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Full-scale (CPU/MPS) launcher for the SR-adapter-as-tool answerability run on
-# Granite 4.2-3b. Trains the FULL set (3191 rows) for 2 epochs, skips in-job
-# generation, then runs the structural/accuracy/consistency eval over the full
-# 354-row val set. Sibling of run_tool_adapter_local.sh (120-row flow check).
+# Granite 4.2-3b. Trains the FULL set for 2 epochs, skips in-job generation,
+# then runs the structural/accuracy eval over the val set. Data:
+#   python -m shadow_residual.training.tool_data --task answerability --input <src> \
+#     --out-train data/tool_adapter/train.jsonl --out-val data/tool_adapter/val.jsonl
+# Sibling of run_tool_adapter_local.sh (120-row flow check).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export HF_HOME=/Users/antonp/models/hf_cache
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export WANDB_MODE=offline WANDB_DISABLED=true
-export BASE_MODEL=ibm-research/granite-4.2-3b-prerelease-r260622a
+export BASE_MODEL=ibm-granite/granite-4.2-3b
 export DATA_ROOT=data/tool_adapter
 export RUN_DIR=runs/tool_adapter_g42_3b_full
 export EVAL_DATA=data/tool_adapter/val.jsonl
@@ -17,7 +19,7 @@ mkdir -p "$RUN_DIR"
 
 echo "[$(date)] starting training" | tee -a "$RUN_DIR/run.log"
 .venv/bin/python -m shadow_residual.training.train \
-  --config src/shadow_residual/config/sr-tool-adapter-answerability-g42.yaml \
+  --config src/shadow_residual/config/sr-tool-g42.yaml \
   --train-data data/tool_adapter/train.jsonl \
   --val-data   data/tool_adapter/val.jsonl \
   --output-dir "$RUN_DIR" \
@@ -32,7 +34,7 @@ echo "[$(date)] starting eval" | tee -a "$RUN_DIR/run.log"
   --base-model "$BASE_MODEL" \
   --adapter "$RUN_DIR" \
   --val data/tool_adapter/val.jsonl \
-  --limit 354 --max-new-tokens 160 \
+  --limit 354 --max-new-tokens 64 \
   --dump "$RUN_DIR/eval_dump.jsonl" \
   --out  "$RUN_DIR/eval.json" >> "$RUN_DIR/run.log" 2>&1
 echo "[$(date)] eval done" | tee -a "$RUN_DIR/run.log"

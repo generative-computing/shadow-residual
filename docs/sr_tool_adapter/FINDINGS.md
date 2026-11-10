@@ -5,10 +5,18 @@ scale, to compare the **adapter-as-tool** flow against the **plain** (label-only
 flow. Runs done locally on Apple MPS (2026-10-19/20), branch
 `experiments/sr-tool-adapter`.
 
+> The shipped implementation is documented in [`docs/tool_formatting.md`](../tool_formatting.md),
+> and the data generator now lives in `shadow_residual.training.tool_data`. It
+> differs from the autoregressive runs below in one respect: the adapter emits
+> only the tool response and stops; it does not write an answer turn. The runs
+> below trained the earlier span, which also emitted the answer label.
+
 ## Setup (identical across both runs)
 
-- **Base:** `ibm-research/granite-4.2-3b-prerelease-r260622a` (Granite 4.2-3b,
-  `model_type=granite`, `tie_word_embeddings=False`).
+- **Base:** Granite 4.2-3b, `ibm-granite/granite-4.2-3b` (`model_type=granite`,
+  `tie_word_embeddings=False`). These runs predate its public release and used
+  the internal pre-release checkpoint, whose tokenizer and chat template are
+  identical.
 - **Data source:** `granite-switch-internal/scratch/answerability_evaluation.jsonl`
   (3565 rows: `messages` + `documents` + `ground_truth`). The **`ground_truth`
   field is the gold answerability verdict** and the sole supervised signal — the
@@ -93,7 +101,7 @@ tool_response + answer into one turn).
 The autoregressive mode (adapter emits the `<tool_response>` block + the next
 assistant-turn opener, then stops at `<|im_start|>assistant\n`) re-run at full
 scale, so the flow-check numbers above can be read against a real quality scale.
-Granite 4.2-3b prerelease, SR r32 q/o/MLP + cross_stream, 4-GPU DDP, 2 epochs (750
+Granite 4.2-3b (`ibm-granite/granite-4.2-3b`; run on the pre-release checkpoint), SR r32 q/o/MLP + cross_stream, 4-GPU DDP, 2 epochs (750
 steps). Data generated in-pod from `unified_compare/data_v4` (11,978 train / 1,350
 val); verdict derived from the final assistant turn. `--thinking off`. Boundary
 validated 8/8 per rank.
@@ -160,7 +168,7 @@ modes*.
 
 ### Vela run (2026-11-04, job `antonp-sr-tooladapter-ext-42-3b`, commit `b29a377`)
 
-Granite 4.2-3b prerelease, SR r32 q/o/MLP + cross_stream, 4-GPU DDP, 2 epochs
+Granite 4.2-3b (`ibm-granite/granite-4.2-3b`; run on the pre-release checkpoint), SR r32 q/o/MLP + cross_stream, 4-GPU DDP, 2 epochs
 (750 optimizer steps). Data was generated in-pod from `unified_compare/data_v4`
 (11,978 train / 1,350 val), the same source as the autoregressive Vela run.
 Boundary validated on 8/8 rows per rank.
@@ -204,9 +212,10 @@ Artifacts: `/danieloh_cos/granite-switch/adapter_training/shadow_residual_runs/t
 - Plain:  `runs/plain_answerability_g42_3b/` (adapter, `eval.json`, `eval_dump.jsonl`)
 - Tool:   `runs/tool_adapter_g42_3b/` (adapter, `eval.json`, `eval_dump.jsonl`)
 - Generators: `scripts/make_plain_answerability_data.py`,
-  `scripts/make_tool_adapter_data.py`
+  `python -m shadow_residual.training.tool_data` (tool; formerly
+  `scripts/make_tool_adapter_data.py`)
 - Evals: `scripts/eval_plain_answerability.py`, `scripts/eval_tool_adapter.py`
 - Launchers: `scripts/run_plain_answerability_local.sh`,
   `scripts/run_tool_adapter_local.sh`
 - Configs: `src/shadow_residual/config/sr-qo-mlp-r32-c32-sharedkv-g42.yaml`
-  (plain), `sr-tool-adapter-answerability-g42.yaml` (tool)
+  (plain), `sr-tool-g42.yaml` (tool; formerly `sr-tool-adapter-answerability-g42.yaml`)

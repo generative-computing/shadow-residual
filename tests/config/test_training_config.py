@@ -268,11 +268,20 @@ def test_tool_formatting_rejects_unknown_mode():
         )
 
 
-def test_tool_adapter_config_opts_in(monkeypatch):
+def test_tool_reference_config_opts_in_without_markers(monkeypatch):
+    """The reference tool config sets the mode and leaves the markers to it
+    (setting them too is rejected by train.apply_tool_formatting)."""
+    from shadow_residual.training.train import apply_tool_formatting
+
     for var in ("DATA_ROOT", "RUN_DIR", "EVAL_DATA", "BASE_MODEL"):
         monkeypatch.setenv(var, "/x")
-    cfg = load_training_config(EXAMPLES / "sr-tool-adapter-answerability-g42.yaml")
+    cfg = load_training_config(EXAMPLES / "sr-tool-g42.yaml")
     assert cfg.data.tool_formatting == "external_tool_formatting"
+    assert cfg.data.assistant_marker is None
+    assert cfg.adapter.last_context_token is None
+    assert cfg.adapter.last_token is None
+    assert "cross_stream" in cfg.adapter.target_modules
+    apply_tool_formatting(cfg)
     assert cfg.data.assistant_marker == "<tool_response>\n"
     assert cfg.adapter.last_context_token == "\n"
     assert cfg.adapter.last_token == "<|im_end|>"

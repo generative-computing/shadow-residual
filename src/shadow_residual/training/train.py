@@ -27,31 +27,39 @@ from shadow_residual.config.adapters import (
     to_training_arguments,
 )
 from shadow_residual.config.training_config import ToolFormatting, TrainingConfig
+from shadow_residual.training.tool_data.formatting import TOOL_FORMATTING_MARKERS
 
 logger = logging.getLogger(__name__)
 
 
-# Boundary markers per SR-adapter-as-tool mode:
-# (assistant_marker, last_context_token, last_token).
-#   autoregressive: supervision starts after the base's </tool_call>; the adapter
-#     emits the tool_response turn + final answer, ending at <|im_end|>.
-#   external: the env writes "<tool_response>\n"; supervision starts after it and
-#     covers only the dict, ending at <|im_end|> (the EOS the adapter stops on).
-_TOOL_FORMATTING_MARKERS = {
-    ToolFormatting.AUTOREGRESSIVE.value: ("</tool_call>", "</tool_call>", "<|im_end|>"),
-    ToolFormatting.EXTERNAL.value: ("<tool_response>\n", "\n", "<|im_end|>"),
-}
-
-
 def apply_tool_formatting(cfg: TrainingConfig) -> None:
-    """Set the boundary markers implied by ``cfg.data.tool_formatting`` (no-op if unset)."""
+    """Set the boundary markers implied by ``cfg.data.tool_formatting`` (no-op if unset).
+
+    Each mode fixes ``data.assistant_marker`` / ``adapter.last_context_token`` /
+    ``adapter.last_token`` (see ``tool_data.TOOL_FORMATTING_MARKERS``). Setting
+    any of them alongside ``tool_formatting`` is rejected rather than silently
+    overridden, so the mode is the single source of truth for the boundary.
+    """
     mode = cfg.data.tool_formatting
     if mode is None:
         return
-    marker, last_ctx, last_tok = _TOOL_FORMATTING_MARKERS[mode]
-    cfg.data.assistant_marker = marker
-    cfg.adapter.last_context_token = last_ctx
-    cfg.adapter.last_token = last_tok
+    markers = TOOL_FORMATTING_MARKERS[mode]
+    explicit = {
+        "data.assistant_marker": cfg.data.assistant_marker,
+        "adapter.last_context_token": cfg.adapter.last_context_token,
+        "adapter.last_token": cfg.adapter.last_token,
+    }
+    set_fields = {k: v for k, v in explicit.items() if v is not None}
+    if set_fields:
+        implied = dict(zip(explicit, markers))
+        detail = ", ".join(f"{k}={v!r} (mode implies {implied[k]!r})" for k, v in set_fields.items())
+        raise ValueError(
+            f"data.tool_formatting={mode!r} sets the boundary markers itself; remove "
+            f"{detail} from the config. See docs/tool_formatting.md."
+        )
+    cfg.data.assistant_marker = markers.assistant_marker
+    cfg.adapter.last_context_token = markers.last_context_token
+    cfg.adapter.last_token = markers.last_token
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -105,11 +113,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tool-formatting", dest="tool_formatting", nargs="?",
                    const=ToolFormatting.EXTERNAL.value, default=None,
                    choices=[m.value for m in ToolFormatting],
-                   help="Opt in to SR-adapter-as-tool training (data.tool_formatting). "
-                        "A bare flag selects external_tool_formatting (the adapter emits "
-                        "only the tool-response dict after an env-written "
-                        "'<tool_response>\\n'); autoregressive_tool_formatting has the "
-                        "adapter emit the whole tool-response turn after '</tool_call>'.")
+                   help="Opt in to SR-adapter-as-tool training (data.tool_formatting; "
+                        "Granite 4.2 only). A bare flag selects external_tool_formatting "
+                        "(the adapter emits only the tool-response payload after an "
+                        "env-written '<tool_response>\\n'); autoregressive_tool_formatting "
+                        "has the adapter emit the whole tool-response turn after "
+                        "'</tool_call>'. Either way the adapter stops before the "
+                        "assistant answer. See docs/tool_formatting.md.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", action="store_true",
                    help="Periodically log a decoded training example + labels from the collator. "
@@ -270,6 +280,7 @@ def _run_post_training_generation(
         gen_config=cfg.generation,
         data_path=cfg.generation.input_path,
         out_path=gen_out,
+        tool_formatting=cfg.data.tool_formatting,
     )
 
 
@@ -349,6 +360,9 @@ def main(argv: list[str] | None = None) -> int:
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
+    if cfg.data.tool_formatting is not None:
+        from shadow_residual.training.tool_data import check_tool_formatting_support
+        check_tool_formatting_support(tok, cfg.model.base)
 
     # 2. Resolve the two optional single-token markers (each must encode to
     # exactly one token id). They shape the data/labels and are recorded into
@@ -426,20 +440,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # 5. Datasets. last_token (when set) is appended to rows that don't already
     # end with it — done at the text level so both masking paths inherit it.
-    allow_prerendered = cfg.data.tool_formatting is not None
     train_ds = load_jsonl_dataset(
         cfg.data.train_path, tok,
         enable_thinking=cfg.data.enable_thinking,
         last_token=cfg.adapter.last_token,
         instruction_as_user_message=cfg.data.instruction_as_user_message,
-        allow_prerendered=allow_prerendered,
+        tool_formatting=cfg.data.tool_formatting,
     )
     val_ds = load_jsonl_dataset(
         cfg.data.val_path, tok,
         enable_thinking=cfg.data.enable_thinking,
         last_token=cfg.adapter.last_token,
         instruction_as_user_message=cfg.data.instruction_as_user_message,
-        allow_prerendered=allow_prerendered,
+        tool_formatting=cfg.data.tool_formatting,
     )
     logger.info("Train rows: %d, Val rows: %d", len(train_ds), len(val_ds))
 

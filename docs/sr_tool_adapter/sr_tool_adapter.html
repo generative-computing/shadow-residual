@@ -479,7 +479,7 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
 <div class="oneliner"><b>Bottom line.</b> The 3-message split is recoverable only if the switch runtime (a) keeps special tokens on decode and (b) deliberately re-segments on <code>&lt;|im_start|&gt;</code>. A naive OpenAI server collapses everything into one assistant message with the tool_response + answer stranded in <code>content</code>, markers stripped. The <b>runtime</b>, not the model, owns this.</div>
 
 <h2 id="results">11 &middot; Results: tool-adapter vs. plain</h2>
-<p>Two SR answerability adapters trained and evaluated on the same base, data, and scale, to compare the <b>adapter-as-tool</b> flow against the <b>plain</b> (label-only) flow. Base <code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>; data from <code>answerability_evaluation.jsonl</code> (gold = the <code>ground_truth</code> verdict); SR r32 on q/o/MLP + <code>cross_stream</code>, thinking off; free-generation greedy eval.</p>
+<p>Two SR answerability adapters trained and evaluated on the same base, data, and scale, to compare the <b>adapter-as-tool</b> flow against the <b>plain</b> (label-only) flow. Base <code>ibm-granite/granite-4.2-3b</code> (run on the pre-release checkpoint); data from <code>answerability_evaluation.jsonl</code> (gold = the <code>ground_truth</code> verdict); SR r32 on q/o/MLP + <code>cross_stream</code>, thinking off; free-generation greedy eval.</p>
 
 <div class="note"><b>Scale caveat.</b> These numbers are from the <b>flow-validation</b> run: 120 balanced train rows (60/60), 60 balanced val rows, 1 epoch, 15 optimizer steps, ~32&ndash;37&nbsp;min each on Apple&nbsp;MPS. Absolute numbers are indicative, not final &mdash; the prior full-scale answerability run (Vela GPU) reached ~0.89. A full-scale rerun (3191 train / 354 val, 2 epochs) is the current next lever.</div>
 
@@ -622,7 +622,7 @@ leave, taken any time within the first 12 months after the birth or adoption&hel
 
 <footer>
   Generated from <code>docs/sr_tool_adapter/SR_TOOL_ADAPTER_BOOTSTRAP.md</code> and <code>FINDINGS.md</code>.
-  Runs on Granite&nbsp;4.2-3b (<code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>), Apple&nbsp;MPS, 2026-10-19/20, branch <code>experiments/sr-tool-adapter</code>.
+  Runs on Granite&nbsp;4.2-3b (<code>ibm-granite/granite-4.2-3b</code>; run on the pre-release checkpoint), Apple&nbsp;MPS, 2026-10-19/20, branch <code>experiments/sr-tool-adapter</code>.
 </footer>
 
 </div>

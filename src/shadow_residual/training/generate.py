@@ -27,6 +27,11 @@ Output row shape (JSONL): the input row preserved verbatim, with one
 extra key ``generated_content`` holding the newly-generated text. A
 downstream scorer reads gold from ``ground_truth`` and prediction from
 ``generated_content``.
+
+Tool rows (``data.tool_formatting`` set, Granite 4.2 only): ``messages`` end
+with the trigger tool call (a trailing gold ``tool`` message is dropped), the
+prompt is the mode's handoff point, and ``generated_content`` is the
+tool-response payload the adapter emitted. See ``docs/tool_formatting.md``.
 """
 
 from __future__ import annotations
@@ -121,10 +126,12 @@ def _generate_batch(
     prompts: list[str],
     cfg_gen,
     debug_probability: float = 0.0,
+    skip_special_tokens: bool = True,
 ) -> list[str]:
     """Run model.generate on a list of pre-rendered prompt strings.
 
-    Returns the *newly generated* text only (prompt is sliced off).
+    Returns the *newly generated* text only (prompt is sliced off), decoded
+    with ``skip_special_tokens`` (tool rows keep them to find the payload).
 
     When ``debug_probability > 0``, periodically logs a decoded prompt +
     generated text for one example in the batch — mirrors
@@ -166,7 +173,7 @@ def _generate_batch(
     predictions: list[str] = []
     for i in range(out.shape[0]):
         new_tokens = out[i, padded_prompt_len:]
-        text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        text = tokenizer.decode(new_tokens, skip_special_tokens=skip_special_tokens)
         predictions.append(text)
 
     if debug_probability > 0.0 and random.random() < debug_probability:
@@ -197,6 +204,7 @@ def run_generation(
     data_path: str | Path,
     out_path: str | Path,
     limit: int | None = None,
+    tool_formatting: str | None = None,
 ) -> int:
     """Run generation given an already-loaded model + tokenizer.
 
@@ -216,6 +224,10 @@ def run_generation(
             input row preserved verbatim with one extra
             ``generated_content`` key.
         limit: optional cap on number of rows.
+        tool_formatting: ``data.tool_formatting`` mode the adapter was trained
+            in (Granite 4.2 only). Each row is rendered up to the mode's handoff
+            point (:func:`tool_data.render_tool_prompt`) and
+            ``generated_content`` holds the extracted tool-response payload.
 
     Returns:
         Number of predictions written.
@@ -246,20 +258,33 @@ def run_generation(
             )
 
         prompts: list[str] = []
-        for row in rows:
-            # Eval rows are expected to NOT include a trailing gold-answer
-            # assistant turn — the gold lives in a separate ``ground_truth``
-            # field if present (read by the scorer). ``messages`` is
-            # rendered as-is here; ``add_generation_prompt=True`` appends
-            # the empty assistant role-tag so the model fills in what
-            # comes next.
-            prompts.append(tokenizer.apply_chat_template(
-                row["messages"],
-                tools=row.get("tools"),
-                documents=row.get("documents"),
-                tokenize=False,
-                add_generation_prompt=True,
-            ))
+        if tool_formatting is not None:
+            from shadow_residual.training.tool_data import (
+                check_tool_formatting_support,
+                extract_tool_payload,
+                render_tool_prompt,
+            )
+            check_tool_formatting_support(tokenizer, getattr(tokenizer, "name_or_path", "tokenizer"))
+            for row in rows:
+                prompts.append(render_tool_prompt(
+                    tokenizer, row["messages"], tools=row.get("tools"),
+                    documents=row.get("documents"), mode=tool_formatting,
+                ))
+        else:
+            for row in rows:
+                # Eval rows are expected to NOT include a trailing gold-answer
+                # assistant turn — the gold lives in a separate ``ground_truth``
+                # field if present (read by the scorer). ``messages`` is
+                # rendered as-is here; ``add_generation_prompt=True`` appends
+                # the empty assistant role-tag so the model fills in what
+                # comes next.
+                prompts.append(tokenizer.apply_chat_template(
+                    row["messages"],
+                    tools=row.get("tools"),
+                    documents=row.get("documents"),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ))
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         bs = gen_config.batch_size
@@ -281,6 +306,7 @@ def run_generation(
                         batch_predictions = _generate_batch(
                             model, tokenizer, batch_prompts, gen_config,
                             debug_probability=getattr(gen_config, "debug_probability", 0.0),
+                            skip_special_tokens=tool_formatting is None,
                         )
                     except torch.cuda.OutOfMemoryError:
                         if bs == 1:
@@ -299,6 +325,8 @@ def run_generation(
                         row_idx = i + j
                         # Preserve the input row verbatim, append the new key.
                         out_row = dict(rows[row_idx])
+                        if tool_formatting is not None:
+                            pred = extract_tool_payload(pred, tool_formatting)
                         out_row["generated_content"] = pred
                         f.write(json.dumps(out_row) + "\n")
                         n_done += 1
@@ -619,6 +647,7 @@ def run_generation_under_fsdp(
                 data_path=data_path,
                 out_path=out_path,
                 limit=limit,
+                tool_formatting=cfg.data.tool_formatting,
             )
             _cuda_mem_snapshot("rank0/after-generation", device=0)
         except Exception:
@@ -674,7 +703,13 @@ def main(argv: list[str] | None = None) -> int:
     from shadow_residual.shadow_residual.build import build_sr_base
     from shadow_residual.training.generation_utils import (
         read_share_moe_routing_from_adapter,
+        read_tool_formatting_from_adapter,
     )
+
+    # The adapter's recorded mode wins: it is how the adapter was trained.
+    tool_formatting = read_tool_formatting_from_adapter(str(checkpoint_path)) or cfg.data.tool_formatting
+    if tool_formatting is not None:
+        logger.info("Tool formatting: %s", tool_formatting)
 
     # Load tokenizer (prefer the one saved next to the adapter; some adapters
     # carry tokenizer changes worth preserving).
@@ -713,6 +748,7 @@ def main(argv: list[str] | None = None) -> int:
         data_path=data_path,
         out_path=out_path,
         limit=args.limit,
+        tool_formatting=tool_formatting,
     )
     return 0
 

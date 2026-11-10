@@ -107,7 +107,7 @@
 <h2>2 &middot; How they were trained</h2>
 <p>Both used the same recipe, so only the formatting differs:</p>
 <ul>
-  <li><b>Base model:</b> <code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>.</li>
+  <li><b>Base model:</b> Granite 4.2-3b, <code>ibm-granite/granite-4.2-3b</code> (run on the pre-release checkpoint, which has an identical tokenizer and template).</li>
   <li><b>Adapter:</b> SR r32 on q/o and the MLP projections plus <code>cross_stream</code>, thinking off.</li>
   <li><b>Compute:</b> 2 epochs (750 optimizer steps) on 4 GPUs (DDP) on Vela.</li>
   <li><b>Data:</b> generated inside the job from <code>unified_compare/data_v4</code>, 11,978 training rows and 1,350 held-out rows. The gold verdict is each row's final assistant turn.</li>
@@ -158,44 +158,57 @@
 <p>All three land at 0.94&ndash;0.95: wrapping answerability in the tool protocol costs essentially no accuracy.</p>
 <p class="muted">The held-out losses differ in scale because of what each mode supervises. Autoregressive trains on its whole turn, which is mostly fixed template tokens that are easy to predict. External trains on only the ~7-token dict, where the uncertain verdict token makes up a larger share. The free-generation scores are the comparable numbers.</p>
 
-<h2>5 &middot; Three more adapters (external mode) <span class="pending">pending</span></h2>
-<p>The same external approach applied to the other three intrinsics of the adapter benchmark. Unlike answerability above, these are scored on the <b>benchmark's own eval sets</b> with its <b>own scorers</b>, so they compare directly with the benchmark's LoRA, aLoRA and SR columns.</p>
+<h2>5 &middot; All four adapters <span class="pending">partly pending</span></h2>
+<p>Both tool modes across all four intrinsics of the adapter benchmark, next to the benchmark's own columns and the plain SR adapters trained on Vela on 2026-11-10. Answerability's tool adapters are done. The other three intrinsics have no tool adapters yet, in either mode.</p>
+
+<h3>All results in one table</h3>
+<table>
+  <tr><th rowspan="2">Intrinsic (headline metric)</th><th rowspan="2">Eval rows</th><th colspan="3">Benchmark, granite-switch (v3)</th><th rowspan="2">Plain SR, retrained</th><th colspan="2">SR as a tool</th></tr>
+  <tr><th>LoRA</th><th>aLoRA</th><th>SR</th><th>Autoregressive</th><th>External</th></tr>
+  <tr><td>answerability (accuracy)</td><td class="num">3,565</td><td class="num">0.8449</td><td class="num">0.8174</td><td class="num">0.6334</td><td class="num">0.9444&nbsp;&#8224;</td><td class="num">0.95&nbsp;&#8224;</td><td class="num">0.9541&nbsp;&#8224;</td></tr>
+  <tr><td>guardian_core (accuracy)</td><td class="num">11,347</td><td class="num">0.8128</td><td class="num">0.7998</td><td class="num">0.8016</td><td class="num">0.8024</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
+  <tr><td>query_clarification (overall accuracy)</td><td class="num">279</td><td class="num">0.9211</td><td class="num">0.9176</td><td class="num">0.9283</td><td class="num">0.9247</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
+  <tr><td>requirement_check (balanced accuracy)</td><td class="num">2,409</td><td class="num">0.6822</td><td class="num">0.6748</td><td class="num">0.6557</td><td class="num">0.6490</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
+</table>
+<ul class="muted">
+  <li><b>Benchmark columns:</b> the latest full run on Granite&nbsp;4.2-3b (bench v3, granite-switch commit <code>a3d43fd</code>, 2026-10-22, all rows), served through granite-switch on vLLM.</li>
+  <li><b>Plain SR, retrained:</b> the <code>antonp-sra-vanilla-*</code> jobs (2026-11-10). Plain SR config, no tool. Guardian, query clarification and requirement check were scored on the full benchmark eval sets with the benchmark's scorer (0 parse failures / 0 invalid).</li>
+  <li><b>&#8224; Different eval set.</b> The marked answerability numbers are on the <code>data_v4</code> held-out split (1,350 rows; 500 for autoregressive) and were scored by <code>eval_tool_adapter.py</code>. They compare with each other, not with the 3,565-row benchmark columns in the same row. Scoring the two answerability tool adapters on the benchmark set needs only a scoring job; both checkpoints are on COS.</li>
+  <li><b>Pending:</b> tool adapters for guardian, query clarification and requirement check, in both modes. They need training on Vela; the code for external mode is ready, autoregressive still needs adding.</li>
+</ul>
 
 <h3>What changes per adapter</h3>
-<p>The base calls the tool with the intrinsic's instruction as its argument, taken out of the <code>&lt;guardian&gt;</code> / <code>&lt;requirements&gt;</code> user turn. The adapter writes exactly the dict its scorer parses.</p>
+<p>The base calls the tool with the intrinsic's instruction as its argument, taken out of the <code>&lt;guardian&gt;</code> / <code>&lt;requirements&gt;</code> user turn. Its output is what the scorer parses: the dict alone in external mode, or the dict wrapped in the <code>&lt;tool_response&gt;</code> turn in autoregressive mode.</p>
 <table>
-  <tr><th>Intrinsic</th><th>Tool call arguments</th><th>Adapter writes</th><th>Training data (train / val)</th></tr>
+  <tr><th>Intrinsic</th><th>Tool call arguments</th><th>Dict the scorer reads</th><th>Training data (train / val)</th></tr>
+  <tr><td>answerability</td><td><code>question</code>; documents as a tool message</td><td><code>{"answerable": true|false}</code></td><td class="num">unified-compare data_v4: 11,978 / 1,350</td></tr>
   <tr><td>guardian_core</td><td><code>criteria</code>, <code>target</code> (last <code>user</code> or <code>assistant</code> turn)</td><td><code>{"score": "yes"|"no"}</code></td><td class="num">guardian-ood-12k: 12,000 / 577</td></tr>
   <tr><td>requirement_check</td><td><code>requirements</code></td><td><code>{"score": "yes"|"no"}</code></td><td class="num">core-library-train-v2: 11,882 / 500</td></tr>
   <tr><td>query_clarification</td><td><code>query</code> (the user's last turn); documents as a tool message</td><td><code>{"clarification": "CLEAR"|&lt;question&gt;}</code></td><td class="num">unified-compare-data-v4: 2,153 / 240</td></tr>
 </table>
 <p class="muted">Each row is checked against the stock 4.2 template: with the environment's closing text appended, it is byte-identical (<code>tests/training/test_tool_intrinsics.py</code>). Training: same SR recipe as answerability, 2 epochs, 4 GPUs on Vela, <code>--max-length 12288</code>. Some query-clarification rows reach 11k tokens and would otherwise be cut, losing their labels.</p>
 
-<h3>How they are evaluated</h3>
+<h3>How the tool cells are evaluated</h3>
 <ul>
   <li><b>Rows:</b> every row of the benchmark's eval set for that intrinsic (<code>adapter-bench/granite-4.2-3b/v1/eval/</code>).</li>
-  <li><b>Prompt:</b> built by the same code as training, cut after <code>&lt;tool_response&gt;\n</code>. Greedy decoding in bf16, stopping on <code>&lt;|im_end|&gt;</code>.</li>
-  <li><b>Score:</b> the harness's own scorer and headline metric. The scorer code is byte-identical to the harness copy on COS.</li>
+  <li><b>Prompt:</b> built by the same code as training. External mode cuts it after <code>&lt;tool_response&gt;\n</code>, autoregressive mode after <code>&lt;/tool_call&gt;</code>. Greedy decoding in bf16, stopping on <code>&lt;|im_end|&gt;</code>.</li>
+  <li><b>Score:</b> the benchmark harness's own scorer and headline metric, run on the dict the adapter wrote. Its code is byte-identical to the harness copy on COS.</li>
   <li><b>Runs on Vela:</b> scoring is a separate single-GPU step after training.</li>
 </ul>
 
-<h3>Results</h3>
+<h3>Per-cell details, once run</h3>
 <table>
-  <tr><th>Intrinsic (headline metric)</th><th>Eval rows</th><th>LoRA</th><th>aLoRA</th><th>SR</th><th>SR as tool, external</th></tr>
-  <tr><td>guardian_core (accuracy)</td><td class="num">11,347</td><td class="num">0.8128</td><td class="num">0.7998</td><td class="num">0.8016</td><td><span class="pending">pending</span></td></tr>
-  <tr><td>query_clarification (overall accuracy)</td><td class="num">279</td><td class="num">0.9211</td><td class="num">0.9176</td><td class="num">0.9283</td><td><span class="pending">pending</span></td></tr>
-  <tr><td>requirement_check (balanced accuracy)</td><td class="num">2,409</td><td class="num">0.6822</td><td class="num">0.6748</td><td class="num">0.6557</td><td><span class="pending">pending</span></td></tr>
+  <tr><th>Intrinsic</th><th>Mode</th><th>Invalid outputs</th><th>Stopped on EOS</th><th>Held-out loss, epoch 1 &rarr; 2</th><th>Vela job</th></tr>
+  <tr class="ours"><td>answerability &#8224;</td><td>autoregressive</td><td class="num">0 / 500</td><td>&mdash; (consistency 1.00)</td><td class="num">0.00596 &rarr; 0.00516</td><td><code>antonp-sr-tooladapter-42-3b</code>, scored by <code>antonp-sr-eval-both-42-3b</code></td></tr>
+  <tr class="ours"><td>answerability &#8224;</td><td>external</td><td class="num">0 / 1,350</td><td class="num">1.00</td><td class="num">0.0191 &rarr; 0.0167</td><td><code>antonp-sr-tooladapter-ext-42-3b</code></td></tr>
+  <tr class="ours"><td>guardian_core</td><td>autoregressive</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">not submitted</span></td></tr>
+  <tr class="ours"><td>guardian_core</td><td>external</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">not submitted</span></td></tr>
+  <tr class="ours"><td>query_clarification</td><td>autoregressive</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">not submitted</span></td></tr>
+  <tr class="ours"><td>query_clarification</td><td>external</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">not submitted</span></td></tr>
+  <tr class="ours"><td>requirement_check</td><td>autoregressive</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">not submitted</span></td></tr>
+  <tr class="ours"><td>requirement_check</td><td>external</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">not submitted</span></td></tr>
 </table>
-<p class="muted">LoRA, aLoRA and SR come from the latest full benchmark run on Granite&nbsp;4.2-3b (bench v3, granite-switch commit <code>a3d43fd</code>, 2026-10-22, all rows). Those columns are served through granite-switch with vLLM. The new column is scored with HF&nbsp;+&nbsp;PEFT, on the same rows with the same scorer.</p>
-
-<table>
-  <tr><th>Per adapter, once run</th><th>guardian_core</th><th>query_clarification</th><th>requirement_check</th></tr>
-  <tr class="ours"><td>Headline score</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
-  <tr class="ours"><td>Parse failures / invalid outputs</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
-  <tr class="ours"><td>EOS stop rate</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
-  <tr class="ours"><td>Held-out loss, epoch 1 &rarr; 2</td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td><td><span class="pending">pending</span></td></tr>
-  <tr class="ours"><td>Vela job</td><td><span class="pending">not submitted</span></td><td><span class="pending">not submitted</span></td><td><span class="pending">not submitted</span></td></tr>
-</table>
+<p class="muted">&#8224; Answerability details are from section&nbsp;4, on the <code>data_v4</code> held-out split.</p>
 
 <h2>6 &middot; Reading the numbers</h2>
 <div class="note"><b>Tied on accuracy and structure.</b> 0.95 and 0.954 are within one or two errors of each other for these sample sizes. External is the default for its other properties: the adapter learns only the payload, the transcript is stock ChatML, and it stops cleanly on EOS.</div>

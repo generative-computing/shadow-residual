@@ -165,6 +165,78 @@ def test_tool_formatting_rejects_unknown_mode(config_path):
         _build_parser().parse_args(["--config", str(config_path), "--tool-formatting", "bogus"])
 
 
+@pytest.mark.parametrize("section, field, value", [
+    ("data", "assistant_marker", "<|im_start|>assistant\n"),
+    ("adapter", "last_context_token", "</think>"),
+    ("adapter", "last_token", "<|im_end|>"),
+])
+def test_tool_formatting_rejects_explicit_markers(config_path, section, field, value):
+    """Any explicitly set marker conflicts with the mode, even one equal to the
+    implied value, and the error names the field and the implied value."""
+    cfg = load_training_config(config_path)
+    setattr(getattr(cfg, section), field, value)
+    args = _build_parser().parse_args(["--config", str(config_path), "--tool-formatting"])
+    apply_cli_overrides(cfg, args)
+    with pytest.raises(ValueError, match=rf"{section}\.{field}=.*mode implies") as exc:
+        apply_tool_formatting(cfg)
+    assert "external_tool_formatting" in str(exc.value)
+    assert "docs/tool_formatting.md" in str(exc.value)
+
+
+@pytest.fixture
+def no_model_build(monkeypatch):
+    """Fail the test if train.main gets as far as building the model."""
+    from shadow_residual.training import factory
+
+    def _boom(**kw):
+        raise AssertionError("train.main built the model before rejecting the config")
+
+    monkeypatch.setattr(factory, "get_shadow_residual_peft_model", _boom)
+
+
+def _tool_cfg(tmp_path: Path, base: str, **data) -> Path:
+    p = tmp_path / "tool.yaml"
+    p.write_text(yaml.safe_dump({
+        "model": {"base": base},
+        "data": {"train_path": str(tmp_path / "t.jsonl"), "val_path": str(tmp_path / "t.jsonl"),
+                 "tool_formatting": "external_tool_formatting", **data},
+        "adapter": {"target_modules": {"q_proj": 8, "cross_stream": 8}},
+        "save": {"output_dir": str(tmp_path / "out")},
+    }))
+    return p
+
+
+def test_main_rejects_non_g42_base_before_model_build(tmp_path, no_model_build):
+    pytest.importorskip("trl")
+    from transformers import AutoTokenizer
+    from shadow_residual.training.train import main
+
+    base = "ibm-granite/granite-4.1-3b"
+    try:
+        AutoTokenizer.from_pretrained(base)
+    except Exception as e:  # pragma: no cover - environment dependent
+        pytest.skip(f"{base} tokenizer unavailable: {e}")
+    with pytest.raises(ValueError, match=r"requires a Granite 4\.2 base model.*granite-4\.1-3b"):
+        main(["--config", str(_tool_cfg(tmp_path, base))])
+
+
+def test_main_rejects_explicit_marker_before_loading_anything(tmp_path, no_model_build):
+    from shadow_residual.training.train import main
+
+    cfg = _tool_cfg(tmp_path, "does-not-exist/never-loaded", assistant_marker="<|im_start|>assistant\n")
+    with pytest.raises(ValueError, match=r"data\.assistant_marker=.*mode implies '<tool_response>\\n'"):
+        main(["--config", str(cfg)])
+
+
+def test_explicit_markers_allowed_without_tool_formatting(config_path):
+    cfg = load_training_config(config_path)
+    cfg.data.assistant_marker = "<|im_start|>assistant\n"
+    cfg.adapter.last_context_token = "\n"
+    apply_tool_formatting(cfg)
+    assert cfg.data.assistant_marker == "<|im_start|>assistant\n"
+    assert cfg.adapter.last_context_token == "\n"
+
+
 def test_quantize_flag_does_not_touch_config(config_path):
     """--quantize is consumed inside main(), not by apply_cli_overrides."""
     cfg = load_training_config(config_path)

@@ -27,8 +27,19 @@ Target base: **Granite 4.2** (ChatML template, `<|im_start|>` / `<|im_end|>`,
   describe this mode, which came first.
 
 Tool training is **opt-in for the repo**: with `tool_formatting` unset (every
-config except `sr-tool-adapter-answerability-g42.yaml`) training is standard chat
-SFT and pre-rendered `{"text"}` rows are rejected.
+config except `sr-tool-g42.yaml`) training is standard chat SFT.
+
+> **Superseded implementation notes.** This is the experiment's design log. The
+> shipped implementation is documented in [`docs/tool_formatting.md`](../tool_formatting.md).
+> Where they differ, that doc wins. In particular:
+> - The adapter **does not write the assistant answer** in either mode. In
+>   autoregressive mode it emits the tool-response turn and stops on its
+>   `<|im_end|>`; the base (or another adapter) writes the answer.
+> - Rows are no longer pre-rendered `{"text"}`. They are `messages` + `tools`
+>   rows ending with the trigger call and the gold `tool` message, built with
+>   `python -m shadow_residual.training.tool_data` and rendered by the trainer.
+> - The base model is `ibm-granite/granite-4.2-3b`. The runs below used the
+>   pre-release checkpoint, which has an identical tokenizer and template.
 
 ---
 
@@ -418,8 +429,8 @@ generation (up to EOS) to parse as a dict with a boolean `answerable`, and repor
 ### First run result (2026-10-19, Granite 4.2-3b, local MPS)
 
 `runs/tool_adapter_g42_3b` — 120 balanced rows (60 ans / 60 un), 1 epoch, 15
-optimizer steps, ~39 min train on MPS. Base
-`ibm-research/granite-4.2-3b-prerelease-r260622a`.
+optimizer steps, ~39 min train on MPS. Base Granite 4.2-3b
+(`ibm-granite/granite-4.2-3b`; run on the pre-release checkpoint).
 
 - Train: `train_loss≈0.70` (avg), final-step `loss=0.281`,
   `mean_token_accuracy=0.946`. Held-out teacher-forced: `eval_loss=0.258`,
