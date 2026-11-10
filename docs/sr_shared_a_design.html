@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SR Shared-A / per-task-B multi-intrinsic training — design, implementation, results</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; max-width: 1080px; margin: 2em auto; padding: 0 1em; color: #1d1d1f; line-height: 1.5; }
+  h1 { font-size: 1.7em; border-bottom: 2px solid #333; padding-bottom: .3em; }
+  h2 { margin-top: 2em; border-bottom: 1px solid #ccc; padding-bottom: .2em; }
+  code, pre { background: #f4f4f6; border-radius: 4px; font-size: .92em; }
+  code { padding: .1em .3em; }
+  pre { padding: .8em 1em; overflow-x: auto; }
+  table { border-collapse: collapse; margin: 1em 0; }
+  th, td { border: 1px solid #ccc; padding: .35em .7em; text-align: left; vertical-align: top; }
+  th { background: #f0f0f3; }
+  .status { background: #fff7d6; border: 1px solid #e6c200; padding: .6em 1em; border-radius: 6px; }
+  .note { background: #eef6ff; border-left: 4px solid #3b82f6; padding: .5em 1em; }
+  .warn { background: #fff0f0; border-left: 4px solid #e11d48; padding: .5em 1em; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  svg text { font-family: inherit; }
+</style>
+</head>
+<body>
+
+<h1>Shadow Residual with a shared LoRA&nbsp;A and per-intrinsic B</h1>
+
+<p class="status"><b>Status:</b> <span id="status">implemented and tested (8 CPU tests incl. exact routed≡exported equivalence; GPU smoke on the real 4.2 tokenizer); training jobs being launched.</span>
+Branch <code>feature/different-arch</code>. Owner: Claude session <code>3a884bc0</code>.
+Last update: 2026-11-10.</p>
+
+<h2>1. The idea</h2>
+<p>Today every intrinsic adapter (answerability, guardian_core, query_clarification,
+requirement_check) is a separate SR adapter: per layer and per target module it owns a full
+LoRA pair <code>(A<sub>t</sub>, B<sub>t</sub>)</code>. The idea under test:</p>
+<blockquote><b>Train one A matrix per (layer, module) that is shared by all 4 adapters, and
+give each adapter only its own ("proprietary") B matrix.</b></blockquote>
+<p>For a target module <code>W</code> (q_proj, o_proj, gate/up/down_proj, cross_stream) of task
+<code>t</code>:</p>
+<pre>
+vanilla SR   :  Δ_t(x) = (α/r) · B_t · A_t · x          A_t ∈ R^{r×in},  B_t ∈ R^{out×r}
+shared-A SR  :  Δ_t(x) = (α/r) · B_t · A   · x          A shared across t ∈ {ans, guard, qc, req}
+</pre>
+<p>A is the "down-projection / feature extractor" (which r directions of the input to read);
+B is the "up-projection / writer" (what to do with them). Prior work found the two
+asymmetric: A matrices are largely task-agnostic input feature extractors while B carries the
+task-specific signal (Zhu et&nbsp;al. 2024, <i>Asymmetry in Low-Rank Adapters of Foundation
+Models</i>), and HydraLoRA (NeurIPS'24) shares one A across several B heads for multi-domain
+tuning. This experiment asks the question in the SR setting, on the four production intrinsics,
+with the adapter benchmark's own scorers.</p>
+
+<h3>What we hope to see</h3>
+<ul>
+  <li><b>Accuracy:</b> shared-A per-intrinsic accuracy within noise of (or above) vanilla SR. A
+  could even help the small task (query_clarification, 2&nbsp;153 rows) by borrowing features
+  learned on the 3 large ones.</li>
+  <li><b>Parameters:</b> 4 vanilla SR adapters = 4 × 60.95M = 243.8M trainable; shared-A =
+  40 layers × (A 671&nbsp;744 + 4 × B 851&nbsp;968) = <b>163.2M (−33%)</b>.</li>
+  <li><b>Serving:</b> with a common A, a multi-intrinsic request computes <code>z = A·x</code>
+  once per module and only the cheap <code>B_t·z</code> per intrinsic (the SR adapter stream is
+  otherwise a second full forward per adapter; sharing A is the first step toward amortizing
+  it).</li>
+</ul>
+
+<h2>2. Where it sits in SR</h2>
+<svg width="1000" height="300" viewBox="0 0 1000 300" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#555"/></marker></defs>
+  <rect x="20" y="30" width="220" height="230" rx="10" fill="#e8f0fe" stroke="#3b82f6"/>
+  <text x="130" y="55" text-anchor="middle" font-weight="bold">frozen base stream</text>
+  <text x="130" y="85" text-anchor="middle" font-size="13">attn (shared base K/V)</text>
+  <text x="130" y="110" text-anchor="middle" font-size="13">MLP (base_layer only)</text>
+  <text x="130" y="140" text-anchor="middle" font-size="13">h_base — bit-exact base</text>
+  <text x="130" y="200" text-anchor="middle" font-size="12" fill="#555">unchanged by this design</text>
+
+  <rect x="290" y="30" width="250" height="230" rx="10" fill="#fef3e8" stroke="#f59e0b"/>
+  <text x="415" y="55" text-anchor="middle" font-weight="bold">adapter stream (per layer)</text>
+  <text x="415" y="85" text-anchor="middle" font-size="13">q_proj, o_proj  (+Δ_t)</text>
+  <text x="415" y="110" text-anchor="middle" font-size="13">gate/up/down_proj  (+Δ_t)</text>
+  <text x="415" y="135" text-anchor="middle" font-size="13">h_adapt += cross_stream(h_base) (Δ_t)</text>
+  <text x="415" y="200" text-anchor="middle" font-size="12" fill="#555">every Δ_t is (α/r)·B_t·A·x</text>
+  <line x1="240" y1="135" x2="290" y2="135" stroke="#555" marker-end="url(#ar)"/>
+
+  <rect x="600" y="30" width="380" height="230" rx="10" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="790" y="55" text-anchor="middle" font-weight="bold">one target module, 4 intrinsics</text>
+  <rect x="630" y="120" width="70" height="60" fill="#fff" stroke="#16a34a"/>
+  <text x="665" y="155" text-anchor="middle">A</text>
+  <text x="665" y="200" text-anchor="middle" font-size="11">shared r×in</text>
+  <text x="615" y="155" text-anchor="end" font-size="13">x</text>
+  <g font-size="12">
+    <rect x="770" y="70" width="90" height="28" fill="#fff" stroke="#999"/><text x="815" y="89" text-anchor="middle">B_ans</text>
+    <rect x="770" y="110" width="90" height="28" fill="#fff" stroke="#999"/><text x="815" y="129" text-anchor="middle">B_guard</text>
+    <rect x="770" y="150" width="90" height="28" fill="#fff" stroke="#999"/><text x="815" y="169" text-anchor="middle">B_qc</text>
+    <rect x="770" y="190" width="90" height="28" fill="#fff" stroke="#999"/><text x="815" y="209" text-anchor="middle">B_req</text>
+  </g>
+  <line x1="700" y1="150" x2="770" y2="84" stroke="#555" marker-end="url(#ar)"/>
+  <line x1="700" y1="150" x2="770" y2="124" stroke="#555" marker-end="url(#ar)"/>
+  <line x1="700" y1="150" x2="770" y2="164" stroke="#555" marker-end="url(#ar)"/>
+  <line x1="700" y1="150" x2="770" y2="204" stroke="#555" marker-end="url(#ar)"/>
+  <text x="900" y="145" font-size="12">row of task t</text>
+  <text x="900" y="162" font-size="12">uses B_t only</text>
+</svg>
+
+<p>Every SR invariant is untouched: the base stream still runs <code>base_layer</code> only,
+K/V are base-only and shared, and with no adapter attached the model runs
+<code>forward_bare</code>. The change is entirely in how the LoRA deltas are parameterized and
+trained.</p>
+
+<h2>3. Training design</h2>
+<h3>3.1 Joint multi-task training</h3>
+<p>A shared A has to be learned from all four tasks at once, so the four datasets are trained
+<b>jointly in one job</b>: the union of the 4 training sets, shuffled together, with every row
+tagged by its task id. Each row's LoRA deltas use the shared A and <b>its own task's B</b>
+(per-row routing inside a mixed batch). B<sub>t</sub> therefore only receives gradient from
+task-t rows; A receives the sum of all four.</p>
+
+<h3>3.2 Implementation with stock PEFT (export = 4 ordinary SR adapters)</h3>
+<ol>
+  <li>Build the SR PEFT model as today (<code>get_shadow_residual_peft_model</code>) with
+  adapter name <code>answerability</code>, then <code>add_adapter</code> the other three with the
+  identical <code>LoraConfig</code>.</li>
+  <li><b>Tie A:</b> in every LoRA layer, <code>lora_A[t] = lora_A[t0]</code> — the same
+  <code>nn.Linear</code> object under four adapter names. <code>parameters()</code> de-duplicates,
+  so the optimizer and DDP see A once; <code>state_dict()</code> lists it under every adapter
+  name, so per-adapter saving still works.</li>
+  <li><b>Per-row routing (training only):</b> each LoRA layer's <code>forward</code> is replaced on
+  the instance by a routed version:
+  <pre>z     = A(dropout(x))                       # once, shared
+delta = Σ_t  route[:, t] · (α/r) · B_t(z)        # route = one-hot task of each row
+out   = base_layer(x) + delta</pre>
+  The one-hot route is set by the trainer from the batch's <code>task_ids</code> just before the
+  forward and read again on the gradient-checkpoint recompute (unchanged in between, so the
+  recompute stays exact). All four B<sub>t</sub> stay in the autograd graph every step (rows of
+  other tasks multiply them by exactly 0), so DDP with <code>find_unused_parameters=False</code>
+  works and absent tasks get an exact-zero gradient. Extra compute is 4× the B projection only
+  (≈2% of a layer).</li>
+  <li><b>Export:</b> the trainer's ordinary <code>save_model</code> → PEFT
+  <code>save_pretrained</code> writes every non-default adapter to
+  <code>out/&lt;t&gt;/adapter_config.json + adapter_model.safetensors</code> — a completely stock SR
+  adapter whose <code>lora_A</code> tensors are byte-identical across the four exports.
+  Each loads with the standard path
+  (<code>build_sr_base</code> + <code>PeftModel.from_pretrained</code>), so the benchmark's HF+PEFT
+  reference code evaluates it with no change.</li>
+</ol>
+
+<h3>3.3 Hyper-parameters (matched to the benchmark's SR recipe)</h3>
+<table>
+<tr><th></th><th>vanilla SR (×4 jobs)</th><th>shared-A SR (1 job)</th></tr>
+<tr><td>base</td><td colspan="2">granite-4.2-3b-prerelease-r260622a (<code>/danieloh_cos/antonp_hf_cache/…</code>)</td></tr>
+<tr><td>targets / rank / α</td><td colspan="2">q,o,gate,up,down + cross_stream; r=32 everywhere; α=64; dropout 0.05 (config <code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code>)</td></tr>
+<tr><td>data</td><td>one intrinsic</td><td>union of the 4 intrinsics (38&nbsp;014 rows)</td></tr>
+<tr><td>batch</td><td colspan="2">2/device × grad-accum 4 × 4 GPUs (DDP) = 32</td></tr>
+<tr><td>optimizer</td><td colspan="2">AdamW lr 2e-4, wd 0.01, cosine, warmup 5%, bf16, 2 epochs, seed 2, grad checkpointing</td></tr>
+<tr><td>steps</td><td>ans 750 · guard 750 · qc 136 · req 744</td><td>≈2&nbsp;376</td></tr>
+</table>
+<p>Every row is seen exactly twice in both arms, so each B<sub>t</sub> sees the same examples as
+its vanilla counterpart.</p>
+
+<h3>3.4 Data (identical for both arms, identical to the benchmark's prompts)</h3>
+<table>
+<tr><th>intrinsic</th><th>training set (adapter-bench COS)</th><th>train / val</th><th>documents</th></tr>
+<tr><td>answerability</td><td><code>datasets/train/answerability/g42-alora-4.1-split</code></td><td>11&nbsp;979 / 1&nbsp;351</td><td>tool turns → rebuilt <code>{document_id: i, content}</code></td></tr>
+<tr><td>guardian_core</td><td><code>datasets/train/guardian_core/guardian-ood-12k</code></td><td>12&nbsp;000 / 577</td><td>none</td></tr>
+<tr><td>query_clarification</td><td><code>datasets/train/query_clarification/unified-compare-data-v4</code></td><td>2&nbsp;153 / 240</td><td>top-level <code>documents</code></td></tr>
+<tr><td>requirement_check</td><td><code>datasets/train/requirement_check/core-library-train-v2</code></td><td>11&nbsp;882 / 500</td><td>none</td></tr>
+</table>
+<p>Rows are pre-rendered with the benchmark's own <code>prompts.with_documents(…,
+"tool_json_after_question")</code> (the style <code>adapters.yaml</code> uses for SR on 4.2), after
+splitting document turns exactly as <code>adapter_bench/train/render.py</code> does. So the
+training prompt prefix is byte-identical to the eval prompt
+(<code>…&lt;|im_start|&gt;assistant\n&lt;think&gt;&lt;/think&gt;</code>; verified on the 4.2
+tokenizer) and the supervised span is the label plus <code>&lt;|im_end|&gt;</code>.</p>
+
+<h2>4. Evaluation (both arms, identical code)</h2>
+<ul>
+  <li>Generation: the benchmark's <code>benchmarks/adapter_eval/hf_generate.py</code> (HF + PEFT
+  reference path, <code>column=sr</code>), harness commit <code>2506b7c</code> of
+  <code>granite-switch@feature/adapter-benchmark</code>, copied unmodified to COS. Greedy, bf16,
+  <code>enable_thinking=false</code>, documents <code>tool_json_after_question</code>,
+  max_new_tokens 200 / 24 / 160 / 200 (ans / guard / qc / req), max_model_len 32768.</li>
+  <li>Eval sets: <code>adapter-bench/granite-4.2-3b/v1/eval/&lt;intrinsic&gt;/evaluation.jsonl</code>
+  (3&nbsp;565 / 11&nbsp;347 / 279 / 2&nbsp;409 rows).</li>
+  <li>Scoring: the benchmark's own scorers (<code>scorers/answerability.py</code>, <code>guardian.py</code>,
+  <code>query_clarification.py</code>, <code>requirements.py</code>), headline metrics accuracy /
+  accuracy (mean over ood_safety datasets) / overall_accuracy / balanced_accuracy.</li>
+</ul>
+
+<h3>Published reference points (benchmark HF+PEFT reference run 20261011T193236Z)</h3>
+<table>
+<tr><th>intrinsic (headline)</th><th>base</th><th>LoRA r16</th><th>aLoRA r32</th><th>SR staged in bench v1</th></tr>
+<tr><td>answerability (acc)</td><td class="num">73.83</td><td class="num">84.40</td><td class="num">81.80</td><td class="num">63.39*</td></tr>
+<tr><td>guardian_core (acc)</td><td class="num">64.33</td><td class="num">81.33</td><td class="num">79.89</td><td class="num">80.20</td></tr>
+<tr><td>query_clarification (acc)</td><td class="num">30.11</td><td class="num">92.11</td><td class="num">91.76</td><td class="num">93.19</td></tr>
+<tr><td>requirement_check (bal. acc)</td><td class="num">54.76</td><td class="num">68.20</td><td class="num">67.78</td><td class="num">65.23</td></tr>
+</table>
+<p class="note">*The staged answerability SR is an older run (<code>sr-sharedkv-g42-3b-docs</code>,
+trained with aLoRA invocation tokens, different document format) — not comparable. The other three
+staged SR adapters were trained by <code>main@488f8e7</code> with exactly the recipe of §3.3, so
+our vanilla re-runs should land near them; that is the pipeline sanity check.</p>
+
+<h2>5. Results</h2>
+<p id="results-pending"><i>Pending — jobs not finished yet.</i></p>
+<table id="results">
+<tr><th>intrinsic (headline)</th><th>vanilla SR (ours)</th><th>shared-A SR</th><th>Δ (shared − vanilla)</th></tr>
+<tr><td>answerability (acc)</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td>guardian_core (acc)</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td>query_clarification (acc)</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td>requirement_check (bal. acc)</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>
+</table>
+
+<h2>6. Risks and design caveats</h2>
+<ul>
+  <li><b>Adam on intermittently-present tasks.</b> In a mixed batch of 32 the small task (qc,
+  5.7% of rows) is present in ~85% of optimizer steps. When it is absent its B gets an exact-zero
+  gradient but AdamW still moves it (momentum, weight decay). B<sub>qc</sub> also takes ~2&nbsp;376
+  optimizer steps vs 136 in its vanilla run. This is inherent to joint training; it is the main
+  reason qc might move either way.</li>
+  <li><b>Token-mean loss across tasks.</b> The loss averages over supervised tokens of the
+  batch. qc labels (clarifying questions, tens of tokens) outweigh 5–7-token labels of the other
+  tasks per row; answerability is per-row the lightest. Same normalization as vanilla, but the
+  tasks now compete for A.</li>
+  <li><b>Interference through A.</b> A gets the summed gradient of 4 tasks; if their useful input
+  subspaces differ, r=32 shared directions may be too few. A follow-up would be a larger shared
+  rank (e.g. A r=64 with per-task B r=64, still fewer params than 4 vanilla).</li>
+  <li><b>Not a param-matched comparison per task:</b> each exported shared-A adapter has the
+  same shape (60.95M) as a vanilla one; the saving is across the family.</li>
+</ul>
+
+<h2>7. Implementation map</h2>
+<table>
+<tr><th>file</th><th>what</th></tr>
+<tr><td><code>src/shadow_residual/training/multitask.py</code></td><td>tie A across adapters, routed LoRA forward, task collator, trainer subclass, per-task export</td></tr>
+<tr><td><code>src/shadow_residual/training/train.py</code></td><td><code>--task NAME:TRAIN:VAL</code> (repeatable) shared-A mode; saves <code>&lt;out&gt;/&lt;NAME&gt;/</code> per task (PEFT's per-adapter subfolders; no <code>selected_adapters</code> loop needed)</td></tr>
+<tr><td><code>scripts/prepare_bench_sr_data.py</code></td><td>renders the 4 bench datasets into SR training rows with the bench's document placement</td></tr>
+<tr><td><code>scripts/bench_eval.py</code></td><td>runs the bench's <code>hf_generate</code> + scorer for one adapter/intrinsic</td></tr>
+<tr><td><code>tests/training/test_multitask.py</code></td><td>CPU tests: A tied, routed == per-adapter forward, export reload == routed, base-stream invariant</td></tr>
+</table>
+
+<h2>8. Coordination</h2>
+<p>This session also trains the 4 <b>vanilla SR</b> baselines (same data / recipe / eval) so the
+comparison is controlled. Session <code>8889d7da</code> (read-out-stream design) was told via
+<code>docs/coordination/vanilla_sr_baseline.md</code> on this branch not to re-train them; the
+results are posted there.</p>
+
+<h2>9. Issues log</h2>
+<ul id="issues">
+  <li>2026-11-10 — The benchmark's staged answerability SR adapter is from an older recipe
+  (aLoRA invocation tokens, 0.634 accuracy), so there is no usable published vanilla-SR answerability
+  number; our own vanilla run is the baseline.</li>
+  <li>2026-11-10 — The scoring harness is not in this repo or the internal repo; it is in
+  <code>granite-switch@feature/adapter-benchmark</code> (<code>benchmarks/adapter_eval</code>). Copied
+  unmodified to COS and run from there so scores are the benchmark's.</li>
+  <li>2026-11-10 — Vela <code>jobName</code> must be lowercase (helm template rejects
+  <code>sharedA</code>).</li>
+  <li>2026-11-10 — <b>Trainer drops unknown columns.</b> HF Trainer's <code>remove_unused_columns</code>
+  keeps only TRL's signature columns, so a <code>task_id</code> column vanishes before the collator.
+  Fixed by extending <code>_signature_columns</code> in the multi-task trainer subclass.</li>
+  <li>2026-11-10 — <b>Routed forward bypassed <code>disable_adapter()</code>.</b> The first version
+  ignored PEFT's <code>disable_adapters</code> flag, breaking invariant 3 (bare == base). Caught by
+  the test; the routed forward now returns <code>base_layer(x)</code> when adapters are disabled.</li>
+  <li>2026-11-10 — <b>Boundary validator vs. collator order.</b> <code>validate_last_context_token_boundary</code>
+  calls the collator with features lacking <code>task_id</code>, so the task-id collator wrapper is
+  installed after the check.</li>
+  <li>2026-11-10 — <b>Shared working tree.</b> Other sessions edit the same checkout
+  (e.g. an <code>adapter_stream</code> field in <code>train.py</code>/<code>factory.py</code>). The
+  shared-A commit was built in an isolated clone from <code>c1ca175</code> with only this
+  experiment's files and hunks, so no other session's work is pushed.</li>
+</ul>
+
+</body>
+</html>

@@ -76,6 +76,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Set data.instruction_as_user_message=True — inject RAG documents "
                         "before the first assistant turn (judge/guardian data) instead of "
                         "after the last user turn. ChatML (Granite 4.2) only.")
+    p.add_argument("--task", dest="tasks", action="append", default=None,
+                   metavar="NAME:TRAIN:VAL",
+                   help="Shared-A multi-task mode (repeat per task): one jointly trained LoRA A "
+                        "per module shared by all tasks, one B per task. Saves one stock SR "
+                        "adapter per task under <output-dir>/<NAME>/. Overrides "
+                        "--train-data/--val-data.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", action="store_true",
                    help="Periodically log a decoded training example + labels from the collator. "
@@ -341,13 +347,26 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Loading model %s (param_dtype=%s) ...", cfg.model.base, cfg.model.param_dtype)
     if cfg.model.attn_implementation:
         logger.info("Attention backend: %s", cfg.model.attn_implementation)
+    task_specs = None
+    task_router = None
+    if args.tasks:
+        from shadow_residual.training.multitask import parse_task_specs, setup_shared_a
+        task_specs = parse_task_specs(args.tasks)
+        if os.environ.get("ACCELERATE_USE_FSDP", "").lower() == "true":
+            raise NotImplementedError("shared-A multi-task training supports DDP / single GPU only")
     model = get_shadow_residual_peft_model(
         base_model_name_or_path=cfg.model.base,
         lora_config=peft_config,
         torch_dtype=model_dtype,
         attn_implementation=cfg.model.attn_implementation,
         share_moe_routing=cfg.adapter.share_moe_routing,
+        **({"adapter_name": task_specs[0][0]} if task_specs else {}),
     )
+    if task_specs:
+        task_router = setup_shared_a(
+            model, [n for n, _, _ in task_specs], peft_config, dtype=model_dtype,
+        )
+        logger.info("Shared-A multi-task mode: tasks=%s", [n for n, _, _ in task_specs])
     model.print_trainable_parameters()
 
     # 4a. Activation checkpointing.
@@ -381,18 +400,30 @@ def main(argv: list[str] | None = None) -> int:
 
     # 5. Datasets. last_token (when set) is appended to rows that don't already
     # end with it — done at the text level so both masking paths inherit it.
-    train_ds = load_jsonl_dataset(
-        cfg.data.train_path, tok,
-        enable_thinking=cfg.data.enable_thinking,
-        last_token=cfg.adapter.last_token,
-        instruction_as_user_message=cfg.data.instruction_as_user_message,
-    )
-    val_ds = load_jsonl_dataset(
-        cfg.data.val_path, tok,
-        enable_thinking=cfg.data.enable_thinking,
-        last_token=cfg.adapter.last_token,
-        instruction_as_user_message=cfg.data.instruction_as_user_message,
-    )
+    def _load(path):
+        return load_jsonl_dataset(
+            path, tok,
+            enable_thinking=cfg.data.enable_thinking,
+            last_token=cfg.adapter.last_token,
+            instruction_as_user_message=cfg.data.instruction_as_user_message,
+        )
+
+    if task_specs:
+        from datasets import concatenate_datasets
+
+        def _tagged(path, task_id):
+            ds = _load(path)
+            return ds.add_column("task_id", [task_id] * len(ds))
+
+        parts_train = [_tagged(tr, i) for i, (_, tr, _) in enumerate(task_specs)]
+        parts_val = [_tagged(va, i) for i, (_, _, va) in enumerate(task_specs)]
+        for (name, _, _), p_tr, p_va in zip(task_specs, parts_train, parts_val):
+            logger.info("Task %s: train rows %d, val rows %d", name, len(p_tr), len(p_va))
+        train_ds = concatenate_datasets(parts_train)
+        val_ds = concatenate_datasets(parts_val)
+    else:
+        train_ds = _load(cfg.data.train_path)
+        val_ds = _load(cfg.data.val_path)
     logger.info("Train rows: %d, Val rows: %d", len(train_ds), len(val_ds))
 
     # 6. SFTConfig — start from to_training_arguments, add SFT-specific keys
@@ -434,7 +465,17 @@ def main(argv: list[str] | None = None) -> int:
     sft_args = SFTConfig(**_filter_to_sftconfig_fields(sft_kwargs))
 
     # 7. Trainer
-    trainer = SFTTrainer(
+    trainer_cls, trainer_extra = SFTTrainer, {}
+    if task_specs:
+        from shadow_residual.training.multitask import make_multitask_trainer_class
+        if data_collator is None:
+            raise NotImplementedError(
+                "shared-A multi-task mode needs the ResponseOnlyCollator path "
+                "(set data.assistant_marker; template must lack {% generation %} tags)"
+            )
+        trainer_cls = make_multitask_trainer_class(SFTTrainer)
+        trainer_extra = {"task_router": task_router}
+    trainer = trainer_cls(
         model=model,
         train_dataset=train_ds,
         eval_dataset=val_ds,
@@ -442,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         processing_class=tok,
         data_collator=data_collator,  # None → SFTTrainer uses its default
         callbacks=build_callbacks(cfg),
+        **trainer_extra,
     )
 
     # 7a. last_context_token boundary check — fail loudly unless the supervised
@@ -464,6 +506,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         logger.info("Debug collator enabled (logs ~0.1%% of batches).")
 
+    if task_specs:
+        from shadow_residual.training.multitask import MultiTaskCollator
+        trainer.data_collator = MultiTaskCollator(trainer.data_collator)
+
     # 8. Train + save
     logger.info("Starting training...")
     trainer.train()
@@ -474,6 +520,12 @@ def main(argv: list[str] | None = None) -> int:
     trainer.save_model(str(out))
     tok.save_pretrained(str(out))
     logger.info("Saved adapter + tokenizer to %s", out)
+    # PEFT saves a non-"default" adapter under <out>/<name>/ — one stock SR
+    # adapter per task in multi-task mode.
+    adapter_dirs = [out / n for n, _, _ in task_specs] if task_specs else [out]
+    if task_specs and int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        for d in adapter_dirs:
+            tok.save_pretrained(str(d))
 
     # Guard: a separate-process generate step (and any downstream reload) needs
     # a consolidated PEFT adapter on disk. Under FSDP this only happens when the
@@ -483,8 +535,9 @@ def main(argv: list[str] | None = None) -> int:
     # checkpoint silently.
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         missing = [
-            name for name in ("adapter_config.json", "adapter_model.safetensors")
-            if not (out / name).exists()
+            str(d / name) for d in adapter_dirs
+            for name in ("adapter_config.json", "adapter_model.safetensors")
+            if not (d / name).exists()
         ]
         if missing:
             raise RuntimeError(
@@ -509,8 +562,10 @@ def main(argv: list[str] | None = None) -> int:
         #     read it back (see training.generation_utils.
         #     read_share_moe_routing_from_adapter) so the
         #     adapter self-describes.
-        adapter_cfg_path = out / "adapter_config.json"
-        if adapter_cfg_path.exists():
+        for adapter_dir in adapter_dirs:
+            adapter_cfg_path = adapter_dir / "adapter_config.json"
+            if not adapter_cfg_path.exists():
+                continue
             import json as _json
             with adapter_cfg_path.open("r") as f:
                 adapter_cfg = _json.load(f)
@@ -521,6 +576,8 @@ def main(argv: list[str] | None = None) -> int:
                 adapter_cfg["last_token"] = cfg.adapter.last_token
                 adapter_cfg["last_token_id"] = last_token_id
             adapter_cfg["share_moe_routing"] = bool(cfg.adapter.share_moe_routing)
+            if task_specs:
+                adapter_cfg["shared_a_tasks"] = [n for n, _, _ in task_specs]
             with adapter_cfg_path.open("w") as f:
                 _json.dump(adapter_cfg, f, indent=2)
             logger.info(
@@ -540,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
     # separate process against the saved checkpoint — a fresh interpreter gives
     # generate a clean CUDA context, sidestepping the post-training residue that
     # OOMs the in-process FSDP gather+rebuild at 30B.
-    if args.skip_post_train_generate:
+    if args.skip_post_train_generate or task_specs:
         logger.info(
             "Skipping in-process post-training generation "
             "(--skip-post-train-generate); run generate as a separate process."
