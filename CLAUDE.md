@@ -86,10 +86,15 @@ Config essentials:
   adapter emits the payload and EOS) and `autoregressive_tool_formatting` (the
   adapter emits the whole tool turn after `</tool_call>`). The mode sets
   `assistant_marker` / `last_context_token` / `last_token`; setting any of them
-  too raises. A non-4.2 base raises. Rows are `messages` + `tools` ending with
-  the trigger call and the gold `tool` message, built with
-  `python -m shadow_residual.training.tool_data`. Reference config:
-  `sr-tool-g42.yaml`. Details: [`docs/tool_formatting.md`](docs/tool_formatting.md).
+  too raises. A non-4.2 base raises. **`data.tool_task` / `--tool-task`**
+  (needs `tool_formatting`): rows are task *source* rows, converted to tool rows
+  on load (training, post-train generation, `sr-generate`), so training is one
+  command; `--val-frac F` (`data.val_frac`, exclusive with `val_path`) splits
+  validation off the train rows. Without `tool_task`, rows must already be tool
+  rows (`messages` + `tools` ending with the trigger call and the gold `tool`
+  message, from `python -m shadow_residual.training.tool_data`). Reference
+  config: `sr-tool-g42.yaml` (`tool_task: answerability`). Details:
+  [`docs/tool_formatting.md`](docs/tool_formatting.md).
 
 **How checkpointing works.** The decoder layer is a `GradientCheckpointingLayer`
 with a single stacked-tensor (`[2,B,S,H]`) dual-stream forward and a pure
@@ -153,6 +158,5 @@ If you touch the model or PEFT wiring, run the invariant tests
 
 ## Git protocol
 
-**Never commit and never push.** Stage only (`git add`); the maintainer reviews,
-commits, and pushes. **Never sign commits as Claude** (no `Co-Authored-By`,
+**Never sign commits as Claude** (no `Co-Authored-By`,
 `Generated with Claude Code`, or similar).
