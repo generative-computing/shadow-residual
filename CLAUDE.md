@@ -68,6 +68,13 @@ accelerate launch --config_file src/shadow_residual/config/accelerate/fsdp_4gpu.
   --train-data … --val-data … --output-dir ./ckpt
 ```
 
+The reference configs' `${BASE_MODEL}` / `${DATA_ROOT}` / `${EVAL_DATA}` /
+`${RUN_DIR}` placeholders come from `--base-model` / `--data-root` /
+`--eval-data` / `--run-dir` (`sr-train` and `sr-generate`), or from the
+environment variable of the same name (the flag wins). Explicit paths
+(`--train-data`, `--val-data`, `--val-frac`, `--output-dir`) replace their
+fields before resolution, so their placeholders need no value.
+
 Config essentials:
 - **`"cross_stream"` in `adapter.target_modules`** engages the dual-stream SR
   forward. Do NOT list `k_proj` / `v_proj` (K/V LoRA is rejected).

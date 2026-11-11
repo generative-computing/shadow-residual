@@ -315,16 +315,19 @@ One command, straight from answerability source rows (the reference config sets
 `tool_task: answerability`):
 
 ```bash
-BASE_MODEL=ibm-granite/granite-4.2-3b DATA_ROOT=/path/to/src RUN_DIR=runs/tool \
-EVAL_DATA=/path/to/src/val.jsonl \
-sr-train --config src/shadow_residual/config/sr-tool-g42.yaml           # external (config default)
+sr-train --config src/shadow_residual/config/sr-tool-g42.yaml \
+  --base-model ibm-granite/granite-4.2-3b --data-root /path/to/src \
+  --eval-data /path/to/src/val.jsonl --run-dir runs/tool              # external (config default)
 #        --tool-formatting autoregressive_tool_formatting               # or the other mode
 #        --tool-task guardian_core                                      # or another task
 #        --train-data src.jsonl --val-frac 0.1                          # one source file
 #        --debug-collator 0.05                                          # print training examples
 ```
 
-`DATA_ROOT` holds the source `train.jsonl` / `val.jsonl`. `--debug-collator
+`--data-root` holds the source `train.jsonl` / `val.jsonl`; `--run-dir` gets
+`checkpoints/`. These flags fill the config's `${DATA_ROOT}` / `${RUN_DIR}` /
+`${BASE_MODEL}` / `${EVAL_DATA}` placeholders (the environment variables of the
+same names still work; the flag wins). `--debug-collator
 [PROB]` always prints the first collated batch. It then prints about PROB of
 later batches (default 0.001). Each print shows the decoded row, the last
 context token, and the supervised text.

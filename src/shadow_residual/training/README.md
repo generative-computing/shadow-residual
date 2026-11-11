@@ -42,6 +42,11 @@ most-edited fields.
 
 ```
 --config PATH           required — unified-config YAML path
+--base-model ID         set model.base and the config's ${BASE_MODEL}
+--data-root DIR         set ${DATA_ROOT} (reference configs read DIR/train.jsonl, DIR/val.jsonl)
+--eval-data PATH        set generation.input_path and ${EVAL_DATA}
+--run-dir DIR           set ${RUN_DIR} (reference configs write DIR/checkpoints)
+                        (these four replace the env variables of the same names; the flag wins)
 --output-dir DIR        override save.output_dir
 --train-data PATH       override data.train_path
 --val-data PATH         override data.val_path
@@ -79,7 +84,8 @@ For overrides outside this set, edit the YAML.
 ```
 --config PATH           required — same training config YAML used for train.py
 --checkpoint PATH       required — directory of a saved LoRA adapter
---data PATH             override eval JSONL (default: cfg.data.val_path)
+--data, --eval-data PATH  eval JSONL: sets generation.input_path and ${EVAL_DATA}
+--base-model / --data-root / --run-dir   as for train.py
 --out PATH              override output JSONL (default: <checkpoint>/<cfg.generation.output_filename>)
 --limit N               cap rows for quick smoke runs
 --tool-task TASK        eval rows are TASK source rows; convert on load (overrides data.tool_task)

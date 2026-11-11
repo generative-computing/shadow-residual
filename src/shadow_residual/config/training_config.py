@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Mapping
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
@@ -373,29 +374,59 @@ class TrainingConfig(BaseModel):
 
 _VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
+# The reference configs' ${VAR} placeholders and the CLI flag that supplies each.
+CONFIG_VARIABLE_FLAGS = {
+    "BASE_MODEL": "--base-model",
+    "DATA_ROOT": "--data-root",
+    "EVAL_DATA": "--eval-data",
+    "RUN_DIR": "--run-dir",
+}
 
-def _resolve_env_vars(value: Any) -> Any:
-    """Recursively resolve ${VAR} in any string. Raise on unset vars."""
+
+def _resolve_env_vars(value: Any, variables: Mapping[str, str] | None = None) -> Any:
+    """Recursively resolve ${VAR} in any string, from ``variables`` first and
+    then the environment. Raise on unset vars."""
+    variables = variables or {}
     if isinstance(value, str):
         def _sub(match: re.Match) -> str:
             name = match.group(1)
+            if name in variables:
+                return variables[name]
             if name not in os.environ:
-                raise KeyError(f"Environment variable ${{{name}}} is not set")
+                flag = CONFIG_VARIABLE_FLAGS.get(name)
+                how = f"pass {flag} or set {name}" if flag else f"set {name}"
+                raise KeyError(f"Environment variable ${{{name}}} is not set ({how})")
             return os.environ[name]
         return _VAR_PATTERN.sub(_sub, value)
     if isinstance(value, dict):
-        return {k: _resolve_env_vars(v) for k, v in value.items()}
+        return {k: _resolve_env_vars(v, variables) for k, v in value.items()}
     if isinstance(value, list):
-        return [_resolve_env_vars(v) for v in value]
+        return [_resolve_env_vars(v, variables) for v in value]
     return value
 
 
-def load_training_config(path: str | Path) -> TrainingConfig:
-    """Load YAML, resolve ${VAR}, validate against TrainingConfig."""
+def load_training_config(
+    path: str | Path,
+    variables: Mapping[str, str] | None = None,
+    overrides: Mapping[str, Any] | None = None,
+) -> TrainingConfig:
+    """Load YAML, apply ``overrides``, resolve ${VAR}, validate against TrainingConfig.
+
+    ``overrides`` maps dotted field paths (``"data.train_path"``) to values set
+    before ${VAR} resolution, so a placeholder in an overridden field needs no
+    value. A ``generation.*`` override applies only if the YAML has a
+    ``generation`` block. ``variables`` supply ${VAR} values ahead of the
+    environment (the CLI's ``--base-model`` / ``--data-root`` / ...).
+    """
     path = Path(path)
     with path.open("r") as f:
         raw = yaml.safe_load(f)
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: expected a YAML mapping at top level")
-    resolved = _resolve_env_vars(raw)
+    for dotted, val in (overrides or {}).items():
+        section, field = dotted.split(".", 1)
+        if section == "generation" and not isinstance(raw.get("generation"), dict):
+            continue
+        raw.setdefault(section, {})[field] = val
+    resolved = _resolve_env_vars(raw, variables)
     return TrainingConfig.model_validate(resolved)

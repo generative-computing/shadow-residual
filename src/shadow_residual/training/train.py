@@ -96,12 +96,60 @@ def apply_tool_formatting(cfg: TrainingConfig) -> None:
 # --- CLI ---------------------------------------------------------------------
 
 
+def add_config_variable_args(p: argparse.ArgumentParser, *, eval_data: bool = True) -> None:
+    """Flags that supply the reference configs' ${VAR} placeholders instead of
+    environment variables (the flag wins over the env var)."""
+    p.add_argument("--base-model", default=None,
+                   help="Base model id or path: sets model.base and ${BASE_MODEL}.")
+    p.add_argument("--data-root", default=None,
+                   help="Sets ${DATA_ROOT}; the reference configs read <data-root>/train.jsonl "
+                        "and <data-root>/val.jsonl.")
+    if eval_data:
+        p.add_argument("--eval-data", default=None,
+                       help="Eval JSONL for post-training generation: sets "
+                            "generation.input_path and ${EVAL_DATA}.")
+    p.add_argument("--run-dir", default=None,
+                   help="Sets ${RUN_DIR}; the reference configs write to <run-dir>/checkpoints "
+                        "(--output-dir sets the exact directory).")
+
+
+def config_variables(args: argparse.Namespace) -> dict[str, str]:
+    """The ${VAR} values given on the command line."""
+    given = {
+        "BASE_MODEL": args.base_model,
+        "DATA_ROOT": args.data_root,
+        "EVAL_DATA": getattr(args, "eval_data", None),
+        "RUN_DIR": args.run_dir,
+    }
+    return {k: v for k, v in given.items() if v is not None}
+
+
+def config_overrides(args: argparse.Namespace) -> dict:
+    """Fields that explicit CLI paths replace, set before ${VAR} resolution so
+    their placeholders need no value."""
+    out = {
+        "model.base": args.base_model,
+        "data.train_path": args.train_data,
+        "save.output_dir": args.output_dir,
+        "generation.input_path": args.eval_data,
+    }
+    out = {k: v for k, v in out.items() if v is not None}
+    if args.val_data is not None:
+        out.update({"data.val_path": args.val_data, "data.val_frac": None})
+    if args.val_frac is not None:
+        if not 0.0 < args.val_frac < 1.0:
+            raise ValueError(f"--val-frac must be in (0, 1), got {args.val_frac}")
+        out.update({"data.val_frac": args.val_frac, "data.val_path": None})
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="shadow_residual.training.train",
         description="Unified adapter-training entry point.",
     )
     p.add_argument("--config", required=True, type=str, help="Path to unified training config YAML.")
+    add_config_variable_args(p)
 
     # Hand-picked overrides for the most-edited fields.
     p.add_argument("--output-dir", type=str, default=None)
@@ -179,6 +227,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
     """Mutate cfg in place with whatever CLI flags the user supplied."""
+    if args.base_model is not None:
+        cfg.model.base = args.base_model
+    if args.eval_data is not None and cfg.generation is not None:
+        cfg.generation.input_path = args.eval_data
     if args.output_dir is not None:
         cfg.save.output_dir = args.output_dir
     if args.train_data is not None:
@@ -417,7 +469,8 @@ def main(argv: list[str] | None = None) -> int:
             "--quantize (4-bit QLoRA via bitsandbytes) is not currently "
             "supported on the shadow-residual + PEFT training path."
         )
-    cfg = load_training_config(args.config)
+    cfg = load_training_config(args.config, variables=config_variables(args),
+                               overrides=config_overrides(args))
     apply_cli_overrides(cfg, args)
     apply_tool_formatting(cfg)
     if cfg.data.tool_formatting is not None:

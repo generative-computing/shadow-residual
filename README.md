@@ -159,9 +159,9 @@ tool rows on load (`data.tool_task`, default `answerability` in the reference
 config):
 
 ```bash
-BASE_MODEL=ibm-granite/granite-4.2-3b DATA_ROOT=/path/to/src RUN_DIR=runs/tool \
-EVAL_DATA=/path/to/src/val.jsonl \
-  sr-train --config src/shadow_residual/config/sr-tool-g42.yaml
+sr-train --config src/shadow_residual/config/sr-tool-g42.yaml \
+  --base-model ibm-granite/granite-4.2-3b --data-root /path/to/src \
+  --eval-data /path/to/src/val.jsonl --run-dir runs/tool
 # --tool-task guardian_core | requirement_check | query_clarification
 # --train-data src.jsonl --val-frac 0.1    (one source file, split in the trainer)
 ```

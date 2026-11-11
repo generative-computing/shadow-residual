@@ -60,8 +60,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True, help="Training config YAML (same one used for training).")
     p.add_argument("--checkpoint", required=True,
                    help="Path to a saved LoRA adapter directory (output of train.py).")
-    p.add_argument("--data", default=None,
-                   help="Override eval JSONL path (defaults to cfg.data.val_path).")
+    p.add_argument("--data", "--eval-data", dest="data", default=None,
+                   help="Eval JSONL path: sets generation.input_path and ${EVAL_DATA}.")
+    from shadow_residual.training.train import add_config_variable_args
+    add_config_variable_args(p, eval_data=False)
     p.add_argument("--out", default=None,
                    help="Override output JSONL path (defaults to <checkpoint>/<cfg.generation.output_filename>).")
     p.add_argument("--limit", type=int, default=None,
@@ -694,7 +696,15 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     args = _build_parser().parse_args(argv)
-    cfg = load_training_config(args.config)
+    from shadow_residual.training.train import config_variables
+    variables = config_variables(args)
+    overrides = {}
+    if args.data is not None:
+        variables["EVAL_DATA"] = args.data
+        overrides["generation.input_path"] = args.data
+    if args.base_model is not None:
+        overrides["model.base"] = args.base_model
+    cfg = load_training_config(args.config, variables=variables, overrides=overrides)
     if cfg.generation is None:
         raise ValueError(
             f"{args.config}: missing 'generation:' block. The standalone "
