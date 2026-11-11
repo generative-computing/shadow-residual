@@ -80,8 +80,9 @@ Config essentials:
 - **`data.enable_thinking` / `--thinking`** → forwarded to
   `apply_chat_template(enable_thinking=...)`. CLI wins over YAML. Default False.
 - **`data.tool_formatting` / `--tool-formatting`** (opt-in, **Granite 4.2 only**)
-  → trains the adapter to be called as a tool. It emits the `<tool_response>`
-  payload and stops, and **never writes the assistant answer**. The two modes
+  → trains the adapter to be called as a tool. As a tool it emits the
+  `<tool_response>` payload and stops, and **never writes the assistant
+  answer**. The two modes
   are `external_tool_formatting` (the env writes `<tool_response>\n`; the
   adapter emits the payload and EOS) and `autoregressive_tool_formatting` (the
   adapter emits the whole tool turn after `</tool_call>`). The mode sets
@@ -93,13 +94,14 @@ Config essentials:
   validation off the train rows. Without `tool_task`, rows must already be tool
   rows (`messages` + `tools` ending with the trigger call and the gold `tool`
   message, from `python -m shadow_residual.training.tool_data`).
-  **`data.vanilla_frac` / `--vanilla-frac F`** (needs `tool_task`; hybrid): a
-  seeded fraction F of the source rows trains as plain vanilla-SR chat rows
+  **`data.vanilla_frac` / `--vanilla-frac F`** (needs `tool_task`; **default
+  0.5**): tool training renders a seeded fraction F of the source rows as plain
+  vanilla-SR chat rows
   (answer after `<|im_start|>assistant\n<think></think>`, last context token
   `</think>`), the rest as tool rows; the collator cuts each row after whichever
   of the two markers ends last, and every row is checked for that at load.
   `--vanilla-frac 0` = tool rows only. Reference config: `sr-tool-g42.yaml`
-  (`tool_task: answerability`, `vanilla_frac: 0.5`). Details:
+  (`tool_task: answerability`). Details:
   [`docs/tool_formatting.md`](docs/tool_formatting.md).
 
 **How checkpointing works.** The decoder layer is a `GradientCheckpointingLayer`

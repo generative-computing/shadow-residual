@@ -162,11 +162,12 @@ class DataConfig(_Strict):
     # (shadow_residual.training.tool_data); unusable rows are dropped. None =
     # rows are already tool rows. Overridable from the CLI via `--tool-task`.
     tool_task: ToolTask | None = None
-    # Requires tool_task. Hybrid tool training: this seeded (runtime.seed)
-    # fraction of the source rows is rendered as plain (vanilla SR) chat rows —
-    # the adapter answers after "<|im_start|>assistant\n<think></think>" — and the
-    # rest as tool rows. None or 0 = tool rows only. The split is exact before a
-    # val_frac split. Overridable from the CLI via `--vanilla-frac F`.
+    # Tool training renders this seeded (runtime.seed) fraction of the source
+    # rows as plain (vanilla SR) chat rows — the adapter answers after
+    # "<|im_start|>assistant\n<think></think>" — and the rest as tool rows.
+    # Needs tool_task. None (unset) = 0.5 with tool_task, else 0; 0 = tool rows
+    # only. The split is exact before a val_frac split. Overridable from the
+    # CLI via `--vanilla-frac F`.
     vanilla_frac: float | None = Field(None, ge=0.0, lt=1.0)
 
     @model_validator(mode="after")

@@ -27,7 +27,11 @@ from shadow_residual.config.adapters import (
     to_training_arguments,
 )
 from shadow_residual.config.training_config import ToolFormatting, ToolTask, TrainingConfig
-from shadow_residual.training.tool_data.formatting import TOOL_FORMATTING_MARKERS, VANILLA_MARKERS
+from shadow_residual.training.tool_data.formatting import (
+    DEFAULT_VANILLA_FRAC,
+    TOOL_FORMATTING_MARKERS,
+    VANILLA_MARKERS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +43,19 @@ def apply_tool_formatting(cfg: TrainingConfig) -> None:
     ``adapter.last_token`` (see ``tool_data.TOOL_FORMATTING_MARKERS``). Setting
     any of them alongside ``tool_formatting`` is rejected rather than silently
     overridden, so the mode is the single source of truth for the boundary.
+
+    Also resolves ``data.vanilla_frac`` to a float (0 = tool rows only). Unset,
+    it is ``DEFAULT_VANILLA_FRAC`` for tool training from source rows
+    (``tool_task``), and 0 otherwise: pre-converted tool rows no longer carry
+    the vanilla answer.
     """
     mode = cfg.data.tool_formatting
-    if not cfg.data.vanilla_frac:
-        cfg.data.vanilla_frac = None
-    if cfg.data.vanilla_frac is not None:
+    if cfg.data.vanilla_frac is None:
+        from_source = mode is not None and cfg.data.tool_task is not None
+        cfg.data.vanilla_frac = DEFAULT_VANILLA_FRAC if from_source else 0.0
+        if mode is not None and not from_source:
+            logger.info("data.tool_task is unset (pre-converted tool rows): training on tool rows only.")
+    if cfg.data.vanilla_frac:
         if cfg.data.tool_task is None:
             raise ValueError(
                 f"data.vanilla_frac={cfg.data.vanilla_frac} requires data.tool_task (or "
@@ -52,8 +64,8 @@ def apply_tool_formatting(cfg: TrainingConfig) -> None:
             )
         if cfg.data.enable_thinking:
             raise ValueError(
-                "data.vanilla_frac renders vanilla rows thinking-off; unset "
-                "data.enable_thinking (--thinking)."
+                f"tool training renders {cfg.data.vanilla_frac:g} of the rows as vanilla rows, "
+                "thinking-off; unset data.enable_thinking (--thinking) or pass --vanilla-frac 0."
             )
     if mode is None:
         if cfg.data.tool_task is not None:
@@ -150,10 +162,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "--tool-formatting). Replaces running `python -m "
                         "shadow_residual.training.tool_data` first.")
     p.add_argument("--vanilla-frac", dest="vanilla_frac", type=float, default=None, metavar="F",
-                   help="Hybrid tool training (data.vanilla_frac; needs --tool-task): render this "
+                   help="Tool training (data.vanilla_frac; needs --tool-task): render this "
                         "seeded fraction of the source rows as plain vanilla-SR chat rows (answer "
                         "after '<|im_start|>assistant\\n<think></think>') and the rest as tool "
-                        "rows. 0 turns it off.")
+                        f"rows. Default {DEFAULT_VANILLA_FRAC}; 0 = tool rows only.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", nargs="?", type=float, const=-1.0, default=None,
                    metavar="PROB",
@@ -208,7 +220,7 @@ def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
     if args.vanilla_frac is not None:
         if not 0.0 <= args.vanilla_frac < 1.0:
             raise ValueError(f"--vanilla-frac must be in [0, 1), got {args.vanilla_frac}")
-        cfg.data.vanilla_frac = args.vanilla_frac or None
+        cfg.data.vanilla_frac = args.vanilla_frac
     if args.debug_collator is not None:
         cfg.trainer.debug_collator = True
         if args.debug_collator >= 0.0:
@@ -339,19 +351,19 @@ def _run_post_training_generation(
 
 def response_templates(cfg: TrainingConfig) -> str | list[str]:
     """The ResponseOnlyCollator marker(s): the config's, plus the vanilla-row
-    marker when ``data.vanilla_frac`` makes the dataset hybrid."""
+    marker when ``data.vanilla_frac`` mixes vanilla rows into tool training."""
     marker = cfg.data.assistant_marker or _DEFAULT_ASSISTANT_MARKER
-    if cfg.data.vanilla_frac is not None:
+    if cfg.data.vanilla_frac:
         return [marker, VANILLA_MARKERS.assistant_marker]
     return marker
 
 
 def validate_boundaries(cfg: TrainingConfig, dataset, tokenizer, collator) -> None:
     """Run the last_context_token boundary check against the real collator;
-    hybrid datasets are checked per row kind, each against its own token."""
+    with vanilla rows each row kind is checked against its own token."""
     from shadow_residual.training.data import validate_last_context_token_boundary
 
-    if cfg.data.vanilla_frac is None:
+    if not cfg.data.vanilla_frac:
         if cfg.adapter.last_context_token is not None:
             validate_last_context_token_boundary(dataset, tokenizer, collator, cfg.adapter.last_context_token)
         return
@@ -423,9 +435,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Val data:     %.0f%% of train rows (seed %d)", cfg.data.val_frac * 100, cfg.runtime.seed)
     if cfg.data.tool_task is not None:
         logger.info("Tool task:    %s (source rows converted on load)", cfg.data.tool_task)
-    if cfg.data.vanilla_frac is not None:
+    if cfg.data.vanilla_frac:
         logger.info(
-            "Hybrid:       %.0f%% of rows vanilla SR (assistant_marker=%r last_context_token=%r), "
+            "Vanilla rows: %.0f%% of rows vanilla SR (assistant_marker=%r last_context_token=%r), "
             "the rest %s tool rows (seed %d)",
             cfg.data.vanilla_frac * 100, VANILLA_MARKERS.assistant_marker,
             VANILLA_MARKERS.last_context_token, cfg.data.tool_formatting, cfg.runtime.seed,
@@ -475,10 +487,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg.adapter.last_context_token, "last_context_token"
     )
     last_token_id = _resolve_single_token(cfg.adapter.last_token, "last_token")
-    hybrid = cfg.data.vanilla_frac is not None
+    with_vanilla = bool(cfg.data.vanilla_frac)
     vanilla_last_context_token_id = (
         _resolve_single_token(VANILLA_MARKERS.last_context_token, "last_context_token (vanilla rows)")
-        if hybrid else None
+        if with_vanilla else None
     )
 
     # 3. PEFT config (stock LoRA — no gated/aLoRA activation).
@@ -575,7 +587,7 @@ def main(argv: list[str] | None = None) -> int:
     # (TRL-version-independent; doesn't depend on TRL's removed
     # DataCollatorForCompletionOnlyLM).
     use_assistant_only_loss = _chat_template_supports_generation_tags(tok)
-    if use_assistant_only_loss and hybrid:
+    if use_assistant_only_loss and with_vanilla:
         raise ValueError(
             "data.vanilla_frac needs the marker-based ResponseOnlyCollator, but this "
             "tokenizer's chat template has {% generation %} tags (assistant_only_loss)."
@@ -694,7 +706,7 @@ def main(argv: list[str] | None = None) -> int:
                 adapter_cfg["tool_formatting"] = cfg.data.tool_formatting
             if cfg.data.tool_task is not None:
                 adapter_cfg["tool_task"] = cfg.data.tool_task
-            if hybrid:
+            if with_vanilla:
                 adapter_cfg["vanilla_frac"] = cfg.data.vanilla_frac
                 adapter_cfg["vanilla_last_context_token"] = VANILLA_MARKERS.last_context_token
                 adapter_cfg["vanilla_last_context_token_id"] = vanilla_last_context_token_id

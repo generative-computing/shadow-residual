@@ -83,8 +83,10 @@ TOOL_FORMATTING_MARKERS: dict[str, ToolMarkers] = {
 }
 
 # Vanilla rows (``data.vanilla_frac``): plain Granite 4.2 SR chat rows, thinking
-# off. The adapter answers right after the empty think block.
+# off. The adapter answers right after the empty think block. Tool training from
+# source rows renders this fraction of them as vanilla rows unless set.
 VANILLA_MARKERS = ToolMarkers("<|im_start|>assistant\n<think></think>", "</think>", EOS)
+DEFAULT_VANILLA_FRAC = 0.5
 
 
 def _mode(mode: str) -> str:

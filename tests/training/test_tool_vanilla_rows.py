@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hybrid tool training (data.vanilla_frac): a seeded fraction of the source rows
-renders as plain vanilla-SR chat rows, the rest as tool rows, in one dataset.
+"""Tool training renders a seeded fraction (data.vanilla_frac, default 0.5) of the
+source rows as plain vanilla-SR chat rows and the rest as tool rows, in one dataset.
 
 Tokenizer-dependent cases use the open-source Granite 4.2 tokenizer and are
 skipped if it can't be loaded.
@@ -128,7 +128,7 @@ def _load(tok, path, mode, task, frac=0.5, seed=2):
 
 
 @pytest.mark.parametrize("mode", MODES)
-def test_hybrid_split_is_exact_and_seeded(tok, tmp_path, mode):
+def test_split_is_exact_and_seeded(tok, tmp_path, mode):
     path = _write(tmp_path / "src.jsonl", ANS_ROWS)
     ds = _load(tok, path, mode, "answerability")
     assert ds["kind"].count("vanilla") == 5 and ds["kind"].count("tool") == 5
@@ -139,16 +139,16 @@ def test_hybrid_split_is_exact_and_seeded(tok, tmp_path, mode):
 
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("task, rows", [("answerability", ANS_ROWS), ("guardian_core", GUARD_ROWS)])
-def test_hybrid_rows_match_the_pure_formats(tok, tmp_path, mode, task, rows):
-    """Tool rows are byte-identical to a tool-only load; vanilla rows to a plain
-    (non-tool) load of the vanilla source row — the vanilla-SR training format."""
+def test_tool_and_vanilla_rows_match_the_single_formats(tok, tmp_path, mode, task, rows):
+    """Tool rows are byte-identical to a tool-only load (--vanilla-frac 0); vanilla
+    rows to a plain (non-tool) load of the vanilla source row — the vanilla-SR training format."""
     from shadow_residual.training.data import load_jsonl_dataset
     path = _write(tmp_path / "src.jsonl", rows)
-    hybrid = _load(tok, path, mode, task)
+    mixed = _load(tok, path, mode, task)
     tool_only = load_jsonl_dataset(path, tok, last_token=IM_END, tool_formatting=mode, tool_task=task)
     plain = load_jsonl_dataset(_write(tmp_path / "v.jsonl", [to_vanilla(task, r) for r in rows]),
                                tok, last_token=IM_END)
-    for i, (text, kind) in enumerate(zip(hybrid["text"], hybrid["kind"])):
+    for i, (text, kind) in enumerate(zip(mixed["text"], mixed["kind"])):
         assert text == (tool_only if kind == "tool" else plain)[i]["text"]
 
 
@@ -192,7 +192,7 @@ def test_collator_supervises_each_kind_exactly(tok, tmp_path, mode):
 
 
 def test_single_template_collator_unchanged(tok):
-    """One marker still cuts after its last occurrence (the pre-hybrid behavior)."""
+    """One marker still cuts after its last occurrence (the single-marker behavior)."""
     from shadow_residual.training.data import ResponseOnlyCollator
     text = "<|im_start|>assistant\n<think></think>a<|im_end|>\n<|im_start|>assistant\n<think></think>b<|im_end|>"
     col = ResponseOnlyCollator(tok, VANILLA_MARKERS.assistant_marker)
@@ -212,8 +212,8 @@ def test_loader_rejects_row_cut_at_the_wrong_marker(tok, tmp_path):
         _load(tok, path, AUTOREGRESSIVE, "query_clarification", frac=0.5)
 
 
-@pytest.mark.parametrize("hybrid", [True, False])
-def test_loader_drops_rows_at_or_over_max_length(tok, tmp_path, caplog, hybrid):
+@pytest.mark.parametrize("with_vanilla", [True, False])
+def test_loader_drops_rows_at_or_over_max_length(tok, tmp_path, caplog, with_vanilla):
     """Truncation would cut the gold span and leave an earlier marker as the cut."""
     import logging
     from shadow_residual.training.data import load_jsonl_dataset
@@ -222,11 +222,11 @@ def test_loader_drops_rows_at_or_over_max_length(tok, tmp_path, caplog, hybrid):
     path = _write(tmp_path / "src.jsonl", [*ANS_ROWS[:4], long])
     with caplog.at_level(logging.WARNING, logger="shadow_residual.training.data"):
         ds = load_jsonl_dataset(path, tok, last_token=IM_END, tool_formatting=EXTERNAL, tool_task="answerability",
-                                vanilla_frac=0.5 if hybrid else None, max_length=2048)
+                                vanilla_frac=0.5 if with_vanilla else None, max_length=2048)
     assert len(ds) == 4
     assert "dropped 1 rows of >= max_length=2048 tokens" in caplog.text
     full = load_jsonl_dataset(path, tok, last_token=IM_END, tool_formatting=EXTERNAL, tool_task="answerability",
-                              vanilla_frac=0.5 if hybrid else None)
+                              vanilla_frac=0.5 if with_vanilla else None)
     assert len(full) == 5
 
 
@@ -238,7 +238,7 @@ def test_validator_rejects_all_masked_sample(tok, tmp_path):
         validate_last_context_token_boundary(vanilla, tok, ResponseOnlyCollator(tok, "</tool_call>"), "</think>")
 
 
-def test_loader_hybrid_requires_tool_task(tok, tmp_path):
+def test_loader_vanilla_rows_require_tool_task(tok, tmp_path):
     from shadow_residual.training.data import load_jsonl_dataset
     path = _write(tmp_path / "src.jsonl", ANS_ROWS)
     with pytest.raises(ValueError, match="vanilla_frac requires tool_task"):
@@ -270,11 +270,11 @@ def test_validate_boundaries_checks_each_kind(tok, tmp_path, mode):
 
 
 def _cfg(tmp_path: Path, mode: str = EXTERNAL, **data) -> Path:
-    p = tmp_path / "hybrid.yaml"
+    p = tmp_path / "tool.yaml"
     p.write_text(yaml.safe_dump({
         "model": {"base": G42},
         "data": {"train_path": "t.jsonl", "val_path": "v.jsonl", "tool_formatting": mode,
-                 "tool_task": "answerability", "vanilla_frac": 0.5, **data},
+                 "tool_task": "answerability", **data},
         "adapter": {"target_modules": {"q_proj": 8, "cross_stream": 8}},
         "save": {"output_dir": str(tmp_path / "out")},
     }))
@@ -292,10 +292,22 @@ def _cli(tmp_path, *argv, **data):
     return cfg
 
 
-def test_cli_vanilla_frac_overrides_and_zero_disables(tmp_path):
+def test_tool_training_defaults_to_half_vanilla_rows(tmp_path):
     assert _cli(tmp_path).data.vanilla_frac == 0.5
+
+
+def test_cli_vanilla_frac_overrides_and_zero_disables(tmp_path):
     assert _cli(tmp_path, "--vanilla-frac", "0.25").data.vanilla_frac == 0.25
-    assert _cli(tmp_path, "--vanilla-frac", "0").data.vanilla_frac is None
+    assert _cli(tmp_path, "--vanilla-frac", "0").data.vanilla_frac == 0.0
+
+
+def test_pre_converted_tool_rows_default_to_tool_rows_only(tmp_path):
+    assert _cli(tmp_path, tool_task=None).data.vanilla_frac == 0.0
+
+
+def test_non_tool_training_has_no_vanilla_rows(tmp_path):
+    cfg = _cli(tmp_path, tool_formatting=None, tool_task=None)
+    assert cfg.data.vanilla_frac == 0.0 and cfg.adapter.last_context_token is None
 
 
 @pytest.mark.parametrize("frac", ["1", "-0.1"])
@@ -311,17 +323,18 @@ def test_config_vanilla_frac_out_of_range(tmp_path):
 
 
 def test_config_vanilla_frac_zero_is_off(tmp_path):
-    assert _cli(tmp_path, vanilla_frac=0.0).data.vanilla_frac is None
+    assert _cli(tmp_path, vanilla_frac=0.0).data.vanilla_frac == 0.0
 
 
-def test_vanilla_frac_requires_tool_task(tmp_path):
+def test_explicit_vanilla_frac_requires_tool_task(tmp_path):
     with pytest.raises(ValueError, match=r"vanilla_frac=0\.5 requires data\.tool_task"):
-        _cli(tmp_path, tool_task=None)
+        _cli(tmp_path, tool_task=None, vanilla_frac=0.5)
 
 
-def test_vanilla_frac_rejects_thinking(tmp_path):
-    with pytest.raises(ValueError, match="thinking-off"):
+def test_vanilla_rows_reject_thinking(tmp_path):
+    with pytest.raises(ValueError, match="thinking-off.*--vanilla-frac 0"):
         _cli(tmp_path, "--thinking")
+    assert _cli(tmp_path, "--thinking", "--vanilla-frac", "0").data.enable_thinking
 
 
 def test_response_templates(tmp_path):
@@ -331,12 +344,15 @@ def test_response_templates(tmp_path):
     assert response_templates(_cli(tmp_path, "--vanilla-frac", "0")) == "<tool_response>\n"
 
 
-def test_reference_tool_config_is_hybrid(monkeypatch):
+def test_reference_tool_config_uses_the_default(monkeypatch):
     from shadow_residual.config import load_training_config
+    from shadow_residual.training.train import apply_tool_formatting
     for k, v in {"BASE_MODEL": G42, "DATA_ROOT": "/d", "RUN_DIR": "/r", "EVAL_DATA": "/e"}.items():
         monkeypatch.setenv(k, v)
     cfg = load_training_config(Path(__file__).resolve().parents[2] / "src/shadow_residual/config/sr-tool-g42.yaml")
-    assert cfg.data.vanilla_frac == 0.5 and cfg.data.tool_task == "answerability"
+    assert cfg.data.vanilla_frac is None and cfg.data.tool_task == "answerability"
+    apply_tool_formatting(cfg)
+    assert cfg.data.vanilla_frac == 0.5
 
 
 def test_vanilla_markers():

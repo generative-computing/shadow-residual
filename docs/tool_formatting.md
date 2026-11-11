@@ -3,8 +3,11 @@
 An SR adapter can be exposed to the base model as a **tool**. The base decides
 when to call it (it emits a `<tool_call>`), the serving environment routes the
 next tokens to the adapter, and the adapter produces the tool's
-`<tool_response>` payload. **The adapter never writes the assistant answer.**
-After the tool turn, the base (or another adapter) resumes and answers.
+`<tool_response>` payload. **As a tool, the adapter never writes the assistant
+answer.** After the tool turn, the base (or another adapter) resumes and answers.
+Tool training also renders half of the source rows as plain (vanilla SR) chat
+rows, so the same adapter answers directly when it is invoked after the plain
+generation prompt (see [Vanilla rows](#vanilla-rows-datavanilla_frac)).
 
 `data.tool_formatting` selects which of two handoff contracts the adapter is
 trained for. It is opt-in. Unset (the default), training is standard chat SFT
@@ -82,14 +85,15 @@ adapter-bench `g42-alora-4.1-split` shape) instead of a `documents` field. The
 converter moves them into `documents` as `{"document_id": <index>, "content":
 ...}`, the same records the benchmark's own renderer builds.
 
-### Hybrid: tool rows + vanilla rows, `data.vanilla_frac`
+### Vanilla rows: `data.vanilla_frac`
 
-With `data.vanilla_frac: F` (`--vanilla-frac F`, needs `tool_task`) a seeded
-(`runtime.seed`) `round(F * n)` of the usable source rows train as **vanilla
-SR** chat rows; the rest train as tool rows for the mode. One adapter then
+Tool training from source rows (`tool_task`) renders a seeded (`runtime.seed`)
+`round(F * n)` of the usable source rows as **vanilla SR** chat rows; the rest
+train as tool rows for the mode. `F` is `data.vanilla_frac` (`--vanilla-frac F`),
+**default 0.5**. One adapter then
 serves both ways: as a tool, and by last-context-token activation after the
-plain generation prompt. The reference config sets `vanilla_frac: 0.5`;
-`--vanilla-frac 0` trains tool rows only. Each source row is used once, in one
+plain generation prompt. `--vanilla-frac 0` trains tool rows only; pre-converted
+tool rows (no `tool_task`) always train as tool rows only. Each source row is used once, in one
 of the two formats.
 
 A vanilla row is the source row as a plain chat row (documents after the last

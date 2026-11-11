@@ -96,7 +96,7 @@ def _supervision_start(ids: list[int], templates: list[list[int]]) -> tuple[int,
     last occurrence ENDS latest in ``ids``, or None if no template occurs.
 
     With one template this is "just after its last occurrence". With several
-    (hybrid tool + vanilla rows) each row's own marker is the one closest to the
+    (tool + vanilla rows) each row's own marker is the one closest to the
     end: a vanilla row's documents ``<tool_response>\\n`` precede its final
     assistant opener, and a tool row's trigger-turn assistant opener precedes its
     tool marker.
@@ -163,8 +163,8 @@ def load_jsonl_dataset(
     (:func:`~shadow_residual.training.tool_data.convert.convert`). Rows the
     converter drops are counted and logged.
 
-    ``vanilla_frac`` (``data.vanilla_frac``; requires ``tool_task``) makes the
-    dataset hybrid: a seeded (``seed``) ``round(vanilla_frac * n)`` of the usable
+    ``vanilla_frac`` (``data.vanilla_frac``; requires ``tool_task``; the trainer
+    defaults it to 0.5 for tool training): a seeded (``seed``) ``round(vanilla_frac * n)`` of the usable
     source rows are rendered as plain (vanilla SR) chat rows instead of tool rows
     (:func:`~shadow_residual.training.tool_data.convert.to_vanilla`, thinking
     off), so the adapter learns both the tool payload and the plain answer after
@@ -193,13 +193,13 @@ def load_jsonl_dataset(
 
     if tool_task is not None and tool_formatting is None:
         raise ValueError("tool_task requires tool_formatting")
-    hybrid = bool(vanilla_frac)
-    if hybrid and tool_task is None:
+    with_vanilla = bool(vanilla_frac)
+    if with_vanilla and tool_task is None:
         raise ValueError("vanilla_frac requires tool_task (vanilla rows are rendered from source rows)")
     if tool_formatting is not None:
         from shadow_residual.training.tool_data import render_tool_example
         from shadow_residual.training.tool_data.convert import convert, to_vanilla
-    if hybrid:
+    if with_vanilla:
         import random
 
         from shadow_residual.training.tool_data import TOOL_FORMATTING_MARKERS, VANILLA_MARKERS
@@ -231,7 +231,7 @@ def load_jsonl_dataset(
             entries.append((lineno, src, obj))
 
     vanilla_idx: set[int] = set()
-    if hybrid:
+    if with_vanilla:
         n_vanilla = round(vanilla_frac * len(entries))
         vanilla_idx = set(random.Random(seed).sample(range(len(entries)), n_vanilla))
 
@@ -294,7 +294,7 @@ def load_jsonl_dataset(
             if len(row_ids) >= max_length:
                 n_too_long[kind] += 1
                 continue
-        if hybrid:
+        if with_vanilla:
             # The collator cuts after whichever marker ends last; make sure that
             # is this row's own marker, on the real tokenization.
             if row_ids is None:
@@ -321,10 +321,10 @@ def load_jsonl_dataset(
             "their supervised span", path, sum(n_too_long.values()), max_length,
             ", ".join(f"{k}: {v}" for k, v in n_too_long.items() if v),
         )
-    if hybrid:
+    if with_vanilla:
         n_v = sum(r["kind"] == "vanilla" for r in rows)
         logger.info(
-            "%s: hybrid split (vanilla_frac=%g, seed=%d): %d %s tool rows + %d vanilla rows",
+            "%s: split (vanilla_frac=%g, seed=%d): %d %s tool rows + %d vanilla rows",
             path, vanilla_frac, seed, len(rows) - n_v, tool_formatting, n_v,
         )
     if not rows:
@@ -363,7 +363,7 @@ class ResponseOnlyCollator:
       matches ``adapter.last_context_token = "<|end_of_role|>"`` and the
       ``validate_last_context_token_boundary`` check.
 
-    ``response_template`` may also be a list of markers (hybrid tool + vanilla
+    ``response_template`` may also be a list of markers (tool + vanilla
     rows): each row is cut after the marker whose last occurrence ends latest
     (see :func:`_supervision_start`).
     """
