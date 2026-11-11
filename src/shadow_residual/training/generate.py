@@ -528,7 +528,10 @@ def run_generation_under_fsdp(
         StateDictType,
     )
 
-    from shadow_residual.shadow_residual.build import build_sr_config as _build_sr_config
+    from shadow_residual.shadow_residual.build import (
+        build_sr_config as _build_sr_config,
+        reinit_rope_buffers as _reinit_rope_buffers,
+    )
     from shadow_residual.training.factory import (
         _build_sr_peft_model_meta,
     )
@@ -644,6 +647,10 @@ def run_generation_under_fsdp(
             logger.warning("[FSDP-generate] missing keys (first 5): %s", missing[:5])
         if unexpected:
             logger.warning("[FSDP-generate] unexpected keys (first 5): %s", unexpected[:5])
+        # The RoPE inv_freq buffers are non-persistent, so the gathered state
+        # dict does not carry them and to_empty() left them uninitialized.
+        # Recompute them (fp32, as in training — see to_dtype_keep_rope_fp32).
+        _reinit_rope_buffers(rebuilt)
         del gathered
         gc.collect()
         _cuda_mem_snapshot("rank0/pre-.to(cuda:0)", device=0)
