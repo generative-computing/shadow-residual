@@ -100,7 +100,7 @@ Config essentials:
   command; `--val-frac F` (`data.val_frac`, exclusive with `val_path`) splits
   validation off the train rows. Without `tool_task`, rows must already be tool
   rows (`messages` + `tools` ending with the trigger call and the gold `tool`
-  message, from `python -m shadow_residual.training.tool_data`).
+  message, for example built with `tool_data.convert.convert`).
   **`data.vanilla_frac` / `--vanilla-frac F`** (needs `tool_task`; **default
   0.5**): tool training renders a seeded fraction F of the source rows as plain
   vanilla-SR chat rows

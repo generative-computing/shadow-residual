@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SR-adapter-as-tool data: converters, CLI, mode rendering, markers, model gate.
+"""SR-adapter-as-tool data: converters, mode rendering, markers, model gate.
 
 Tokenizer-dependent cases use the open-source Granite 4.2 tokenizer
 (``ibm-granite/granite-4.2-3b``) and are skipped if it can't be loaded; the
-converter / CLI / payload-extraction cases are pure Python.
+converter / payload-extraction cases are pure Python.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from shadow_residual.training.tool_data import (
     extract_tool_payload,
 )
 from shadow_residual.training.tool_data import answerability, intrinsics
-from shadow_residual.training.tool_data.__main__ import main as tool_data_main
 
 G42 = "ibm-granite/granite-4.2-3b"
 G41 = "ibm-granite/granite-4.1-3b"
@@ -204,43 +203,6 @@ def test_intrinsic_errors():
         intrinsics.split_row("guardian_core", {"messages": [{"role": "user", "content": "<guardian>no"}]})
 
 
-# --- CLI (pure Python) -----------------------------------------------------------
-
-
-def test_cli_train_split(tmp_path):
-    src = _write_jsonl(tmp_path / "src.jsonl", ANS_SRC * 5 + [
-        {"messages": [{"role": "user", "content": "hi"}], "ground_truth": "conversational"},
-    ])
-    tr, va = tmp_path / "train.jsonl", tmp_path / "val.jsonl"
-    assert tool_data_main([
-        "--task", "answerability", "--input", str(src),
-        "--out-train", str(tr), "--out-val", str(va), "--val-frac", "0.2",
-    ]) == 0
-    train = [json.loads(l) for l in tr.read_text().splitlines()]
-    val = [json.loads(l) for l in va.read_text().splitlines()]
-    assert (len(train), len(val)) == (8, 2)
-    assert all(r["messages"][-1]["role"] == "tool" for r in train + val)
-
-
-def test_cli_eval_drops_response_and_keeps_order(tmp_path):
-    rows = [{"messages": INTRINSIC_SRC["guardian_core"]["messages"][:-1], "ground_truth": gt}
-            for gt in ("yes", "no", "yes")]
-    src = _write_jsonl(tmp_path / "eval_src.jsonl", rows)
-    out = tmp_path / "eval.jsonl"
-    assert tool_data_main(["--task", "guardian_core", "--input", str(src), "--eval", "--out", str(out)]) == 0
-    got = [json.loads(l) for l in out.read_text().splitlines()]
-    assert [r["ground_truth"] for r in got] == ["yes", "no", "yes"]
-    assert all(r["messages"][-1]["role"] == "assistant" for r in got)
-
-
-def test_cli_requires_outputs(tmp_path):
-    src = _write_jsonl(tmp_path / "s.jsonl", ANS_SRC)
-    with pytest.raises(SystemExit):
-        tool_data_main(["--task", "answerability", "--input", str(src)])
-    with pytest.raises(SystemExit):
-        tool_data_main(["--task", "answerability", "--input", str(src), "--eval"])
-
-
 # --- payload extraction (pure Python) ------------------------------------------
 
 
@@ -408,7 +370,7 @@ def test_loader_reports_bad_row_location(tok, tmp_path):
 
 @pytest.mark.parametrize("mode", MODES)
 def test_loader_converts_source_rows_identically_to_cli(tok, tmp_path, mode):
-    """tool_task on load == running the tool_data CLI first, then loading."""
+    """tool_task on load == converting the rows first, then loading them as tool rows."""
     pytest.importorskip("datasets")
     from shadow_residual.training.data import load_jsonl_dataset
     conversational = {"messages": [{"role": "user", "content": "hi"}], "ground_truth": "conversational"}

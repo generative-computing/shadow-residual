@@ -208,8 +208,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    choices=[t.value for t in ToolTask],
                    help="Treat the train/val/generation rows as this task's SOURCE rows and "
                         "convert them to tool rows on load (data.tool_task; needs "
-                        "--tool-formatting). Replaces running `python -m "
-                        "shadow_residual.training.tool_data` first.")
+                        "--tool-formatting).")
     p.add_argument("--vanilla-frac", dest="vanilla_frac", type=float, default=None, metavar="F",
                    help="Tool training (data.vanilla_frac; needs --tool-task): render this "
                         "seeded fraction of the source rows as plain vanilla-SR chat rows (answer "

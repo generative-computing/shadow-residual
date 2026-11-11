@@ -171,8 +171,7 @@ With `data.tool_task` set (`--tool-task`; the reference config sets
 `answerability`), the rows are the task's source rows. The trainer converts
 them to tool rows on load, so training is one command. Without it, rows must be
 pre-converted tool rows: `messages` + `tools` (+ `documents`) ending with the
-trigger tool call and the gold `tool` response
-(`python -m shadow_residual.training.tool_data --task <task> ...`). The trainer
+trigger tool call and the gold `tool` response. The trainer
 renders the rows for the mode, so one data file trains either mode:
 
 | mode | adapter takes over after | adapter emits | markers (`assistant_marker` / `last_context_token` / `last_token`) |

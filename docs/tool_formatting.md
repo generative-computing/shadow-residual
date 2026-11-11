@@ -137,31 +137,18 @@ Notes:
   vanilla side with the plain generation prompt (for example the adapter
   benchmark's own HF+PEFT runner).
 
-### Building rows by hand: `python -m shadow_residual.training.tool_data`
+### What each task's tool row holds
 
-The CLI writes the converted rows to files, so you can inspect them or reuse
-them. No tokenizer is needed. The CLI and `data.tool_task` use the same
-converter (`tool_data/convert.py`).
-
-```bash
-# training: gold kept, shuffled train/val split
-python -m shadow_residual.training.tool_data --task answerability \
-  --input src.jsonl --out-train train.jsonl --out-val val.jsonl
-
-# eval prompts: gold tool message dropped (gold stays in ground_truth)
-python -m shadow_residual.training.tool_data --task guardian_core \
-  --input evaluation.jsonl --eval --out eval.jsonl
-```
-
-| `--task` | tool call arguments | payload |
+| `tool_task` | tool call arguments | payload |
 |---|---|---|
 | `answerability` | `{"question": <last user turn>}` | `{"answerable": true\|false}` (`partial` counts as answerable; `conversational` rows are dropped) |
 | `guardian_core` | `{"criteria", "target"}`, lifted out of the `<guardian>` instruction turn | `{"score": "yes"\|"no"}` |
 | `requirement_check` | `{"requirements"}`, lifted out of the `<requirements>` instruction turn | `{"score": "yes"\|"no"}` |
 | `query_clarification` | `{"query": <last user turn>}` | `{"clarification": "CLEAR" \| <question>}` |
 
-To add a task, write a converter that returns the row shape above. The
-formatting layer is task-agnostic.
+To add a task, write a converter in `tool_data/` that returns the row shape
+above and register it in `tool_data/convert.py`. The formatting layer is
+task-agnostic.
 
 ---
 

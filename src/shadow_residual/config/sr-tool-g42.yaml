@@ -15,9 +15,9 @@
 # tool row on load (trigger tool call + gold tool response) and renders it for
 # the mode, so one command trains either mode. Other tasks: `--tool-task
 # guardian_core | requirement_check | query_clarification`. Only one source
-# file? Use `--val-frac 0.1` instead of a val file. Rows already converted with
-# `python -m shadow_residual.training.tool_data`: remove `tool_task` below; they
-# train as tool rows only (they no longer carry the vanilla answer).
+# file? Use `--val-frac 0.1` instead of a val file. Rows that are already tool
+# rows: remove `tool_task` below; they train as tool rows only (they no longer
+# carry the vanilla answer).
 #
 # Vanilla rows: data.vanilla_frac (default 0.5) sets the fraction;
 # `--vanilla-frac 0` trains tool rows only.

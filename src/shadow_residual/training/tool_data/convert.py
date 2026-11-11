@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dispatch a task source row to its tool-row converter.
 
-Shared by the ``tool_data`` CLI and by the trainer / generator when
-``data.tool_task`` is set (conversion on load, no intermediate file).
+Used by the trainer / generator when ``data.tool_task`` is set (conversion on
+load, no intermediate file).
 """
 
 from __future__ import annotations

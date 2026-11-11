@@ -6,8 +6,7 @@
   tokenizer supports them (Granite 4.2 only).
 - :mod:`.answerability` / :mod:`.intrinsics` convert task source rows into
   tool rows; :mod:`.convert` dispatches by task (used on load when
-  ``data.tool_task`` is set); ``python -m shadow_residual.training.tool_data``
-  is the CLI.
+  ``data.tool_task`` is set).
 
 See ``docs/tool_formatting.md``.
 """
