@@ -55,7 +55,8 @@ most-edited fields.
 --lora-alpha INT        override adapter.alpha
 --batch-size INT        override batch.per_device_train
 --grad-accum INT        override batch.gradient_accumulation
---max-length INT        override data.max_length (longer rows are truncated, dropping their labels)
+--max-length INT        override data.max_length (tool training drops rows of >= INT tokens; other
+                        training truncates longer rows, dropping their labels)
 --thinking              set data.enable_thinking=True (apply_chat_template enable_thinking)
 --tool-formatting [MODE]  opt in to SR-adapter-as-tool training (data.tool_formatting, Granite 4.2);
                         bare flag = external_tool_formatting, or autoregressive_tool_formatting

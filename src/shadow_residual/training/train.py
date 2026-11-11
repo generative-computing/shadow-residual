@@ -122,8 +122,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Override adapter.target_modules to a uniform scalar rank")
     p.add_argument("--lora-alpha", type=int, default=None, help="Override adapter.alpha")
     p.add_argument("--max-length", type=int, default=None,
-                   help="Override data.max_length (rows longer than this are truncated "
-                        "from the end, which drops their supervised completion)")
+                   help="Override data.max_length. Tool training drops rows of at least this "
+                        "many tokens; other training truncates longer rows from the end, which "
+                        "drops their supervised completion.")
     p.add_argument("--batch-size", type=int, default=None, help="Override batch.per_device_train")
     p.add_argument("--grad-accum", type=int, default=None, help="Override batch.gradient_accumulation")
 

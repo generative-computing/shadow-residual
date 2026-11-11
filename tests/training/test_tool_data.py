@@ -266,12 +266,8 @@ def test_markers_table_matches_modes():
 
 
 def _load_tokenizer(model_id: str):
-    pytest.importorskip("transformers")
-    from transformers import AutoTokenizer
-    try:
-        return AutoTokenizer.from_pretrained(model_id)
-    except Exception as e:  # pragma: no cover - environment dependent
-        pytest.skip(f"{model_id} tokenizer unavailable: {e}")
+    from tests._tokenizers import load_tokenizer
+    return load_tokenizer(model_id)
 
 
 @pytest.fixture(scope="module")

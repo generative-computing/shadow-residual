@@ -44,8 +44,8 @@ def tokenizer():
     full row's tokenization — a fixture artifact, not behavior these tests
     intend to exercise.
     """
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-LlamaForCausalLM")
+    from tests._tokenizers import load_tokenizer
+    tok = load_tokenizer("hf-internal-testing/tiny-random-LlamaForCausalLM")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.add_special_tokens(

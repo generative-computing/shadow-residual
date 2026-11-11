@@ -441,11 +441,8 @@ def test_run_generation_halves_batch_on_oom(tmp_path, monkeypatch):
 
 
 def _g42_tokenizer():
-    from transformers import AutoTokenizer
-    try:
-        return AutoTokenizer.from_pretrained("ibm-granite/granite-4.2-3b")
-    except Exception as e:  # pragma: no cover - environment dependent
-        pytest.skip(f"granite 4.2 tokenizer unavailable: {e}")
+    from tests._tokenizers import load_tokenizer
+    return load_tokenizer("ibm-granite/granite-4.2-3b")
 
 
 class _ScriptedModel:
@@ -550,12 +547,9 @@ def test_run_generation_tool_task_converts_eval_source_rows(tmp_path):
 
 def test_run_generation_tool_mode_rejects_non_g42_tokenizer(tmp_path):
     import json
-    from transformers import AutoTokenizer
     from shadow_residual.training import generate as gen_mod
-    try:
-        tok41 = AutoTokenizer.from_pretrained("ibm-granite/granite-4.1-3b")
-    except Exception as e:  # pragma: no cover - environment dependent
-        pytest.skip(f"granite 4.1 tokenizer unavailable: {e}")
+    from tests._tokenizers import load_tokenizer
+    tok41 = load_tokenizer("ibm-granite/granite-4.1-3b")
     data_path = tmp_path / "eval.jsonl"
     data_path.write_text(json.dumps({"messages": [{"role": "user", "content": "q"}]}) + "\n")
     with pytest.raises(ValueError, match=r"requires a Granite 4\.2 base model"):

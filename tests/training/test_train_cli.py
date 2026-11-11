@@ -208,14 +208,11 @@ def _tool_cfg(tmp_path: Path, base: str, **data) -> Path:
 
 def test_main_rejects_non_g42_base_before_model_build(tmp_path, no_model_build):
     pytest.importorskip("trl")
-    from transformers import AutoTokenizer
     from shadow_residual.training.train import main
+    from tests._tokenizers import load_tokenizer
 
     base = "ibm-granite/granite-4.1-3b"
-    try:
-        AutoTokenizer.from_pretrained(base)
-    except Exception as e:  # pragma: no cover - environment dependent
-        pytest.skip(f"{base} tokenizer unavailable: {e}")
+    load_tokenizer(base)
     with pytest.raises(ValueError, match=r"requires a Granite 4\.2 base model.*granite-4\.1-3b"):
         main(["--config", str(_tool_cfg(tmp_path, base))])
 

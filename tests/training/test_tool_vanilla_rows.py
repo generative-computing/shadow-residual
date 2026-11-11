@@ -114,11 +114,8 @@ def tok():
     pytest.importorskip("transformers")
     pytest.importorskip("datasets")
     pytest.importorskip("torch")
-    from transformers import AutoTokenizer
-    try:
-        return AutoTokenizer.from_pretrained(G42)
-    except Exception as e:  # pragma: no cover - environment dependent
-        pytest.skip(f"{G42} tokenizer unavailable: {e}")
+    from tests._tokenizers import load_tokenizer
+    return load_tokenizer(G42)
 
 
 def _load(tok, path, mode, task, frac=0.5, seed=2):
