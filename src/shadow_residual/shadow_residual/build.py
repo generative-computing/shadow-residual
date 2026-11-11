@@ -131,7 +131,7 @@ def build_sr_base(
     )
     sr_model = ShadowResidualForCausalLM(sr_config)
     if torch_dtype is not None:
-        sr_model = sr_model.to(dtype=torch_dtype)
+        sr_model = to_dtype_keep_rope_fp32(sr_model, torch_dtype)
 
     load_kwargs = {"low_cpu_mem_usage": True}
     if torch_dtype is not None:
@@ -146,6 +146,40 @@ def build_sr_base(
     return sr_model
 
 
+_ROPE_BUFFERS = ("inv_freq", "original_inv_freq")
+
+
+def _rope_buffers_to_fp32(model) -> None:
+    """Re-register every RoPE frequency buffer as float32 (values not recomputed).
+
+    On meta tensors this is a pure metadata flip. On real tensors the values
+    keep whatever rounding they already had — follow with
+    :func:`reinit_rope_buffers` to recompute them exactly.
+    """
+    for module in model.modules():
+        for name in _ROPE_BUFFERS:
+            buf = module._buffers.get(name)
+            if buf is not None and buf.dtype != torch.float32:
+                module._buffers[name] = buf.float()
+
+
+def to_dtype_keep_rope_fp32(model, dtype: torch.dtype):
+    """``model.to(dtype=dtype)``, except the RoPE frequency buffers stay float32.
+
+    A whole-module ``.to(bfloat16)`` also casts the non-persistent
+    ``inv_freq`` / ``original_inv_freq`` buffers, and bf16 frequencies drift the
+    rotation angle by radians at long positions (measured on granite-4.1-3b:
+    up to ~1.2 rad at position 1024, ~9.6 rad at 8192). Stock HF
+    ``from_pretrained(dtype=bfloat16)`` keeps them fp32; every SR build path
+    casts through here so training and serving match it and each other.
+    Real buffers are recomputed exactly; meta buffers only change dtype.
+    """
+    model = model.to(dtype=dtype)
+    _rope_buffers_to_fp32(model)
+    reinit_rope_buffers(model)
+    return model
+
+
 def reinit_rope_buffers(model) -> None:
     """Recompute non-persistent RoPE ``inv_freq`` buffers after meta-materialize.
 
@@ -154,12 +188,14 @@ def reinit_rope_buffers(model) -> None:
     fresh on CPU — its ``__init__`` runs the correct rope-init for whatever
     rope_type the config declares, so we don't reimplement the HF dispatch
     (which varies across transformers versions). The freshly-computed
-    ``inv_freq`` / ``original_inv_freq`` are copied in-place into the
-    materialized buffers. No-op when the model has no rotary module (e.g.
-    configs that disable RoPE). Idempotent and safe on a fully-real model.
+    ``inv_freq`` / ``original_inv_freq`` are copied into the materialized
+    buffers, which are always left in float32 (see
+    :func:`to_dtype_keep_rope_fp32`). No-op when the model has no rotary module
+    (e.g. configs that disable RoPE). Idempotent and safe on a fully-real model.
     See :func:`shadow_residual.training.factory._materialize_and_transfer`
     for why this is required under the FSDP meta-init path.
     """
+    _rope_buffers_to_fp32(model)
     n_fixed = 0
     for module in model.modules():
         buf = getattr(module, "inv_freq", None)
@@ -172,11 +208,9 @@ def reinit_rope_buffers(model) -> None:
         # model's own rope-init recipe regardless of rope_type.
         fresh = type(module)(config=config, device=torch.device("cpu"))
         with torch.no_grad():
-            module.inv_freq.copy_(fresh.inv_freq.to(module.inv_freq.dtype))
+            module.inv_freq.copy_(fresh.inv_freq)
             if hasattr(module, "original_inv_freq") and hasattr(fresh, "original_inv_freq"):
-                module.original_inv_freq.copy_(
-                    fresh.original_inv_freq.to(module.original_inv_freq.dtype)
-                )
+                module.original_inv_freq.copy_(fresh.original_inv_freq)
         if hasattr(fresh, "attention_scaling"):
             module.attention_scaling = fresh.attention_scaling
         n_fixed += 1
@@ -218,5 +252,6 @@ __all__ = [
     "build_sr_config",
     "build_sr_base",
     "reinit_rope_buffers",
+    "to_dtype_keep_rope_fp32",
     "diagnose_materialized",
 ]
