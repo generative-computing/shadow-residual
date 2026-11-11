@@ -154,11 +154,16 @@ the base then writes the answer. Two modes are available:
 `external_tool_formatting`, where the serving environment writes the tool-turn
 scaffolding, and `autoregressive_tool_formatting`, where the adapter writes it.
 
+One command trains from the task's source rows. The trainer converts them to
+tool rows on load (`data.tool_task`, default `answerability` in the reference
+config):
+
 ```bash
-python -m shadow_residual.training.tool_data --task answerability \
-  --input src.jsonl --out-train data/train.jsonl --out-val data/val.jsonl
-BASE_MODEL=ibm-granite/granite-4.2-3b DATA_ROOT=data RUN_DIR=runs/tool EVAL_DATA=data/val.jsonl \
-  sr-train --config src/shadow_residual/config/sr-tool-g42.yaml
+sr-train --config src/shadow_residual/config/sr-tool-g42.yaml \
+  --base-model ibm-granite/granite-4.2-3b --data-root /path/to/src \
+  --eval-data /path/to/src/val.jsonl --run-dir runs/tool
+# --tool-task guardian_core | requirement_check | query_clarification
+# --train-data src.jsonl --val-frac 0.1    (one source file, split in the trainer)
 ```
 
 See [`docs/tool_formatting.md`](docs/tool_formatting.md) for both modes in full.

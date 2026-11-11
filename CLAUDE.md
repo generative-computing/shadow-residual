@@ -68,6 +68,13 @@ accelerate launch --config_file src/shadow_residual/config/accelerate/fsdp_4gpu.
   --train-data … --val-data … --output-dir ./ckpt
 ```
 
+The reference configs' `${BASE_MODEL}` / `${DATA_ROOT}` / `${EVAL_DATA}` /
+`${RUN_DIR}` placeholders come from `--base-model` / `--data-root` /
+`--eval-data` / `--run-dir` (`sr-train` and `sr-generate`), or from the
+environment variable of the same name (the flag wins). Explicit paths
+(`--train-data`, `--val-data`, `--val-frac`, `--output-dir`) replace their
+fields before resolution, so their placeholders need no value.
+
 Config essentials:
 - **`"cross_stream"` in `adapter.target_modules`** engages the dual-stream SR
   forward. Do NOT list `k_proj` / `v_proj` (K/V LoRA is rejected).
@@ -80,16 +87,29 @@ Config essentials:
 - **`data.enable_thinking` / `--thinking`** → forwarded to
   `apply_chat_template(enable_thinking=...)`. CLI wins over YAML. Default False.
 - **`data.tool_formatting` / `--tool-formatting`** (opt-in, **Granite 4.2 only**)
-  → trains the adapter to be called as a tool. It emits the `<tool_response>`
-  payload and stops, and **never writes the assistant answer**. The two modes
+  → trains the adapter to be called as a tool. As a tool it emits the
+  `<tool_response>` payload and stops, and **never writes the assistant
+  answer**. The two modes
   are `external_tool_formatting` (the env writes `<tool_response>\n`; the
   adapter emits the payload and EOS) and `autoregressive_tool_formatting` (the
   adapter emits the whole tool turn after `</tool_call>`). The mode sets
   `assistant_marker` / `last_context_token` / `last_token`; setting any of them
-  too raises. A non-4.2 base raises. Rows are `messages` + `tools` ending with
-  the trigger call and the gold `tool` message, built with
-  `python -m shadow_residual.training.tool_data`. Reference config:
-  `sr-tool-g42.yaml`. Details: [`docs/tool_formatting.md`](docs/tool_formatting.md).
+  too raises. A non-4.2 base raises. **`data.tool_task` / `--tool-task`**
+  (needs `tool_formatting`): rows are task *source* rows, converted to tool rows
+  on load (training, post-train generation, `sr-generate`), so training is one
+  command; `--val-frac F` (`data.val_frac`, exclusive with `val_path`) splits
+  validation off the train rows. Without `tool_task`, rows must already be tool
+  rows (`messages` + `tools` ending with the trigger call and the gold `tool`
+  message, for example built with `tool_data.convert.convert`).
+  **`data.vanilla_frac` / `--vanilla-frac F`** (needs `tool_task`; **default
+  0.5**): tool training renders a seeded fraction F of the source rows as plain
+  vanilla-SR chat rows
+  (answer after `<|im_start|>assistant\n<think></think>`, last context token
+  `</think>`), the rest as tool rows; the collator cuts each row after whichever
+  of the two markers ends last, and every row is checked for that at load.
+  `--vanilla-frac 0` = tool rows only. Reference config: `sr-tool-g42.yaml`
+  (`tool_task: answerability`). Details:
+  [`docs/tool_formatting.md`](docs/tool_formatting.md).
 
 **How checkpointing works.** The decoder layer is a `GradientCheckpointingLayer`
 with a single stacked-tensor (`[2,B,S,H]`) dual-stream forward and a pure
@@ -153,6 +173,5 @@ If you touch the model or PEFT wiring, run the invariant tests
 
 ## Git protocol
 
-**Never commit and never push.** Stage only (`git add`); the maintainer reviews,
-commits, and pushes. **Never sign commits as Claude** (no `Co-Authored-By`,
+**Never sign commits as Claude** (no `Co-Authored-By`,
 `Generated with Claude Code`, or similar).

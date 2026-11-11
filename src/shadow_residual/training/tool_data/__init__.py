@@ -5,7 +5,8 @@
   modes (training text, generation prompts, payload extraction) and checks the
   tokenizer supports them (Granite 4.2 only).
 - :mod:`.answerability` / :mod:`.intrinsics` convert task source rows into
-  tool rows; ``python -m shadow_residual.training.tool_data`` is the CLI.
+  tool rows; :mod:`.convert` dispatches by task (used on load when
+  ``data.tool_task`` is set).
 
 See ``docs/tool_formatting.md``.
 """
@@ -14,6 +15,7 @@ from shadow_residual.training.tool_data.formatting import (
     AUTOREGRESSIVE,
     EXTERNAL,
     TOOL_FORMATTING_MARKERS,
+    VANILLA_MARKERS,
     ToolMarkers,
     check_tool_formatting_support,
     extract_tool_payload,
@@ -26,6 +28,7 @@ __all__ = [
     "EXTERNAL",
     "TOOL_FORMATTING_MARKERS",
     "ToolMarkers",
+    "VANILLA_MARKERS",
     "check_tool_formatting_support",
     "extract_tool_payload",
     "render_tool_example",

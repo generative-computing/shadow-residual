@@ -74,6 +74,38 @@ def _verdict(row: dict) -> str | None:
     return gt if gt in _LABELS else None
 
 
+def _is_document_turn(m: dict) -> bool:
+    return m.get("role") in ("tool", "documents")
+
+
+def documents(row: dict) -> list:
+    """The row's ``documents`` plus its inline document turns (``tool`` /
+    ``documents`` messages, the adapter-bench g42-alora-4.1-split shape), the
+    latter as ``{"document_id": <index>, "content": ...}`` like the benchmark's
+    own training-set renderer."""
+    docs = list(row.get("documents") or [])
+    for m in row.get("messages", []):
+        if _is_document_turn(m):
+            docs.append({"document_id": len(docs), "content": m.get("content")})
+    return docs
+
+
+def to_vanilla_row(row: dict) -> dict:
+    """The source row as a plain chat row: inline document turns move into
+    ``documents``; the final assistant turn (the quoted label) is the gold, built
+    from ``ground_truth`` when the row has none."""
+    messages = [m for m in row.get("messages", []) if not _is_document_turn(m)]
+    if messages and messages[-1].get("role") != "assistant" and _verdict(row):
+        messages.append({"role": "assistant", "content": f'"{_verdict(row)}"'})
+    if not messages or messages[-1].get("role") != "assistant":
+        raise ValueError("a vanilla answerability row must end with the gold assistant turn")
+    out = {"messages": messages}
+    docs = documents(row)
+    if docs:
+        out["documents"] = docs
+    return out
+
+
 def to_tool_row(row: dict, *, include_response: bool = True) -> dict | None:
     """Convert one source row; ``None`` if it has no usable verdict or question.
 
@@ -104,6 +136,7 @@ def to_tool_row(row: dict, *, include_response: bool = True) -> dict | None:
         "tools": [ANSWERABILITY_TOOL],
         "ground_truth": "answerable" if answerable else "unanswerable",
     }
-    if row.get("documents"):
-        out["documents"] = row["documents"]
+    docs = documents(row)
+    if docs:
+        out["documents"] = docs
     return out

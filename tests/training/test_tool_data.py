@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SR-adapter-as-tool data: converters, CLI, mode rendering, markers, model gate.
+"""SR-adapter-as-tool data: converters, mode rendering, markers, model gate.
 
 Tokenizer-dependent cases use the open-source Granite 4.2 tokenizer
 (``ibm-granite/granite-4.2-3b``) and are skipped if it can't be loaded; the
-converter / CLI / payload-extraction cases are pure Python.
+converter / payload-extraction cases are pure Python.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from shadow_residual.training.tool_data import (
     extract_tool_payload,
 )
 from shadow_residual.training.tool_data import answerability, intrinsics
-from shadow_residual.training.tool_data.__main__ import main as tool_data_main
 
 G42 = "ibm-granite/granite-4.2-3b"
 G41 = "ibm-granite/granite-4.1-3b"
@@ -137,6 +136,24 @@ def test_answerability_drops_unusable_rows(row):
     assert answerability.to_tool_row(row) is None
 
 
+def test_answerability_lifts_inline_document_turns():
+    # adapter-bench g42-alora-4.1-split rows carry their documents as tool turns.
+    row = {"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "tool", "content": "doc A"},
+        {"role": "tool", "content": "doc B"},
+        {"role": "user", "content": "q?"},
+        {"role": "assistant", "content": '"unanswerable"'},
+    ]}
+    out = answerability.to_tool_row(row)
+    assert out["documents"] == [
+        {"document_id": 0, "content": "doc A"},
+        {"document_id": 1, "content": "doc B"},
+    ]
+    assert [m["role"] for m in out["messages"]] == ["system", "user", "assistant", "tool"]
+
+
 def test_answerability_eval_row_has_no_response():
     row = answerability.to_tool_row(ANS_SRC[1], include_response=False)
     assert row["messages"][-1]["role"] == "assistant"
@@ -186,43 +203,6 @@ def test_intrinsic_errors():
         intrinsics.split_row("guardian_core", {"messages": [{"role": "user", "content": "<guardian>no"}]})
 
 
-# --- CLI (pure Python) -----------------------------------------------------------
-
-
-def test_cli_train_split(tmp_path):
-    src = _write_jsonl(tmp_path / "src.jsonl", ANS_SRC * 5 + [
-        {"messages": [{"role": "user", "content": "hi"}], "ground_truth": "conversational"},
-    ])
-    tr, va = tmp_path / "train.jsonl", tmp_path / "val.jsonl"
-    assert tool_data_main([
-        "--task", "answerability", "--input", str(src),
-        "--out-train", str(tr), "--out-val", str(va), "--val-frac", "0.2",
-    ]) == 0
-    train = [json.loads(l) for l in tr.read_text().splitlines()]
-    val = [json.loads(l) for l in va.read_text().splitlines()]
-    assert (len(train), len(val)) == (8, 2)
-    assert all(r["messages"][-1]["role"] == "tool" for r in train + val)
-
-
-def test_cli_eval_drops_response_and_keeps_order(tmp_path):
-    rows = [{"messages": INTRINSIC_SRC["guardian_core"]["messages"][:-1], "ground_truth": gt}
-            for gt in ("yes", "no", "yes")]
-    src = _write_jsonl(tmp_path / "eval_src.jsonl", rows)
-    out = tmp_path / "eval.jsonl"
-    assert tool_data_main(["--task", "guardian_core", "--input", str(src), "--eval", "--out", str(out)]) == 0
-    got = [json.loads(l) for l in out.read_text().splitlines()]
-    assert [r["ground_truth"] for r in got] == ["yes", "no", "yes"]
-    assert all(r["messages"][-1]["role"] == "assistant" for r in got)
-
-
-def test_cli_requires_outputs(tmp_path):
-    src = _write_jsonl(tmp_path / "s.jsonl", ANS_SRC)
-    with pytest.raises(SystemExit):
-        tool_data_main(["--task", "answerability", "--input", str(src)])
-    with pytest.raises(SystemExit):
-        tool_data_main(["--task", "answerability", "--input", str(src), "--eval"])
-
-
 # --- payload extraction (pure Python) ------------------------------------------
 
 
@@ -248,12 +228,8 @@ def test_markers_table_matches_modes():
 
 
 def _load_tokenizer(model_id: str):
-    pytest.importorskip("transformers")
-    from transformers import AutoTokenizer
-    try:
-        return AutoTokenizer.from_pretrained(model_id)
-    except Exception as e:  # pragma: no cover - environment dependent
-        pytest.skip(f"{model_id} tokenizer unavailable: {e}")
+    from tests._tokenizers import load_tokenizer
+    return load_tokenizer(model_id)
 
 
 @pytest.fixture(scope="module")
@@ -390,6 +366,81 @@ def test_loader_reports_bad_row_location(tok, tmp_path):
     path = _write_jsonl(tmp_path / "rows.jsonl", [good, bad])
     with pytest.raises(ValueError, match=r"rows\.jsonl:2: .*tool message"):
         load_jsonl_dataset(path, tok, tool_formatting=EXTERNAL)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_loader_converts_source_rows_identically_to_cli(tok, tmp_path, mode):
+    """tool_task on load == converting the rows first, then loading them as tool rows."""
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    conversational = {"messages": [{"role": "user", "content": "hi"}], "ground_truth": "conversational"}
+    src = _write_jsonl(tmp_path / "src.jsonl", [ANS_SRC[0], conversational, ANS_SRC[1]])
+    pre = _write_jsonl(tmp_path / "pre.jsonl", [answerability.to_tool_row(r) for r in ANS_SRC])
+    last = TOOL_FORMATTING_MARKERS[mode].last_token
+    on_load = load_jsonl_dataset(src, tok, last_token=last, tool_formatting=mode, tool_task="answerability")
+    two_step = load_jsonl_dataset(pre, tok, last_token=last, tool_formatting=mode)
+    assert on_load["text"] == two_step["text"]
+    assert len(on_load) == 2  # the conversational row is dropped
+
+
+@pytest.mark.parametrize("task", intrinsics.INTRINSICS)
+def test_loader_converts_intrinsic_source_rows(tok, tmp_path, task):
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    src = _write_jsonl(tmp_path / "src.jsonl", [INTRINSIC_SRC[task]])
+    ds = load_jsonl_dataset(src, tok, tool_formatting=EXTERNAL, tool_task=task)
+    gold = json.dumps(json.loads(INTRINSIC_SRC[task]["messages"][-1]["content"]))
+    assert ds[0]["text"].endswith("<tool_response>\n" + gold + IM_END)
+
+
+def test_loader_rejects_already_converted_rows(tok, tmp_path):
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    pre = _write_jsonl(tmp_path / "pre.jsonl", [answerability.to_tool_row(ANS_SRC[0])])
+    with pytest.raises(ValueError, match=r"pre\.jsonl:1: .*already defines the 'answerability' tool"):
+        load_jsonl_dataset(pre, tok, tool_formatting=EXTERNAL, tool_task="answerability")
+
+
+def test_loader_reports_source_row_conversion_error(tok, tmp_path):
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    bad = {"messages": [{"role": "user", "content": "<guardian>no criteria"}]}
+    src = _write_jsonl(tmp_path / "src.jsonl", [INTRINSIC_SRC["guardian_core"], bad])
+    with pytest.raises(ValueError, match=r"src\.jsonl:2: guardian_core conversion: .*criteria"):
+        load_jsonl_dataset(src, tok, tool_formatting=EXTERNAL, tool_task="guardian_core")
+
+
+def test_loader_tool_task_requires_tool_formatting(tok, tmp_path):
+    pytest.importorskip("datasets")
+    from shadow_residual.training.data import load_jsonl_dataset
+    src = _write_jsonl(tmp_path / "src.jsonl", ANS_SRC)
+    with pytest.raises(ValueError, match="tool_task requires tool_formatting"):
+        load_jsonl_dataset(src, tok, tool_task="answerability")
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_debug_collator_prints_first_batch_with_supervised_span(tok, mode, caplog):
+    """The first batch always prints (even at probability 0), showing the last
+    context token and the supervised span; later batches follow the probability."""
+    import logging
+    pytest.importorskip("torch")
+    from shadow_residual.training.data import DebugPrintingCollator, ResponseOnlyCollator
+    from shadow_residual.training.tool_data import render_tool_example
+
+    row = answerability.to_tool_row(ANS_SRC[0])
+    markers = TOOL_FORMATTING_MARKERS[mode]
+    ids = tok.encode(_render(render_tool_example, tok, row, mode), add_special_tokens=False)
+    col = DebugPrintingCollator(ResponseOnlyCollator(tokenizer=tok, response_template=markers.assistant_marker),
+                                tokenizer=tok, probability=0.0)
+    with caplog.at_level(logging.INFO, logger="shadow_residual.training.data"):
+        col([{"input_ids": ids}])
+        col([{"input_ids": ids}])
+    log = caplog.text
+    assert log.count("DEBUG COLLATOR OUTPUT") == 1
+    assert f"Last context token: {markers.last_context_token!r}" in log
+    span = _gold(row) + IM_END if mode == EXTERNAL else (
+        "\n<|im_start|>user\n<tool_response>\n" + _gold(row) + "\n</tool_response>\n" + IM_END)
+    assert f"Supervised text: {span!r}" in log
 
 
 def test_loader_without_tool_formatting_is_unchanged(tok, tmp_path):

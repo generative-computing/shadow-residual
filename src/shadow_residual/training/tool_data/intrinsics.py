@@ -108,6 +108,23 @@ def split_row(intrinsic: str, row: dict) -> tuple[list[dict], dict, dict | None]
     return convo, args, _score_gold(final, row)
 
 
+def to_vanilla_row(intrinsic: str, row: dict) -> dict:
+    """The source row as a plain chat row; its final assistant turn is the gold,
+    built from ``ground_truth`` (the score dict) when the row has none."""
+    if intrinsic not in TOOLS:
+        raise KeyError(f"unknown intrinsic {intrinsic!r}; known: {INTRINSICS}")
+    messages = list(row["messages"])
+    if (messages and messages[-1].get("role") != "assistant" and intrinsic != "query_clarification"
+            and row.get("ground_truth") is not None):
+        messages.append({"role": "assistant", "content": json.dumps(_score_gold(None, row))})
+    if not messages or messages[-1].get("role") != "assistant":
+        raise ValueError(f"a vanilla {intrinsic} row must end with the gold assistant turn")
+    out = {"messages": messages}
+    if row.get("documents"):
+        out["documents"] = row["documents"]
+    return out
+
+
 def to_tool_row(intrinsic: str, row: dict, *, include_response: bool = True) -> dict:
     """Convert one source row to a tool-formatted row.
 

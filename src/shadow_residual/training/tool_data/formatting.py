@@ -82,6 +82,12 @@ TOOL_FORMATTING_MARKERS: dict[str, ToolMarkers] = {
     EXTERNAL: ToolMarkers(TOOL_RESPONSE_OPEN, "\n", EOS),
 }
 
+# Vanilla rows (``data.vanilla_frac``): plain Granite 4.2 SR chat rows, thinking
+# off. The adapter answers right after the empty think block. Tool training from
+# source rows renders this fraction of them as vanilla rows unless set.
+VANILLA_MARKERS = ToolMarkers("<|im_start|>assistant\n<think></think>", "</think>", EOS)
+DEFAULT_VANILLA_FRAC = 0.5
+
 
 def _mode(mode: str) -> str:
     return ToolFormatting(mode).value
@@ -253,6 +259,7 @@ __all__ = [
     "EXTERNAL",
     "TOOL_FORMATTING_MARKERS",
     "ToolMarkers",
+    "VANILLA_MARKERS",
     "check_tool_formatting_support",
     "extract_tool_payload",
     "render_tool_example",

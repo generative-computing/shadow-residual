@@ -3,8 +3,11 @@
 An SR adapter can be exposed to the base model as a **tool**. The base decides
 when to call it (it emits a `<tool_call>`), the serving environment routes the
 next tokens to the adapter, and the adapter produces the tool's
-`<tool_response>` payload. **The adapter never writes the assistant answer.**
-After the tool turn, the base (or another adapter) resumes and answers.
+`<tool_response>` payload. **As a tool, the adapter never writes the assistant
+answer.** After the tool turn, the base (or another adapter) resumes and answers.
+Tool training also renders half of the source rows as plain (vanilla SR) chat
+rows, so the same adapter answers directly when it is invoked after the plain
+generation prompt (see [Vanilla rows](#vanilla-rows-datavanilla_frac)).
 
 `data.tool_formatting` selects which of two handoff contracts the adapter is
 trained for. It is opt-in. Unset (the default), training is standard chat SFT
@@ -54,30 +57,98 @@ are the same row without the trailing `tool` message; gold, if any, goes in
 `ground_truth`. A trailing gold `tool` message is also accepted at generation
 time and is dropped from the prompt.
 
-### Building rows: `python -m shadow_residual.training.tool_data`
+### Train from source rows: `data.tool_task`
 
-The `shadow_residual.training.tool_data` package converts task source rows into
-tool rows. No tokenizer is needed.
+Set `data.tool_task` (or `--tool-task`) and the trainer converts each task
+**source** row to a tool row on load, then renders it for the mode. You don't
+need a separate data-prep step. Rows the converter can't use are dropped and
+counted in the log (`converted N answerability source rows to tool rows (M
+dropped as unusable)`). Post-training generation and `sr-generate` convert eval
+source rows the same way: the gold tool message is dropped, and `ground_truth`
+is kept for the scorer.
 
 ```bash
-# training: gold kept, shuffled train/val split
-python -m shadow_residual.training.tool_data --task answerability \
-  --input src.jsonl --out-train train.jsonl --out-val val.jsonl
-
-# eval prompts: gold tool message dropped (gold stays in ground_truth)
-python -m shadow_residual.training.tool_data --task guardian_core \
-  --input evaluation.jsonl --eval --out eval.jsonl
+# one command; one source file, validation split held out in the trainer
+sr-train --config src/shadow_residual/config/sr-tool-g42.yaml \
+  --tool-formatting external_tool_formatting --tool-task answerability \
+  --train-data src.jsonl --val-frac 0.1
 ```
 
-| `--task` | tool call arguments | payload |
+`--val-frac F` (`data.val_frac`) holds out a seeded (`runtime.seed`) fraction of
+the train rows instead of reading `data.val_path`. Set exactly one of the two.
+`tool_task` requires `tool_formatting`. If a row already defines the task's
+tool, it has already been converted, so loading it with `tool_task` set raises
+an error. For pre-converted files, unset `tool_task`.
+
+Answerability source rows may carry their documents as inline `tool` turns (the
+adapter-bench `g42-alora-4.1-split` shape) instead of a `documents` field. The
+converter moves them into `documents` as `{"document_id": <index>, "content":
+...}`, the same records the benchmark's own renderer builds.
+
+### Vanilla rows: `data.vanilla_frac`
+
+Tool training from source rows (`tool_task`) renders a seeded (`runtime.seed`)
+`round(F * n)` of the usable source rows as **vanilla SR** chat rows; the rest
+train as tool rows for the mode. `F` is `data.vanilla_frac` (`--vanilla-frac F`),
+**default 0.5**. One adapter then
+serves both ways: as a tool, and by last-context-token activation after the
+plain generation prompt. `--vanilla-frac 0` trains tool rows only; pre-converted
+tool rows (no `tool_task`) always train as tool rows only. Each source row is used once, in one
+of the two formats.
+
+A vanilla row is the source row as a plain chat row (documents after the last
+user turn, thinking off), and it supervises the source row's own final
+assistant turn. The response formats differ. For answerability the vanilla gold
+is the quoted label and the tool gold is the dict:
+
+```
+vanilla  ...<|im_start|>assistant\n<think></think>   "unanswerable"<|im_end|>\n
+tool     ...<|im_start|>user\n<tool_response>\n       {"answerable": false}<|im_end|>
+```
+
+| row kind | marker (masked through) | last context token |
+|---|---|---|
+| vanilla | `<\|im_start\|>assistant\n<think></think>` | `</think>` |
+| tool, external | `<tool_response>\n` | `\n` |
+| tool, autoregressive | `</tool_call>` | `</tool_call>` |
+
+TRL passes only token ids to the collator, so a row's kind is not available
+there. The collator gets both markers and cuts after the one whose last
+occurrence **ends last**. That is always the row's own marker: a vanilla row's
+documents `<tool_response>\n` comes before its final assistant opener, and a
+tool row's trigger-turn assistant opener comes before its tool marker. The
+loader checks this on every row with the real tokenization and names the line
+of a row that would be cut elsewhere. The dataset gets a `kind` column, and the
+boundary validator runs per kind, each against its own last context token.
+`adapter_config.json` records `vanilla_frac` and `vanilla_last_context_token`.
+
+Notes:
+- The split is exact per file, before a `--val-frac` split; train and val then
+  each hold about F vanilla rows.
+- Rows the tool converter drops (answerability `conversational`) are dropped for
+  both kinds. A vanilla row keeps the source label as is (answerability
+  `"partial"` stays `"partial"`); a row with only `ground_truth` gets its gold
+  turn built from it.
+- In tool mode (with or without vanilla rows), rows of at least
+  `data.max_length` tokens are dropped and counted in the log. The trainer would
+  truncate them from the end, which cuts off the supervised span and leaves an
+  earlier marker (the documents, the trigger turn) as the cut point.
+- Post-training generation and `sr-generate` render the tool prompt. Evaluate the
+  vanilla side with the plain generation prompt (for example the adapter
+  benchmark's own HF+PEFT runner).
+
+### What each task's tool row holds
+
+| `tool_task` | tool call arguments | payload |
 |---|---|---|
 | `answerability` | `{"question": <last user turn>}` | `{"answerable": true\|false}` (`partial` counts as answerable; `conversational` rows are dropped) |
 | `guardian_core` | `{"criteria", "target"}`, lifted out of the `<guardian>` instruction turn | `{"score": "yes"\|"no"}` |
 | `requirement_check` | `{"requirements"}`, lifted out of the `<requirements>` instruction turn | `{"score": "yes"\|"no"}` |
 | `query_clarification` | `{"query": <last user turn>}` | `{"clarification": "CLEAR" \| <question>}` |
 
-To add a task, write a converter that returns the row shape above. The
-formatting layer is task-agnostic.
+To add a task, write a converter in `tool_data/` that returns the row shape
+above and register it in `tool_data/convert.py`. The formatting layer is
+task-agnostic.
 
 ---
 
@@ -227,14 +298,26 @@ The check probes the template's behaviour, not the model name, so any Granite
 
 ## 7. Quick start
 
-```bash
-python -m shadow_residual.training.tool_data --task answerability \
-  --input answerability.jsonl --out-train data/train.jsonl --out-val data/val.jsonl
+One command, straight from answerability source rows (the reference config sets
+`tool_task: answerability`):
 
-BASE_MODEL=ibm-granite/granite-4.2-3b DATA_ROOT=data RUN_DIR=runs/tool EVAL_DATA=data/val.jsonl \
-sr-train --config src/shadow_residual/config/sr-tool-g42.yaml           # external (config default)
+```bash
+sr-train --config src/shadow_residual/config/sr-tool-g42.yaml \
+  --base-model ibm-granite/granite-4.2-3b --data-root /path/to/src \
+  --eval-data /path/to/src/val.jsonl --run-dir runs/tool              # external (config default)
 #        --tool-formatting autoregressive_tool_formatting               # or the other mode
+#        --tool-task guardian_core                                      # or another task
+#        --train-data src.jsonl --val-frac 0.1                          # one source file
+#        --debug-collator 0.05                                          # print training examples
 ```
+
+`--data-root` holds the source `train.jsonl` / `val.jsonl`; `--run-dir` gets
+`checkpoints/`. These flags fill the config's `${DATA_ROOT}` / `${RUN_DIR}` /
+`${BASE_MODEL}` / `${EVAL_DATA}` placeholders (the environment variables of the
+same names still work; the flag wins). `--debug-collator
+[PROB]` always prints the first collated batch. It then prints about PROB of
+later batches (default 0.001). Each print shows the decoded row, the last
+context token, and the supervised text.
 
 The reference config is
 [`src/shadow_residual/config/sr-tool-g42.yaml`](../src/shadow_residual/config/sr-tool-g42.yaml).

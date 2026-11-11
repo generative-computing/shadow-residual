@@ -26,8 +26,12 @@ from shadow_residual.config.adapters import (
     to_peft_config,
     to_training_arguments,
 )
-from shadow_residual.config.training_config import ToolFormatting, TrainingConfig
-from shadow_residual.training.tool_data.formatting import TOOL_FORMATTING_MARKERS
+from shadow_residual.config.training_config import ToolFormatting, ToolTask, TrainingConfig
+from shadow_residual.training.tool_data.formatting import (
+    DEFAULT_VANILLA_FRAC,
+    TOOL_FORMATTING_MARKERS,
+    VANILLA_MARKERS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +43,36 @@ def apply_tool_formatting(cfg: TrainingConfig) -> None:
     ``adapter.last_token`` (see ``tool_data.TOOL_FORMATTING_MARKERS``). Setting
     any of them alongside ``tool_formatting`` is rejected rather than silently
     overridden, so the mode is the single source of truth for the boundary.
+
+    Also resolves ``data.vanilla_frac`` to a float (0 = tool rows only). Unset,
+    it is ``DEFAULT_VANILLA_FRAC`` for tool training from source rows
+    (``tool_task``), and 0 otherwise: pre-converted tool rows no longer carry
+    the vanilla answer.
     """
     mode = cfg.data.tool_formatting
+    if cfg.data.vanilla_frac is None:
+        from_source = mode is not None and cfg.data.tool_task is not None
+        cfg.data.vanilla_frac = DEFAULT_VANILLA_FRAC if from_source else 0.0
+        if mode is not None and not from_source:
+            logger.info("data.tool_task is unset (pre-converted tool rows): training on tool rows only.")
+    if cfg.data.vanilla_frac:
+        if cfg.data.tool_task is None:
+            raise ValueError(
+                f"data.vanilla_frac={cfg.data.vanilla_frac} requires data.tool_task (or "
+                "--tool-task): vanilla rows are rendered from the task's source rows. "
+                "See docs/tool_formatting.md."
+            )
+        if cfg.data.enable_thinking:
+            raise ValueError(
+                f"tool training renders {cfg.data.vanilla_frac:g} of the rows as vanilla rows, "
+                "thinking-off; unset data.enable_thinking (--thinking) or pass --vanilla-frac 0."
+            )
     if mode is None:
+        if cfg.data.tool_task is not None:
+            raise ValueError(
+                f"data.tool_task={cfg.data.tool_task!r} requires data.tool_formatting "
+                "(or --tool-formatting). See docs/tool_formatting.md."
+            )
         return
     markers = TOOL_FORMATTING_MARKERS[mode]
     explicit = {
@@ -65,17 +96,69 @@ def apply_tool_formatting(cfg: TrainingConfig) -> None:
 # --- CLI ---------------------------------------------------------------------
 
 
+def add_config_variable_args(p: argparse.ArgumentParser, *, eval_data: bool = True) -> None:
+    """Flags that supply the reference configs' ${VAR} placeholders instead of
+    environment variables (the flag wins over the env var)."""
+    p.add_argument("--base-model", default=None,
+                   help="Base model id or path: sets model.base and ${BASE_MODEL}.")
+    p.add_argument("--data-root", default=None,
+                   help="Sets ${DATA_ROOT}; the reference configs read <data-root>/train.jsonl "
+                        "and <data-root>/val.jsonl.")
+    if eval_data:
+        p.add_argument("--eval-data", default=None,
+                       help="Eval JSONL for post-training generation: sets "
+                            "generation.input_path and ${EVAL_DATA}.")
+    p.add_argument("--run-dir", default=None,
+                   help="Sets ${RUN_DIR}; the reference configs write to <run-dir>/checkpoints "
+                        "(--output-dir sets the exact directory).")
+
+
+def config_variables(args: argparse.Namespace) -> dict[str, str]:
+    """The ${VAR} values given on the command line."""
+    given = {
+        "BASE_MODEL": args.base_model,
+        "DATA_ROOT": args.data_root,
+        "EVAL_DATA": getattr(args, "eval_data", None),
+        "RUN_DIR": args.run_dir,
+    }
+    return {k: v for k, v in given.items() if v is not None}
+
+
+def config_overrides(args: argparse.Namespace) -> dict:
+    """Fields that explicit CLI paths replace, set before ${VAR} resolution so
+    their placeholders need no value."""
+    out = {
+        "model.base": args.base_model,
+        "data.train_path": args.train_data,
+        "save.output_dir": args.output_dir,
+        "generation.input_path": args.eval_data,
+    }
+    out = {k: v for k, v in out.items() if v is not None}
+    if args.val_data is not None:
+        out.update({"data.val_path": args.val_data, "data.val_frac": None})
+    if args.val_frac is not None:
+        if not 0.0 < args.val_frac < 1.0:
+            raise ValueError(f"--val-frac must be in (0, 1), got {args.val_frac}")
+        out.update({"data.val_frac": args.val_frac, "data.val_path": None})
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="shadow_residual.training.train",
         description="Unified adapter-training entry point.",
     )
     p.add_argument("--config", required=True, type=str, help="Path to unified training config YAML.")
+    add_config_variable_args(p)
 
     # Hand-picked overrides for the most-edited fields.
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--train-data", type=str, default=None)
-    p.add_argument("--val-data", type=str, default=None)
+    val = p.add_mutually_exclusive_group()
+    val.add_argument("--val-data", type=str, default=None)
+    val.add_argument("--val-frac", type=float, default=None,
+                     help="Hold out this seeded fraction of the train rows as validation "
+                          "(data.val_frac) instead of reading --val-data.")
     p.add_argument("--lr", type=float, default=None, help="Override optimizer.learning_rate")
     p.add_argument("--epochs", type=int, default=None, help="Override runtime.num_train_epochs")
     p.add_argument("--max-steps", type=int, default=None,
@@ -87,8 +170,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Override adapter.target_modules to a uniform scalar rank")
     p.add_argument("--lora-alpha", type=int, default=None, help="Override adapter.alpha")
     p.add_argument("--max-length", type=int, default=None,
-                   help="Override data.max_length (rows longer than this are truncated "
-                        "from the end, which drops their supervised completion)")
+                   help="Override data.max_length. Tool training drops rows of at least this "
+                        "many tokens; other training truncates longer rows from the end, which "
+                        "drops their supervised completion.")
     p.add_argument("--batch-size", type=int, default=None, help="Override batch.per_device_train")
     p.add_argument("--grad-accum", type=int, default=None, help="Override batch.gradient_accumulation")
 
@@ -120,22 +204,44 @@ def _build_parser() -> argparse.ArgumentParser:
                         "has the adapter emit the whole tool-response turn after "
                         "'</tool_call>'. Either way the adapter stops before the "
                         "assistant answer. See docs/tool_formatting.md.")
+    p.add_argument("--tool-task", dest="tool_task", default=None,
+                   choices=[t.value for t in ToolTask],
+                   help="Treat the train/val/generation rows as this task's SOURCE rows and "
+                        "convert them to tool rows on load (data.tool_task; needs "
+                        "--tool-formatting).")
+    p.add_argument("--vanilla-frac", dest="vanilla_frac", type=float, default=None, metavar="F",
+                   help="Tool training (data.vanilla_frac; needs --tool-task): render this "
+                        "seeded fraction of the source rows as plain vanilla-SR chat rows (answer "
+                        "after '<|im_start|>assistant\\n<think></think>') and the rest as tool "
+                        f"rows. Default {DEFAULT_VANILLA_FRAC}; 0 = tool rows only.")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
-    p.add_argument("--debug-collator", action="store_true",
-                   help="Periodically log a decoded training example + labels from the collator. "
-                        "Also enables generation debug printing at the same probability "
-                        "(unless generation.debug_probability is already set in the config).")
+    p.add_argument("--debug-collator", nargs="?", type=float, const=-1.0, default=None,
+                   metavar="PROB",
+                   help="Log a decoded training example + labels from the collator: the first "
+                        "batch, then ~PROB of batches (default trainer.debug_probability, "
+                        "0.001). Also enables generation debug printing at the same "
+                        "probability (unless generation.debug_probability is already set).")
     return p
 
 
 def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
     """Mutate cfg in place with whatever CLI flags the user supplied."""
+    if args.base_model is not None:
+        cfg.model.base = args.base_model
+    if args.eval_data is not None and cfg.generation is not None:
+        cfg.generation.input_path = args.eval_data
     if args.output_dir is not None:
         cfg.save.output_dir = args.output_dir
     if args.train_data is not None:
         cfg.data.train_path = args.train_data
     if args.val_data is not None:
         cfg.data.val_path = args.val_data
+        cfg.data.val_frac = None
+    if args.val_frac is not None:
+        if not 0.0 < args.val_frac < 1.0:
+            raise ValueError(f"--val-frac must be in (0, 1), got {args.val_frac}")
+        cfg.data.val_frac = args.val_frac
+        cfg.data.val_path = None
     if args.lr is not None:
         cfg.optimizer.learning_rate = args.lr
     if args.epochs is not None:
@@ -161,13 +267,23 @@ def apply_cli_overrides(cfg: TrainingConfig, args: argparse.Namespace) -> None:
         cfg.data.instruction_as_user_message = True
     if args.tool_formatting is not None:
         cfg.data.tool_formatting = args.tool_formatting
-    if args.debug_collator:
+    if args.tool_task is not None:
+        cfg.data.tool_task = args.tool_task
+    if args.vanilla_frac is not None:
+        if not 0.0 <= args.vanilla_frac < 1.0:
+            raise ValueError(f"--vanilla-frac must be in [0, 1), got {args.vanilla_frac}")
+        cfg.data.vanilla_frac = args.vanilla_frac
+    if args.debug_collator is not None:
         cfg.trainer.debug_collator = True
+        if args.debug_collator >= 0.0:
+            if args.debug_collator > 1.0:
+                raise ValueError(f"--debug-collator PROB must be in [0, 1], got {args.debug_collator}")
+            cfg.trainer.debug_probability = args.debug_collator
         # Also turn on generation debug printing at the same rate, unless the
         # config already set it explicitly (don't clobber an explicit choice).
         # No-op when the generation block is absent (post-training gen disabled).
         if cfg.generation is not None and cfg.generation.debug_probability == 0.0:
-            cfg.generation.debug_probability = 0.001
+            cfg.generation.debug_probability = cfg.trainer.debug_probability
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -281,7 +397,36 @@ def _run_post_training_generation(
         data_path=cfg.generation.input_path,
         out_path=gen_out,
         tool_formatting=cfg.data.tool_formatting,
+        tool_task=cfg.data.tool_task,
     )
+
+
+def response_templates(cfg: TrainingConfig) -> str | list[str]:
+    """The ResponseOnlyCollator marker(s): the config's, plus the vanilla-row
+    marker when ``data.vanilla_frac`` mixes vanilla rows into tool training."""
+    marker = cfg.data.assistant_marker or _DEFAULT_ASSISTANT_MARKER
+    if cfg.data.vanilla_frac:
+        return [marker, VANILLA_MARKERS.assistant_marker]
+    return marker
+
+
+def validate_boundaries(cfg: TrainingConfig, dataset, tokenizer, collator) -> None:
+    """Run the last_context_token boundary check against the real collator;
+    with vanilla rows each row kind is checked against its own token."""
+    from shadow_residual.training.data import validate_last_context_token_boundary
+
+    if not cfg.data.vanilla_frac:
+        if cfg.adapter.last_context_token is not None:
+            validate_last_context_token_boundary(dataset, tokenizer, collator, cfg.adapter.last_context_token)
+        return
+    kinds = dataset["kind"]
+    for kind, token in (("tool", cfg.adapter.last_context_token),
+                        ("vanilla", VANILLA_MARKERS.last_context_token)):
+        subset = dataset.select([i for i, k in enumerate(kinds) if k == kind])
+        if len(subset) == 0:
+            raise ValueError(f"data.vanilla_frac left no {kind} rows in the train set")
+        logger.info("Validating the %s rows' boundary (%d rows).", kind, len(subset))
+        validate_last_context_token_boundary(subset, tokenizer, collator, token)
 
 
 def _chat_template_supports_generation_tags(tokenizer) -> bool:
@@ -323,7 +468,8 @@ def main(argv: list[str] | None = None) -> int:
             "--quantize (4-bit QLoRA via bitsandbytes) is not currently "
             "supported on the shadow-residual + PEFT training path."
         )
-    cfg = load_training_config(args.config)
+    cfg = load_training_config(args.config, variables=config_variables(args),
+                               overrides=config_overrides(args))
     apply_cli_overrides(cfg, args)
     apply_tool_formatting(cfg)
     if cfg.data.tool_formatting is not None:
@@ -336,7 +482,19 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Adapter activation: unconditional (always active)")
     logger.info("Base model:   %s", cfg.model.base)
     logger.info("Train data:   %s", cfg.data.train_path)
-    logger.info("Val data:     %s", cfg.data.val_path)
+    if cfg.data.val_path is not None:
+        logger.info("Val data:     %s", cfg.data.val_path)
+    else:
+        logger.info("Val data:     %.0f%% of train rows (seed %d)", cfg.data.val_frac * 100, cfg.runtime.seed)
+    if cfg.data.tool_task is not None:
+        logger.info("Tool task:    %s (source rows converted on load)", cfg.data.tool_task)
+    if cfg.data.vanilla_frac:
+        logger.info(
+            "Vanilla rows: %.0f%% of rows vanilla SR (assistant_marker=%r last_context_token=%r), "
+            "the rest %s tool rows (seed %d)",
+            cfg.data.vanilla_frac * 100, VANILLA_MARKERS.assistant_marker,
+            VANILLA_MARKERS.last_context_token, cfg.data.tool_formatting, cfg.runtime.seed,
+        )
     logger.info("Output dir:   %s", cfg.save.output_dir)
 
     # Lazy imports — keeps argparse fast, lets unit tests import the module
@@ -352,7 +510,6 @@ def main(argv: list[str] | None = None) -> int:
         DebugPrintingCollator,
         ResponseOnlyCollator,
         load_jsonl_dataset,
-        validate_last_context_token_boundary,
     )
 
     # 1. Tokenizer
@@ -383,6 +540,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg.adapter.last_context_token, "last_context_token"
     )
     last_token_id = _resolve_single_token(cfg.adapter.last_token, "last_token")
+    with_vanilla = bool(cfg.data.vanilla_frac)
+    vanilla_last_context_token_id = (
+        _resolve_single_token(VANILLA_MARKERS.last_context_token, "last_context_token (vanilla rows)")
+        if with_vanilla else None
+    )
 
     # 3. PEFT config (stock LoRA — no gated/aLoRA activation).
     peft_config = to_peft_config(cfg)
@@ -440,20 +602,26 @@ def main(argv: list[str] | None = None) -> int:
 
     # 5. Datasets. last_token (when set) is appended to rows that don't already
     # end with it — done at the text level so both masking paths inherit it.
-    train_ds = load_jsonl_dataset(
-        cfg.data.train_path, tok,
-        enable_thinking=cfg.data.enable_thinking,
-        last_token=cfg.adapter.last_token,
-        instruction_as_user_message=cfg.data.instruction_as_user_message,
-        tool_formatting=cfg.data.tool_formatting,
-    )
-    val_ds = load_jsonl_dataset(
-        cfg.data.val_path, tok,
-        enable_thinking=cfg.data.enable_thinking,
-        last_token=cfg.adapter.last_token,
-        instruction_as_user_message=cfg.data.instruction_as_user_message,
-        tool_formatting=cfg.data.tool_formatting,
-    )
+    def _load(path):
+        return load_jsonl_dataset(
+            path, tok,
+            enable_thinking=cfg.data.enable_thinking,
+            last_token=cfg.adapter.last_token,
+            instruction_as_user_message=cfg.data.instruction_as_user_message,
+            tool_formatting=cfg.data.tool_formatting,
+            tool_task=cfg.data.tool_task,
+            vanilla_frac=cfg.data.vanilla_frac,
+            seed=cfg.runtime.seed,
+            max_length=cfg.data.max_length,
+        )
+
+    train_ds = _load(cfg.data.train_path)
+    if cfg.data.val_path is not None:
+        val_ds = _load(cfg.data.val_path)
+    else:
+        # Seeded, so every rank derives the same split.
+        split = train_ds.train_test_split(test_size=cfg.data.val_frac, seed=cfg.runtime.seed)
+        train_ds, val_ds = split["train"], split["test"]
     logger.info("Train rows: %d, Val rows: %d", len(train_ds), len(val_ds))
 
     # 6. SFTConfig — start from to_training_arguments, add SFT-specific keys
@@ -472,12 +640,17 @@ def main(argv: list[str] | None = None) -> int:
     # (TRL-version-independent; doesn't depend on TRL's removed
     # DataCollatorForCompletionOnlyLM).
     use_assistant_only_loss = _chat_template_supports_generation_tags(tok)
+    if use_assistant_only_loss and with_vanilla:
+        raise ValueError(
+            "data.vanilla_frac needs the marker-based ResponseOnlyCollator, but this "
+            "tokenizer's chat template has {% generation %} tags (assistant_only_loss)."
+        )
     data_collator = None
     if use_assistant_only_loss:
         sft_kwargs["assistant_only_loss"] = True
         logger.info("Response-only masking via SFTConfig(assistant_only_loss=True).")
     else:
-        marker = cfg.data.assistant_marker or _DEFAULT_ASSISTANT_MARKER
+        marker = response_templates(cfg)
         data_collator = ResponseOnlyCollator(tokenizer=tok, response_template=marker)
         logger.info(
             "Chat template lacks {%% generation %%} tags; using "
@@ -510,10 +683,7 @@ def main(argv: list[str] | None = None) -> int:
     # against trainer.data_collator (the REAL collator TRL settled on), so it
     # covers both masking paths uniformly: the assistant_only_loss path (where
     # TRL owns masking — we can only validate) and our ResponseOnlyCollator.
-    if cfg.adapter.last_context_token is not None:
-        validate_last_context_token_boundary(
-            train_ds, tok, trainer.data_collator, cfg.adapter.last_context_token,
-        )
+    validate_boundaries(cfg, train_ds, tok, trainer.data_collator)
 
     # Optional: wrap whatever collator SFTTrainer ended up with so we
     # periodically log a decoded example + its labels. Covers both the
@@ -521,9 +691,12 @@ def main(argv: list[str] | None = None) -> int:
     # ResponseOnlyCollator fallback.
     if cfg.trainer.debug_collator:
         trainer.data_collator = DebugPrintingCollator(
-            trainer.data_collator, tokenizer=tok, probability=0.001
+            trainer.data_collator, tokenizer=tok, probability=cfg.trainer.debug_probability
         )
-        logger.info("Debug collator enabled (logs ~0.1%% of batches).")
+        logger.info(
+            "Debug collator enabled (logs the first batch, then ~%g%% of batches).",
+            cfg.trainer.debug_probability * 100,
+        )
 
     # 8. Train + save
     logger.info("Starting training...")
@@ -584,6 +757,12 @@ def main(argv: list[str] | None = None) -> int:
             adapter_cfg["share_moe_routing"] = bool(cfg.adapter.share_moe_routing)
             if cfg.data.tool_formatting is not None:
                 adapter_cfg["tool_formatting"] = cfg.data.tool_formatting
+            if cfg.data.tool_task is not None:
+                adapter_cfg["tool_task"] = cfg.data.tool_task
+            if with_vanilla:
+                adapter_cfg["vanilla_frac"] = cfg.data.vanilla_frac
+                adapter_cfg["vanilla_last_context_token"] = VANILLA_MARKERS.last_context_token
+                adapter_cfg["vanilla_last_context_token_id"] = vanilla_last_context_token_id
             with adapter_cfg_path.open("w") as f:
                 _json.dump(adapter_cfg, f, indent=2)
             logger.info(

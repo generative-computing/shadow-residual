@@ -88,6 +88,27 @@ def _find_last_subsequence(haystack: list[int], needle: list[int]) -> int:
     return -1
 
 
+KINDS = ("tool", "vanilla")
+
+
+def _supervision_start(ids: list[int], templates: list[list[int]]) -> tuple[int, int] | None:
+    """Return (first supervised position, template index) for the template whose
+    last occurrence ENDS latest in ``ids``, or None if no template occurs.
+
+    With one template this is "just after its last occurrence". With several
+    (tool + vanilla rows) each row's own marker is the one closest to the
+    end: a vanilla row's documents ``<tool_response>\\n`` precede its final
+    assistant opener, and a tool row's trigger-turn assistant opener precedes its
+    tool marker.
+    """
+    best: tuple[int, int] | None = None
+    for k, t in enumerate(templates):
+        cut = _find_last_subsequence(ids, t)
+        if cut >= 0 and (best is None or cut + len(t) > best[0]):
+            best = (cut + len(t), k)
+    return best
+
+
 def load_jsonl_dataset(
     path: str | Path,
     tokenizer: "PreTrainedTokenizerBase",
@@ -95,6 +116,10 @@ def load_jsonl_dataset(
     last_token: str | None = None,
     instruction_as_user_message: bool = False,
     tool_formatting: str | None = None,
+    tool_task: str | None = None,
+    vanilla_frac: float | None = None,
+    seed: int = 0,
+    max_length: int | None = None,
 ) -> "Dataset":
     """Load a JSONL file and apply the model's chat template to each row.
 
@@ -133,7 +158,25 @@ def load_jsonl_dataset(
     adapter must emit. ``enable_thinking`` / ``instruction_as_user_message`` do
     not apply to tool rows. See ``docs/tool_formatting.md``.
 
-    Returns a `datasets.Dataset` with a single ``text`` column containing the
+    ``tool_task`` (``data.tool_task``; requires ``tool_formatting``) treats each
+    row as a task source row and converts it to a tool row first
+    (:func:`~shadow_residual.training.tool_data.convert.convert`). Rows the
+    converter drops are counted and logged.
+
+    ``vanilla_frac`` (``data.vanilla_frac``; requires ``tool_task``; the trainer
+    defaults it to 0.5 for tool training): a seeded (``seed``) ``round(vanilla_frac * n)`` of the usable
+    source rows are rendered as plain (vanilla SR) chat rows instead of tool rows
+    (:func:`~shadow_residual.training.tool_data.convert.to_vanilla`, thinking
+    off), so the adapter learns both the tool payload and the plain answer after
+    ``tool_data.VANILLA_MARKERS``. Each row is checked to be cut by its own
+    marker under the multi-marker :class:`ResponseOnlyCollator`, and the dataset
+    gains a ``kind`` column (``"tool"`` / ``"vanilla"``).
+
+    ``max_length`` (``data.max_length``; tool rows only) drops rows of at least
+    that many tokens: the trainer would truncate them from the end, cutting off
+    the supervised span so the collator cuts at an earlier marker instead.
+
+    Returns a `datasets.Dataset` with a ``text`` column containing the
     chat-templated string. SFTTrainer reads the ``text`` field directly.
     """
     from datasets import Dataset
@@ -148,29 +191,72 @@ def load_jsonl_dataset(
             )
         last_token_id = ids[0]
 
+    if tool_task is not None and tool_formatting is None:
+        raise ValueError("tool_task requires tool_formatting")
+    with_vanilla = bool(vanilla_frac)
+    if with_vanilla and tool_task is None:
+        raise ValueError("vanilla_frac requires tool_task (vanilla rows are rendered from source rows)")
     if tool_formatting is not None:
         from shadow_residual.training.tool_data import render_tool_example
+        from shadow_residual.training.tool_data.convert import convert, to_vanilla
+    if with_vanilla:
+        import random
 
-    rows: list[dict[str, str]] = []
+        from shadow_residual.training.tool_data import TOOL_FORMATTING_MARKERS, VANILLA_MARKERS
+        kind_markers = {"tool": TOOL_FORMATTING_MARKERS[tool_formatting], "vanilla": VANILLA_MARKERS}
+        marker_ids = [
+            tokenizer.encode(kind_markers[k].assistant_marker, add_special_tokens=False) for k in KINDS
+        ]
+    n_too_long = {k: 0 for k in KINDS}
+
+    # (lineno, source row, row to render): source rows are kept for vanilla rows.
+    entries: list[tuple[int, dict, dict]] = []
+    n_dropped = 0
     with Path(path).open("r") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            obj = json.loads(line)
+            src = obj = json.loads(line)
             if "messages" not in obj:
                 raise ValueError(f"{path}: row is missing 'messages' field: {obj!r}")
-            if tool_formatting is not None:
+            if tool_task is not None:
                 try:
-                    text = render_tool_example(
-                        tokenizer,
-                        obj["messages"],
-                        tools=obj.get("tools"),
-                        documents=obj.get("documents"),
-                        mode=tool_formatting,
-                    )
-                except ValueError as e:
-                    raise ValueError(f"{path}:{lineno}: {e}") from e
+                    obj = convert(tool_task, obj, include_response=True)
+                except (ValueError, KeyError) as e:
+                    raise ValueError(f"{path}:{lineno}: {tool_task} conversion: {e}") from e
+                if obj is None:
+                    n_dropped += 1
+                    continue
+            entries.append((lineno, src, obj))
+
+    vanilla_idx: set[int] = set()
+    if with_vanilla:
+        n_vanilla = round(vanilla_frac * len(entries))
+        vanilla_idx = set(random.Random(seed).sample(range(len(entries)), n_vanilla))
+
+    rows: list[dict[str, str]] = []
+    for i, (lineno, src, obj) in enumerate(entries):
+        kind = "vanilla" if i in vanilla_idx else "tool"
+        try:
+            if kind == "vanilla":
+                obj = to_vanilla(tool_task, src)
+                text = render_chat(
+                    tokenizer,
+                    obj["messages"],
+                    documents=obj.get("documents"),
+                    add_generation_prompt=False,
+                    enable_thinking=False,
+                    instruction_as_user_message=instruction_as_user_message,
+                )
+            elif tool_formatting is not None:
+                text = render_tool_example(
+                    tokenizer,
+                    obj["messages"],
+                    tools=obj.get("tools"),
+                    documents=obj.get("documents"),
+                    mode=tool_formatting,
+                )
             else:
                 # render_chat folds documents into a system message for ChatML
                 # tokenizers (Granite 4.2, whose template ignores documents=) and
@@ -184,18 +270,63 @@ def load_jsonl_dataset(
                     enable_thinking=enable_thinking,
                     instruction_as_user_message=instruction_as_user_message,
                 )
-            if last_token_id is not None:
-                # Append the end-of-completion marker unless the row already
-                # ends with it. Scan past trailing whitespace-only tokens before
-                # comparing: Granite's ChatML template ends rows with
-                # "<|im_end|>\n", so the literal last token is the newline and a
-                # naive row_ids[-1] check would re-append the marker, doubling it.
+        except (ValueError, KeyError) as e:
+            raise ValueError(f"{path}:{lineno}: {e}") from e
+        row_ids = None
+        if last_token_id is not None:
+            # Append the end-of-completion marker unless the row already
+            # ends with it. Scan past trailing whitespace-only tokens before
+            # comparing: Granite's ChatML template ends rows with
+            # "<|im_end|>\n", so the literal last token is the newline and a
+            # naive row_ids[-1] check would re-append the marker, doubling it.
+            row_ids = tokenizer.encode(text, add_special_tokens=False)
+            last_meaningful = _last_non_whitespace_token(row_ids, tokenizer)
+            if last_meaningful != last_token_id:
+                text = text + last_token
+                row_ids = None
+        if tool_formatting is not None and max_length is not None:
+            # The trainer truncates from the end, which would cut the supervised
+            # span off and leave an earlier marker (documents, trigger turn) as
+            # the cut point. Drop such rows instead. ">=" leaves room for the EOS
+            # the trainer appends to rows that end in "<|im_end|>\n".
+            if row_ids is None:
                 row_ids = tokenizer.encode(text, add_special_tokens=False)
-                last_meaningful = _last_non_whitespace_token(row_ids, tokenizer)
-                if last_meaningful != last_token_id:
-                    text = text + last_token
+            if len(row_ids) >= max_length:
+                n_too_long[kind] += 1
+                continue
+        if with_vanilla:
+            # The collator cuts after whichever marker ends last; make sure that
+            # is this row's own marker, on the real tokenization.
+            if row_ids is None:
+                row_ids = tokenizer.encode(text, add_special_tokens=False)
+            hit = _supervision_start(row_ids, marker_ids)
+            if hit is None or KINDS[hit[1]] != kind:
+                got = "no marker" if hit is None else repr(kind_markers[KINDS[hit[1]]].assistant_marker)
+                raise ValueError(
+                    f"{path}:{lineno}: {kind} row would be cut at {got}, not at its own "
+                    f"marker {kind_markers[kind].assistant_marker!r}"
+                )
+            rows.append({"text": text, "kind": kind})
+        else:
             rows.append({"text": text})
 
+    if tool_task is not None:
+        logger.info(
+            "%s: converted %d %s source rows to tool rows (%d dropped as unusable)",
+            path, len(entries), tool_task, n_dropped,
+        )
+    if any(n_too_long.values()):
+        logger.warning(
+            "%s: dropped %d rows of >= max_length=%d tokens (%s); truncation would cut "
+            "their supervised span", path, sum(n_too_long.values()), max_length,
+            ", ".join(f"{k}: {v}" for k, v in n_too_long.items() if v),
+        )
+    if with_vanilla:
+        n_v = sum(r["kind"] == "vanilla" for r in rows)
+        logger.info(
+            "%s: split (vanilla_frac=%g, seed=%d): %d %s tool rows + %d vanilla rows",
+            path, vanilla_frac, seed, len(rows) - n_v, tool_formatting, n_v,
+        )
     if not rows:
         raise ValueError(f"{path}: empty dataset")
     return Dataset.from_list(rows)
@@ -231,19 +362,23 @@ class ResponseOnlyCollator:
       is the last context token and everything after it is generation. This
       matches ``adapter.last_context_token = "<|end_of_role|>"`` and the
       ``validate_last_context_token_boundary`` check.
+
+    ``response_template`` may also be a list of markers (tool + vanilla
+    rows): each row is cut after the marker whose last occurrence ends latest
+    (see :func:`_supervision_start`).
     """
 
-    def __init__(self, tokenizer: "PreTrainedTokenizerBase", response_template: str):
-        if not response_template:
+    def __init__(self, tokenizer: "PreTrainedTokenizerBase", response_template: str | list[str]):
+        templates = [response_template] if isinstance(response_template, str) else list(response_template)
+        if not templates or not all(templates):
             raise ValueError("response_template must be a non-empty string")
         self.tokenizer = tokenizer
-        self.response_template_ids = tokenizer.encode(
-            response_template, add_special_tokens=False
-        )
-        if not self.response_template_ids:
-            raise ValueError(
-                f"response_template {response_template!r} encodes to empty token list"
-            )
+        self.template_ids = []
+        for t in templates:
+            ids = tokenizer.encode(t, add_special_tokens=False)
+            if not ids:
+                raise ValueError(f"response_template {t!r} encodes to empty token list")
+            self.template_ids.append(ids)
         self.pad_id = (
             tokenizer.pad_token_id
             if tokenizer.pad_token_id is not None
@@ -274,9 +409,9 @@ class ResponseOnlyCollator:
             # not generation) — supervision starts at the token AFTER the
             # marker, so the marker's final token (<|end_of_role|>) is the last
             # context token. If absent, the whole row stays -100.
-            cut = _find_last_subsequence(list(ids), self.response_template_ids)
-            if cut >= 0:
-                start = cut + len(self.response_template_ids)
+            hit = _supervision_start(list(ids), self.template_ids)
+            if hit is not None:
+                start = hit[0]
                 labels[i, start:n] = torch.as_tensor(ids[start:], dtype=torch.long)
 
         return {
@@ -300,13 +435,16 @@ class DebugPrintingCollator:
         self.base_collator = base_collator
         self.tokenizer = tokenizer
         self.probability = probability
+        self._printed_first = False
 
     def __call__(self, features):
         import random
 
         batch = self.base_collator(features)
-        if random.random() >= self.probability:
+        # The first batch always prints, so even a few-step run shows one example.
+        if self._printed_first and random.random() >= self.probability:
             return batch
+        self._printed_first = True
 
         input_ids = batch.get("input_ids")
         labels = batch.get("labels")
@@ -316,7 +454,8 @@ class DebugPrintingCollator:
         i = 0
         seq = input_ids[i].tolist()
         lbl = labels[i].tolist()
-        trainable = sum(1 for x in lbl if x != -100)
+        supervised = [x for x in lbl if x != -100]
+        first = next((j for j, x in enumerate(lbl) if x != -100), None)
 
         logger.info("=" * 70)
         logger.info("DEBUG COLLATOR OUTPUT")
@@ -325,7 +464,10 @@ class DebugPrintingCollator:
         logger.info("\nInput text:\n%s", self.tokenizer.decode(seq))
         logger.info("\nInput IDs: %s", seq)
         logger.info("\nLabels: %s", lbl)
-        logger.info("\nTrainable tokens: %d/%d", trainable, len(lbl))
+        if first is not None:
+            logger.info("\nLast context token: %r", self.tokenizer.decode(seq[first - 1 : first]))
+        logger.info("\nSupervised text: %r", self.tokenizer.decode(supervised))
+        logger.info("\nTrainable tokens: %d/%d", len(supervised), len(lbl))
         logger.info("=" * 70)
 
         return batch
@@ -358,7 +500,7 @@ def validate_last_context_token_boundary(
     (``labels[p] != -100``) and assert ``input_ids[p-1]`` is
     ``last_context_token``. Any row where the boundary token is wrong raises.
     Rows with no unmasked labels (fully-masked prompt-only rows) are skipped
-    with a warning.
+    with a warning; if every sampled row is fully masked, it raises.
 
     Args:
         dataset: the training dataset (``text`` column, from
@@ -432,6 +574,13 @@ def validate_last_context_token_boundary(
             )
         n_checked += 1
 
+    if n_checked == 0:
+        raise ValueError(
+            f"None of the {n_to_scan} sampled rows has supervised labels, so the "
+            f"last_context_token {last_context_token!r} boundary is unchecked and "
+            "these rows would train on nothing. The collator's marker does not "
+            "occur in the rendered rows."
+        )
     logger.info(
         "last_context_token boundary validated on %d/%d sampled rows.",
         n_checked, n_to_scan,

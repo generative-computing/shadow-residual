@@ -208,14 +208,11 @@ def _tool_cfg(tmp_path: Path, base: str, **data) -> Path:
 
 def test_main_rejects_non_g42_base_before_model_build(tmp_path, no_model_build):
     pytest.importorskip("trl")
-    from transformers import AutoTokenizer
     from shadow_residual.training.train import main
+    from tests._tokenizers import load_tokenizer
 
     base = "ibm-granite/granite-4.1-3b"
-    try:
-        AutoTokenizer.from_pretrained(base)
-    except Exception as e:  # pragma: no cover - environment dependent
-        pytest.skip(f"{base} tokenizer unavailable: {e}")
+    load_tokenizer(base)
     with pytest.raises(ValueError, match=r"requires a Granite 4\.2 base model.*granite-4\.1-3b"):
         main(["--config", str(_tool_cfg(tmp_path, base))])
 
@@ -235,6 +232,72 @@ def test_explicit_markers_allowed_without_tool_formatting(config_path):
     apply_tool_formatting(cfg)
     assert cfg.data.assistant_marker == "<|im_start|>assistant\n"
     assert cfg.adapter.last_context_token == "\n"
+
+
+def test_tool_task_flag_sets_config(config_path):
+    cfg = load_training_config(config_path)
+    assert cfg.data.tool_task is None
+    args = _build_parser().parse_args(
+        ["--config", str(config_path), "--tool-formatting", "--tool-task", "guardian_core"]
+    )
+    apply_cli_overrides(cfg, args)
+    apply_tool_formatting(cfg)
+    assert cfg.data.tool_task == "guardian_core"
+
+
+def test_tool_task_rejects_unknown_task(config_path):
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["--config", str(config_path), "--tool-task", "bogus"])
+
+
+def test_tool_task_requires_tool_formatting(config_path):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(["--config", str(config_path), "--tool-task", "answerability"])
+    apply_cli_overrides(cfg, args)
+    with pytest.raises(ValueError, match=r"tool_task='answerability' requires data\.tool_formatting"):
+        apply_tool_formatting(cfg)
+
+
+def test_val_frac_replaces_val_path(config_path):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(["--config", str(config_path), "--val-frac", "0.1"])
+    apply_cli_overrides(cfg, args)
+    assert (cfg.data.val_path, cfg.data.val_frac) == (None, 0.1)
+
+
+def test_val_frac_and_val_data_are_exclusive(config_path):
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            ["--config", str(config_path), "--val-frac", "0.1", "--val-data", "/v.jsonl"]
+        )
+
+
+@pytest.mark.parametrize("frac", ["0", "1", "1.5"])
+def test_val_frac_out_of_range(config_path, frac):
+    cfg = load_training_config(config_path)
+    args = _build_parser().parse_args(["--config", str(config_path), "--val-frac", frac])
+    with pytest.raises(ValueError, match="--val-frac"):
+        apply_cli_overrides(cfg, args)
+
+
+def test_debug_collator_flag_forms(config_path):
+    cfg = load_training_config(config_path)
+    apply_cli_overrides(cfg, _build_parser().parse_args(["--config", str(config_path)]))
+    assert (cfg.trainer.debug_collator, cfg.trainer.debug_probability) == (False, 0.001)
+
+    cfg = load_training_config(config_path)
+    apply_cli_overrides(cfg, _build_parser().parse_args(["--config", str(config_path), "--debug-collator"]))
+    assert (cfg.trainer.debug_collator, cfg.trainer.debug_probability) == (True, 0.001)
+
+    cfg = load_training_config(config_path)
+    apply_cli_overrides(cfg, _build_parser().parse_args(
+        ["--config", str(config_path), "--debug-collator", "0.25"]))
+    assert (cfg.trainer.debug_collator, cfg.trainer.debug_probability) == (True, 0.25)
+
+    cfg = load_training_config(config_path)
+    with pytest.raises(ValueError, match="--debug-collator"):
+        apply_cli_overrides(cfg, _build_parser().parse_args(
+            ["--config", str(config_path), "--debug-collator", "2"]))
 
 
 def test_quantize_flag_does_not_touch_config(config_path):

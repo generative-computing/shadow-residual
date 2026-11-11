@@ -142,8 +142,30 @@
           "type": "string"
         },
         "val_path": {
-          "title": "Val Path",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Val Path"
+        },
+        "val_frac": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1.0,
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Val Frac"
         },
         "max_length": {
           "default": 8192,
@@ -183,11 +205,35 @@
             }
           ],
           "default": null
+        },
+        "tool_task": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolTask"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "vanilla_frac": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Vanilla Frac"
         }
       },
       "required": [
-        "train_path",
-        "val_path"
+        "train_path"
       ],
       "title": "DataConfig",
       "type": "object"
@@ -442,6 +488,17 @@
       "title": "ToolFormatting",
       "type": "string"
     },
+    "ToolTask": {
+      "description": "Task source format converted to tool rows on load (``data.tool_task``).\n\nMirrors ``shadow_residual.training.tool_data.convert.TASKS``.",
+      "enum": [
+        "answerability",
+        "guardian_core",
+        "requirement_check",
+        "query_clarification"
+      ],
+      "title": "ToolTask",
+      "type": "string"
+    },
     "TrainerConfig": {
       "additionalProperties": false,
       "description": "SFTTrainer-specific knobs that aren't part of the optimizer/batch story.",
@@ -455,6 +512,13 @@
           "default": false,
           "title": "Debug Collator",
           "type": "boolean"
+        },
+        "debug_probability": {
+          "default": 0.001,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Debug Probability",
+          "type": "number"
         }
       },
       "title": "TrainerConfig",

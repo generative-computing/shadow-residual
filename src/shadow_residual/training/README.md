@@ -42,9 +42,16 @@ most-edited fields.
 
 ```
 --config PATH           required — unified-config YAML path
+--base-model ID         set model.base and the config's ${BASE_MODEL}
+--data-root DIR         set ${DATA_ROOT} (reference configs read DIR/train.jsonl, DIR/val.jsonl)
+--eval-data PATH        set generation.input_path and ${EVAL_DATA}
+--run-dir DIR           set ${RUN_DIR} (reference configs write DIR/checkpoints)
+                        (these four replace the env variables of the same names; the flag wins)
 --output-dir DIR        override save.output_dir
 --train-data PATH       override data.train_path
 --val-data PATH         override data.val_path
+--val-frac F            hold out a seeded fraction F of the train rows as validation (data.val_frac;
+                        exclusive with --val-data)
 --lr FLOAT              override optimizer.learning_rate
 --epochs INT            override runtime.num_train_epochs
 --max-steps INT         cap training to N optimizer steps (diagnostic short runs)
@@ -53,12 +60,19 @@ most-edited fields.
 --lora-alpha INT        override adapter.alpha
 --batch-size INT        override batch.per_device_train
 --grad-accum INT        override batch.gradient_accumulation
---max-length INT        override data.max_length (longer rows are truncated, dropping their labels)
+--max-length INT        override data.max_length (tool training drops rows of >= INT tokens; other
+                        training truncates longer rows, dropping their labels)
 --thinking              set data.enable_thinking=True (apply_chat_template enable_thinking)
 --tool-formatting [MODE]  opt in to SR-adapter-as-tool training (data.tool_formatting, Granite 4.2);
                         bare flag = external_tool_formatting, or autoregressive_tool_formatting
+--tool-task TASK        rows are TASK source rows, converted to tool rows on load (data.tool_task;
+                        answerability | guardian_core | requirement_check | query_clarification)
+--vanilla-frac F        tool training: the seeded fraction F of the source rows trained as plain
+                        vanilla-SR chat rows, the rest as tool rows (data.vanilla_frac; needs
+                        --tool-task; default 0.5; 0 = tool rows only)
 --wandb                 set runtime.report_to=['wandb']
---debug-collator        periodically log a decoded training example + labels
+--debug-collator [PROB] log a decoded training example + labels: the first batch, then ~PROB of
+                        batches (default trainer.debug_probability = 0.001)
 --skip-post-train-generate   skip the in-process post-training generation step
 --no-grad-checkpoint    disable non-reentrant gradient checkpointing (diagnostic)
 ```
@@ -70,9 +84,11 @@ For overrides outside this set, edit the YAML.
 ```
 --config PATH           required — same training config YAML used for train.py
 --checkpoint PATH       required — directory of a saved LoRA adapter
---data PATH             override eval JSONL (default: cfg.data.val_path)
+--data, --eval-data PATH  eval JSONL: sets generation.input_path and ${EVAL_DATA}
+--base-model / --data-root / --run-dir   as for train.py
 --out PATH              override output JSONL (default: <checkpoint>/<cfg.generation.output_filename>)
 --limit N               cap rows for quick smoke runs
+--tool-task TASK        eval rows are TASK source rows; convert on load (overrides data.tool_task)
 ```
 
 Output: each input eval row preserved verbatim, plus one added key
@@ -151,9 +167,11 @@ called as a tool: it produces the `<tool_response>` payload and stops. It never
 writes the assistant answer. **Granite 4.2 only**: any other base is rejected
 at startup.
 
-Rows are ordinary `messages` + `tools` (+ `documents`) rows that end with the
-trigger tool call and the gold `tool` response. Build them with
-`python -m shadow_residual.training.tool_data --task <task> ...`. The trainer
+With `data.tool_task` set (`--tool-task`; the reference config sets
+`answerability`), the rows are the task's source rows. The trainer converts
+them to tool rows on load, so training is one command. Without it, rows must be
+pre-converted tool rows: `messages` + `tools` (+ `documents`) ending with the
+trigger tool call and the gold `tool` response. The trainer
 renders the rows for the mode, so one data file trains either mode:
 
 | mode | adapter takes over after | adapter emits | markers (`assistant_marker` / `last_context_token` / `last_token`) |
