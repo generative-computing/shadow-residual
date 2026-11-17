@@ -302,6 +302,30 @@ _DEFAULT_ASSISTANT_MARKER = "<|start_of_role|>assistant<|end_of_role|>"
 _FSDP_CLASS = None
 
 
+def _keep_fsdp_buffers_unconverted(accelerator) -> None:
+    """Stop FSDP1 mixed precision from casting buffers to bf16.
+
+    With ``mixed_precision: bf16``, accelerate builds an FSDP1 ``MixedPrecision``
+    with ``buffer_dtype=bfloat16``, and FSDP casts every floating buffer to it
+    at wrap time. The SR model's only buffers are the RoPE ``inv_freq`` /
+    ``original_inv_freq`` frequencies, which the build keeps in fp32 so the
+    rotation angles match stock HF and the single-GPU / serving path; a bf16
+    cast here would train the adapter against different RoPE numerics than it
+    is served with. ``buffer_dtype=None`` leaves buffers in their own dtype.
+    FSDP2's policy never casts buffers, so it needs nothing.
+    """
+    fsdp_plugin = getattr(accelerator.state, "fsdp_plugin", None)
+    if fsdp_plugin is None or getattr(fsdp_plugin, "fsdp_version", 1) != 1:
+        return
+    policy = fsdp_plugin.mixed_precision_policy
+    if policy is not None and getattr(policy, "buffer_dtype", None) is not None:
+        logger.info(
+            "FSDP mixed precision: buffer_dtype %s -> None (keep fp32 RoPE buffers).",
+            policy.buffer_dtype,
+        )
+        policy.buffer_dtype = None
+
+
 def _resolve_fsdp_class():
     """Return the FullyShardedDataParallel class, importing if needed.
 
@@ -677,6 +701,9 @@ def main(argv: list[str] | None = None) -> int:
         data_collator=data_collator,  # None → SFTTrainer uses its default
         callbacks=build_callbacks(cfg),
     )
+    # The model is FSDP-wrapped lazily inside trainer.train(), so the
+    # accelerator's mixed-precision policy can still be adjusted here.
+    _keep_fsdp_buffers_unconverted(trainer.accelerator)
 
     # 7a. last_context_token boundary check — fail loudly unless the supervised
     # region (labels != -100) starts immediately after last_context_token. Run

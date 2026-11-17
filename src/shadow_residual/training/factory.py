@@ -49,6 +49,7 @@ from shadow_residual.shadow_residual.build import (
     build_sr_config as _build_sr_config,
     build_sr_base as _build_sr_base,
     reinit_rope_buffers as _reinit_rope_buffers,
+    to_dtype_keep_rope_fp32 as _to_dtype_keep_rope_fp32,
     diagnose_materialized as _diagnose_materialized,
 )
 
@@ -195,8 +196,8 @@ def _build_sr_peft_model_meta(
         sr_model = ShadowResidualForCausalLM(sr_config)
         if torch_dtype is not None:
             # ``.to(dtype)`` rewrites dtype metadata on meta tensors —
-            # no storage alloc.
-            sr_model = sr_model.to(dtype=torch_dtype)
+            # no storage alloc. RoPE frequency buffers stay fp32.
+            sr_model = _to_dtype_keep_rope_fp32(sr_model, torch_dtype)
         peft_model = get_peft_model(sr_model, lora_config, adapter_name=adapter_name)
         if torch_dtype is not None:
             # PEFT's get_peft_model calls cast_adapter_dtype, which
@@ -208,8 +209,9 @@ def _build_sr_peft_model_meta(
             #    torch.bfloat16 and torch.float32"
             # Re-cast the entire PEFT model to torch_dtype so every
             # tensor (base + lora) is uniform before FSDP wraps. Still
-            # all on meta — pure metadata flip, no allocation.
-            peft_model = peft_model.to(dtype=torch_dtype)
+            # all on meta — pure metadata flip, no allocation. Buffers are
+            # not flattened, so the fp32 RoPE frequencies are kept.
+            peft_model = _to_dtype_keep_rope_fp32(peft_model, torch_dtype)
     return peft_model
 
 
