@@ -39,6 +39,7 @@ from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
 from shadow_residual.shadow_residual.cross_stream import CrossStream
+from shadow_residual.shadow_residual.decoder_hf import readout_components
 from shadow_residual.shadow_residual.weight_transfer import (
     transfer_base_weights,
 )
@@ -288,26 +289,41 @@ def _reject_kv_lora(lora_config: LoraConfig) -> None:
 
 
 READOUT_NORM_NAME = "readout_norm"
+READOUT_DENSE_NAME = "readout_dense"
+_READOUT_BRANCH_TARGETS = {
+    "attn": {"q_proj", "o_proj"},
+    "mlp": {"gate_proj", "up_proj", "down_proj"},
+    "dense": {READOUT_DENSE_NAME},
+}
 
 
-def _validate_readout_lora(lora_config: LoraConfig) -> None:
-    """Read-out mode trains only ``cross_stream`` LoRA + the ``readout_norm`` gamma.
+def _validate_readout_lora(lora_config: LoraConfig, adapter_stream: str) -> None:
+    """Read-out modes train ``cross_stream`` LoRA + the ``readout_norm`` gamma,
+    plus LoRA on the projections of whichever branch the mode adds.
 
-    The read-out adapter stream runs no attention/MLP, so a LoRA delta on
-    q/o/MLP would be trained, saved, and never fire. Reject it rather than ship
-    dead weights.
+    A delta on a projection the read-out stream never runs (e.g. q/o without the
+    ``attn`` branch) would be trained, saved, and never fire, so reject it rather
+    than ship dead weights. The ``dense`` site is a zero no-op unless wrapped, so
+    ``readout+dense`` requires it to be targeted.
     """
+    comps = readout_components(adapter_stream)
+    allowed = {CROSS_STREAM_NAME}.union(*(_READOUT_BRANCH_TARGETS[c] for c in comps))
     targets = lora_config.target_modules
     names = [targets] if isinstance(targets, str) else list(targets or [])
-    extra = sorted(set(names) - {CROSS_STREAM_NAME})
+    extra = sorted(set(names) - allowed)
     if CROSS_STREAM_NAME not in names or extra:
         raise ValueError(
-            'adapter_stream="readout" requires target_modules == ["cross_stream"] '
-            f"(the read-out stream has no attention/MLP for a delta to land on); got {names}."
+            f'adapter_stream="{adapter_stream}" allows target_modules within {sorted(allowed)} '
+            f"and requires cross_stream (no other projection runs on the read-out stream); got {names}."
+        )
+    if "dense" in comps and READOUT_DENSE_NAME not in names:
+        raise ValueError(
+            f'adapter_stream="{adapter_stream}" requires "{READOUT_DENSE_NAME}" in target_modules '
+            "(the dense site is a frozen zero no-op until LoRA wraps it)."
         )
     if READOUT_NORM_NAME not in (lora_config.modules_to_save or []):
         raise ValueError(
-            'adapter_stream="readout" requires modules_to_save=["readout_norm"] '
+            f'adapter_stream="{adapter_stream}" requires modules_to_save=["readout_norm"] '
             "(the per-layer RMSNorm gamma is the read-out stream's other trainable)."
         )
 
@@ -375,15 +391,18 @@ def get_shadow_residual_peft_model(
         adapter_stream: ``"full"`` (default — the adapter stream is a second
             LoRA-adapted transformer) or ``"readout"`` (the adapter stream is
             ``readout_norm(h) + W_cross(h_base)`` only; trains ``cross_stream``
-            LoRA + ``modules_to_save=["readout_norm"]``). Recorded into
+            LoRA + ``modules_to_save=["readout_norm"]``), or a read-out ablation
+            ``"readout+attn"`` / ``"readout+mlp"`` / ``"readout+dense"`` that adds
+            one branch (and allows LoRA on its projections). Recorded into
             ``adapter_config.json`` by train.py.
 
     Returns:
         :class:`peft.PeftModel`.
     """
     _reject_kv_lora(lora_config)
-    if adapter_stream == "readout":
-        _validate_readout_lora(lora_config)
+    is_readout = readout_components(adapter_stream) is not None
+    if is_readout:
+        _validate_readout_lora(lora_config, adapter_stream)
     logger.info(
         "Building SR base from upstream HF Granite. target_modules=%s "
         "(cross_stream %s present).",
@@ -421,7 +440,7 @@ def get_shadow_residual_peft_model(
     # ACCELERATE_USE_FSDP env (set by `accelerate launch --config_file <fsdp>`).
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     fsdp_active = os.environ.get("ACCELERATE_USE_FSDP", "").lower() == "true"
-    if adapter_stream == "readout":
+    if is_readout:
         _upcast_readout_gamma(peft_model, fsdp_active=fsdp_active)
     if local_rank == 0 or not fsdp_active:
         _materialize_and_transfer(

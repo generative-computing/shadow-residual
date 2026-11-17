@@ -138,7 +138,7 @@ def to_peft_config(cfg: TrainingConfig) -> "LoraConfig":
         kwargs["rank_pattern"] = rank_pattern
     if alpha_pattern is not None:
         kwargs["alpha_pattern"] = alpha_pattern
-    if a.adapter_stream == "readout":
+    if a.adapter_stream.startswith("readout"):
         # The read-out stream's per-layer RMSNorm gamma: a plain trainable, saved
         # and restored by stock PEFT alongside the cross_stream LoRA tensors.
         kwargs["modules_to_save"] = ["readout_norm"]

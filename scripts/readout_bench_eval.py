@@ -54,7 +54,7 @@ def _sr_loader(original):
         config = PeftConfig.from_pretrained(adapter_dir)
         config.task_type = config.task_type or "CAUSAL_LM"
         model = PeftModel.from_pretrained(model, adapter_dir, config=config)
-        if stream == "readout":
+        if stream.startswith("readout"):
             _check_gamma_loaded(model, adapter_dir)
         return model.to("cuda").eval()
 

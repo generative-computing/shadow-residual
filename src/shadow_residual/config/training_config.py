@@ -169,8 +169,12 @@ class AdapterConfig(_Strict):
     # "readout": the adapter stream runs no attention/MLP — each layer is
     # h = RMSNorm_l(h) + W_cross_l(h_base_out) (docs/sr_readout_stream_design.html);
     # target_modules must then be {cross_stream: R} only, and the per-layer RMSNorm
-    # gamma trains via PEFT modules_to_save. Recorded into adapter_config.json.
-    adapter_stream: Literal["full", "readout"] = "full"
+    # gamma trains via PEFT modules_to_save. "readout+attn" / "readout+mlp" /
+    # "readout+dense" add one branch back (adapter attention on the shared base
+    # K/V, the adapter MLP, or a dense layer on the carry) and also allow LoRA on
+    # that branch's projections (q/o, gate/up/down, readout_dense). Recorded into
+    # adapter_config.json.
+    adapter_stream: Literal["full", "readout", "readout+attn", "readout+mlp", "readout+dense"] = "full"
 
     @field_validator("target_modules")
     @classmethod
@@ -181,13 +185,25 @@ class AdapterConfig(_Strict):
 
     @model_validator(mode="after")
     def _validate_readout_targets(self):
-        if self.adapter_stream != "readout":
+        if not self.adapter_stream.startswith("readout"):
             return self
-        if not isinstance(self.target_modules, dict) or set(self.target_modules) != {"cross_stream"}:
+        branch_targets = {
+            "attn": {"q_proj", "o_proj"},
+            "mlp": {"gate_proj", "up_proj", "down_proj"},
+            "dense": {"readout_dense"},
+        }
+        allowed = {"cross_stream"}.union(
+            *(branch_targets[c] for c in self.adapter_stream.split("+")[1:])
+        )
+        keys = set(self.target_modules) if isinstance(self.target_modules, dict) else None
+        if keys is None or "cross_stream" not in keys or not keys <= allowed:
             raise ValueError(
-                'adapter_stream="readout" requires target_modules: {cross_stream: <rank>} '
-                "(the read-out stream has no attention/MLP for a q/o/MLP delta to land on)"
+                f'adapter_stream="{self.adapter_stream}" requires the dict form of target_modules '
+                f"with cross_stream and only keys within {sorted(allowed)} (no other projection "
+                "runs on the read-out stream)"
             )
+        if self.adapter_stream == "readout+dense" and "readout_dense" not in keys:
+            raise ValueError('adapter_stream="readout+dense" requires a readout_dense rank in target_modules')
         return self
 
     @model_validator(mode="after")

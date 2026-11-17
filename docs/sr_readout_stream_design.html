@@ -66,7 +66,7 @@
 <div class="wrap">
 
 <div class="note">
-  <strong>Status: implemented and CPU-tested; Vela jobs not yet launched</strong> (blocked on getting the code to the pods, &sect;10). Sections 1&ndash;5 are the original
+  <strong>Status (2026-11-17): read-out SR trails vanilla SR by 3&ndash;10 pt on all 4 intrinsics (&sect;9). Three ablation arms (+attn / +mlp / +dense, &sect;11) are running.</strong> Sections 1&ndash;5 are the original
   design (unchanged). Section 6 records how every open question was resolved,
   &sect;7 the implementation, &sect;8 the experiment and evaluation protocol, &sect;9 the
   results, and &sect;10 the issues hit along the way. For the current (shared-base-K/V)
@@ -585,7 +585,8 @@ Eval uses the same harness copy, <code>/danieloh_cos/granite-switch/sr_shared_a/
 
 <h3>Evaluation = the adapter benchmark's own HF + PEFT reference path</h3>
 <ul>
-  <li>Harness: <code>generative-computing/granite-switch@2506b7c</code>, <code>benchmarks/adapter_eval/</code>, cloned into the pod.
+  <li>Harness: <code>generative-computing/granite-switch@2506b7c</code>, <code>benchmarks/adapter_eval/</code>, read from the COS copy the vanilla arm uses
+      (<code>/danieloh_cos/granite-switch/sr_shared_a/bench_harness_2506b7c</code>).
       Its scorers, <code>prompts.py</code> and <code>hf_generate.py</code> were hash-checked identical to the local harness checkout.</li>
   <li>Generation: <code>hf_generate.run(job)</code> with exactly the reference column's settings: greedy, bf16, sdpa,
       <code>max_model_len 32768</code>, <code>token_budget 262144</code>, <code>max_batch 64</code>,
@@ -604,7 +605,43 @@ Eval uses the same harness copy, <code>/danieloh_cos/granite-switch/sr_shared_a/
 
 <!-- ============================================================ -->
 <h2 id="results">9. Results</h2>
-<div class="note" id="results-status"><strong>Pending.</strong> Jobs submitted; this section is filled in as they finish.</div>
+<div class="note" id="results-status"><strong>Read-out SR is clearly worse than vanilla SR on all 4 intrinsics</strong> (−3 to −10 pt).
+The gap is significant on 3 of 4; query clarification (n = 279) is borderline. The &sect;11 ablations look for where the missing value comes from.</div>
+
+<table>
+  <tr><th>Intrinsic (headline)</th><th>Read-out SR</th><th>Vanilla SR</th><th>&Delta; (read-out &minus; vanilla)</th><th>Paired-bootstrap 95% CI</th><th>p</th><th>Identical outputs</th><th>Base model (bench)</th></tr>
+  <tr><td>answerability (accuracy, n = 3 565)</td><td>78.12</td><td>86.34</td><td><strong>&minus;8.22</strong></td><td>[&minus;9.37, &minus;7.10]</td><td>&lt;0.001</td><td>86%</td><td>73.8</td></tr>
+  <tr><td>guardian_core (accuracy, n = 11 347)</td><td>76.94</td><td>80.24</td><td><strong>&minus;3.30</strong></td><td>[&minus;3.94, &minus;2.61]</td><td>&lt;0.001</td><td>90%</td><td>64.3</td></tr>
+  <tr><td>query_clarification (overall acc., n = 279)</td><td>89.25</td><td>92.47</td><td>&minus;3.23</td><td>[&minus;6.81, +0.00]</td><td>0.052</td><td>72%</td><td>30.1</td></tr>
+  <tr><td>requirement_check (balanced acc., n = 2 409)</td><td>54.51</td><td>64.90</td><td><strong>&minus;10.38</strong></td><td>[&minus;12.65, &minus;8.31]</td><td>&lt;0.001</td><td>66%</td><td>54.8</td></tr>
+  <tr><td>trainable params / adapter (3B)</td><td>52.5M</td><td>60.9M</td><td>&minus;14%</td><td colspan="4"></td></tr>
+</table>
+<p class="small">Bootstrap: 1&nbsp;000 paired resamples of eval rows, each re-scored with the bench scorer (same method as the shared-A study),
+script <code>scripts/readout_paired_bootstrap.py readout-c256-g42</code>, results <code>/danieloh_cos/granite-switch/sr_readout/runs/v1/paired_bootstrap_readout_vs_vanilla.json</code>.
+Runs: <code>/danieloh_cos/granite-switch/sr_readout/runs/v1/readout-c256-g42-&lt;ans|guard|qc|req&gt;/run_20261117T14*</code>; vanilla runs as listed in
+<code>docs/coordination/vanilla_sr_baseline.md</code>. Every eval loaded all 40 trained &gamma;, and all 40 had moved from 1.</p>
+
+<h3>Training fit (final epoch)</h3>
+<table>
+  <tr><th>Intrinsic</th><th>Read-out eval loss (ep 1 &rarr; 2)</th><th>Vanilla eval loss (ep 1 &rarr; 2)</th><th>Read-out train loss, last 20 steps</th><th>Vanilla train loss, last 20 steps</th></tr>
+  <tr><td>answerability</td><td>0.0299 &rarr; 0.0255</td><td>0.0244 &rarr; 0.0142</td><td>0.031</td><td>0.014</td></tr>
+  <tr><td>guardian_core</td><td>0.0244 &rarr; 0.0232</td><td>0.0160 &rarr; 0.0133</td><td>0.018</td><td>0.007</td></tr>
+  <tr><td>query_clarification</td><td>1.224 &rarr; 0.890</td><td>0.160 &rarr; 0.149</td><td>1.53</td><td>0.10</td></tr>
+  <tr><td>requirement_check</td><td>0.0677 &rarr; 0.0662</td><td>0.0605 &rarr; 0.0561</td><td>0.072</td><td>0.062</td></tr>
+</table>
+
+<h3>Reading</h3>
+<ul>
+  <li><strong>Read-out underfits everywhere.</strong> Its eval loss is 1.7&ndash;6&times; vanilla's on ans/guard/qc. On query clarification, whose completions are free-text
+      clarifying questions, the loss is 6&times; higher, yet the accuracy gap stays within noise. The headline only scores whether the model asks for clarification, not the wording.</li>
+  <li><strong>Requirement check failed to learn the decision.</strong> The loss is close to vanilla's, because the format tokens are easy, but balanced accuracy is
+      at base level (54.5 vs 54.8 for the base model), and raw accuracy is 48% with yes/no F1 0.46/0.50. The adapter learns the output shape but not the judgement.</li>
+  <li><strong>Hypothesis: the missing piece is the adapter's own attention.</strong> The read-out stream has no attention. At the answer position it can only
+      re-weight what the frozen base already computed there, per position, so it cannot re-query the requirement, the documents or the
+      conversation for what the task needs. The largest losses are on the tasks that need that most: requirement check (response vs requirement) and
+      answerability (question vs documents). The smallest are on guardian, where the base is already decent. A second, smaller suspect is the
+      init: the untrained read-out is not the base model, so training starts at loss &asymp; 150 instead of vanilla's base-model loss.</li>
+</ul>
 
 <!-- ============================================================ -->
 <h2 id="issues">10. Issues &amp; notes log</h2>
@@ -622,9 +659,70 @@ Eval uses the same harness copy, <code>/danieloh_cos/granite-switch/sr_shared_a/
   <li><strong>Several Claude sessions share one working tree.</strong> The shared-A session edits <code>training/train.py</code> (multi-task) in the same
       checkout. This session's train.py change is two additive lines (pass <code>adapter_stream</code>, record it in <code>adapter_config.json</code>),
       but committing the file as it stands would sweep in the other session's uncommitted hunks.</li>
-  <li><strong>Blocker: getting the code to the pods.</strong> Vela pods clone from GitHub. The repo's CLAUDE.md says never commit or push, while
-      the task asked to push only this session's code, and train.py holds another session's unfinished edits. Training waits on that decision.</li>
+  <li><strong>Getting the code to the pods (resolved).</strong> Vela pods clone from GitHub. The repo's CLAUDE.md says never commit or push, while
+      the task asked to push only this session's code, and train.py held another session's unfinished edits. The maintainer allowed the push.
+      Only this session's hunks were staged (a patch applied with <code>git apply --cached</code>). The push was rejected at first because the shared-A
+      session had pushed <code>b1b24fb</code> and <code>d26876e</code>. A rebase fixed it; the two train.py conflicts were additive, so both sides were kept,
+      and the full suite (194 tests) passed. The result went out as <code>c9370e5</code>.</li>
+  <li><strong>Jobs pinned to <code>b0e4abf</code>, not the vanilla arm's <code>b1b24fb</code>.</strong> Between the two commits only the read-out code and
+      the other session's docs changed. The vanilla forward path (<code>adapter_stream: full</code>, the default) is untouched, so the arms differ only in the adapter.</li>
+  <li><strong>Image pull failed on one node.</strong> The first <code>requirement_check</code> pod landed on <code>gpu-worker-3-srqfk</code> and sat in
+      <code>ImagePullBackOff</code> with &ldquo;unable to retrieve auth token: invalid username/password&rdquo; for <code>image-pull-secret-us</code>.
+      The other three pods ran because their nodes already had the image cached, so the secret itself is probably stale. The job was resubmitted with
+      the namespace's other ICR pull secrets (<code>all-icr-io</code>, <code>icr-pull-secret</code>, <code>icr-pull-secret-ares</code>) as fallbacks; kubelet tries each in turn.
+      The resubmitted pod pulled the image and started.</li>
+  <li><strong>The step-0 loss is extreme, as predicted, and drops fast.</strong> Answerability started at loss &asymp; 135, with token entropy &asymp; 1e-15 and
+      token accuracy 0. The untrained read-out puts <code>norm(RMSNorm<sup>N</sup>(embeddings))</code> into an untied <code>lm_head</code>. That gives
+      huge, confidently wrong logits, unlike vanilla SR, which starts at the base model's loss. Grad norm was about 110, clipped. The loss fell to about 100
+      within 9 steps, still inside the 37-step LR warmup. Guardian was already at loss 0.06 after a few steps, and query clarification went from 7.9 to 5.1.
+      All 4 jobs logged &ldquo;Kept 40 trainable readout_norm gamma(s) in fp32&rdquo; and &ldquo;Reset 80 readout_norm weight(s) to 1&rdquo;, with
+      52,531,200 trainable parameters (planned figure: 52.5M).</li>
+  <li><strong>Log monitors replayed stale events.</strong> <code>oc logs -f</code> replays the whole log on attach, and the stream drops on API TLS timeouts.
+      The &ldquo;live&rdquo; loss events were hours behind. All 4 jobs had already finished (exit 0) and their AppWrappers had been reaped when the streams
+      ended. Lesson: confirm a job's state with <code>oc get events</code> or COS artifacts, not with a log follower.</li>
+  <li><strong>Test bug found while extending the tests.</strong> The save/load test copied base weights with
+      <code>load_state_dict(base.state_dict(), strict=False)</code> <em>after</em> <code>get_peft_model</code> had wrapped <code>base</code> in place. The wrapped
+      projections' keys had become <code>*.base_layer.*</code>, so strict=False silently skipped them. The plain read-out passed only because its single
+      wrapped site (cross_stream) is zero. Fixed by snapshotting the state dict before wrapping and loading it strictly.</li>
 </ul>
+
+<!-- ============================================================ -->
+<h2 id="ablations">11. Ablations: where does the value come from?</h2>
+<p>Each arm adds back <em>one</em> component of the full adapter stream to the read-out step, to see which one recovers the &sect;9 gap. A last arm tests
+whether the simplest possible extra capacity, a norm plus one dense layer, can compensate without attention. Notation: <code>h</code> = adapter state
+entering layer <i>l</i>; <code>hb_in</code> / <code>hb_out</code> = base-stream input / output of layer <i>l</i>; <code>c = &gamma;&#8857;RMSNorm(h)</code>;
+<code>rm</code> = residual multiplier. The base stream and its single KV cache are unchanged in every arm.</p>
+<table>
+  <tr><th>Arm (<code>adapter_stream</code>)</th><th>Per-layer adapter step</th><th>Trainable (3B)</th><th>Config</th></tr>
+  <tr><td>read-out (&sect;9, lower bound)</td><td><code>h' = c + cross<sub>256</sub>(hb_out)</code></td><td>52.5M</td><td><code>sr-readout-c256-g42.yaml</code></td></tr>
+  <tr><td><strong>readout+attn</strong></td><td><code>h' = c + rm&middot;o<sub>a</sub>(Attn(q<sub>a</sub>(ln<sub>1</sub>(h)), K(hb_in), V(hb_in))) + cross<sub>256</sub>(hb_out)</code><br>
+      <span class="small">The adapter's own Q (q_proj + LoRA r32) against the <em>shared base K/V</em>, then o_proj + LoRA r32: vanilla SR's adapter attention.</span></td>
+      <td>65.6M (+13.1M)</td><td><code>sr-readout-attn-c256-qo32-g42.yaml</code></td></tr>
+  <tr><td><strong>readout+mlp</strong></td><td><code>h' = c + rm&middot;MLP<sub>a</sub>(ln<sub>2</sub>(h)) + cross<sub>256</sub>(hb_out)</code><br>
+      <span class="small">The layer's SwiGLU with gate/up/down + LoRA r32: vanilla SR's adapter MLP.</span></td>
+      <td>93.8M (+41.3M)</td><td><code>sr-readout-mlp-c256-mlp32-g42.yaml</code></td></tr>
+  <tr><td><strong>readout+dense</strong></td><td><code>h' = c + D(c) + cross<sub>256</sub>(hb_out)</code><br>
+      <span class="small">D is a frozen zero-init H&times;H site (a second <code>CrossStream</code>, <code>readout_dense</code>) wrapped by stock LoRA r64, so the carry becomes a
+      learned full linear map <code>(I + D)&middot;c</code> instead of only a diagonal &gamma;. RMSNorm is the only nonlinearity, and there is no cross-position mixing.</span></td>
+      <td>65.6M (+13.1M)</td><td><code>sr-readout-dense-c256-d64-g42.yaml</code></td></tr>
+  <tr><td>vanilla SR (upper bound)</td><td>full adapter transformer + <code>cross<sub>32</sub></code></td><td>60.9M</td><td><code>sr-qo-mlp-r32-c32-sharedkv-g42.yaml</code></td></tr>
+</table>
+<h3>Design choices</h3>
+<ul>
+  <li><strong>The branches are added in parallel to the read-out carry, not in vanilla's residual order.</strong> Each branch reads the same <code>h</code> as the carry, so
+      every arm is &ldquo;read-out + exactly one thing&rdquo;. The branches reuse the frozen base projections (q/o or gate/up/down) plus LoRA, as vanilla does, so they
+      are not zero at init. Only the dense branch starts as a no-op, which leaves its init identical to the plain read-out.</li>
+  <li><strong>+dense is parameter-matched to +attn</strong> (13.1M each): D's rank 64 equals the q/o r32 budget. If +attn recovers the gap and +dense does not,
+      the value comes from attention (re-querying the context), not from extra parameters or a non-diagonal carry.</li>
+  <li><strong>All LoRA scales are alpha/r = 2</strong>, as in both earlier arms (cross 256/512, q/o/MLP 32/64, dense 64/128). The recipe, data, eval and seed are
+      exactly the &sect;8 protocol, with 4 jobs per arm (12 jobs, 4 GPUs each).</li>
+  <li><strong>Encoded as new <code>adapter_stream</code> values</strong> (<code>readout+attn|+mlp|+dense</code>), so the existing plumbing carries them unchanged:
+      config &rarr; build &rarr; <code>adapter_config.json</code> &rarr; serving/eval. Validation allows LoRA only on projections the chosen mode actually runs, and
+      <code>+dense</code> requires <code>readout_dense</code> to be targeted. CPU tests run every invariant over all 4 read-out modes: hand-written reference
+      recurrence, base stream bit-identical, disabled = bare, gradient checkpointing exact, KV-cache generation, save/load, and materialize.</li>
+</ul>
+<h3>Results</h3>
+<div class="note" id="ablation-status"><strong>Pending.</strong> 12 jobs; filled in as they finish.</div>
 
 </div>
 </body>
