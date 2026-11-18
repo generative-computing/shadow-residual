@@ -66,7 +66,9 @@
 <div class="wrap">
 
 <div class="note">
-  <strong>Status (2026-11-17): read-out SR trails vanilla SR by 3&ndash;10 pt on all 4 intrinsics (&sect;9). Three ablation arms (+attn / +mlp / +dense, &sect;11) are running.</strong> Sections 1&ndash;5 are the original
+  <strong>Status (2026-11-18): read-out SR trails vanilla SR by 3&ndash;10 pt on all 4 intrinsics (&sect;9). The ablations (&sect;11) show the missing value is the adapter's
+  own attention: read-out + Q/O attention on the shared K/V matches vanilla on guardian and requirement check and halves the answerability gap. Neither the MLP
+  nor a dense layer compensates.</strong> Sections 1&ndash;5 are the original
   design (unchanged). Section 6 records how every open question was resolved,
   &sect;7 the implementation, &sect;8 the experiment and evaluation protocol, &sect;9 the
   results, and &sect;10 the issues hit along the way. For the current (shared-base-K/V)
@@ -684,6 +686,11 @@ Runs: <code>/danieloh_cos/granite-switch/sr_readout/runs/v1/readout-c256-g42-&lt
       <code>load_state_dict(base.state_dict(), strict=False)</code> <em>after</em> <code>get_peft_model</code> had wrapped <code>base</code> in place. The wrapped
       projections' keys had become <code>*.base_layer.*</code>, so strict=False silently skipped them. The plain read-out passed only because its single
       wrapped site (cross_stream) is zero. Fixed by snapshotting the state dict before wrapping and loading it strictly.</li>
+  <li><strong>The ablations ran on borrowed quota and some were restarted.</strong> The <code>security</code> queue was at 97 GPUs in use against a 48-GPU nominal quota
+      (49 borrowed), so the 12 jobs first waited in Kueue. Six attempts were later cut off mid-training, most likely preempted when the lending queues reclaimed capacity:
+      attn-guard, dense-guard (twice), dense-qc, mlp-ans and mlp-req. The AppWrapper restarted each from scratch; there is no resume. Those partial run dirs have no
+      predictions. Every reported number comes from the one completed run per (arm, task), which is the latest run dir. The inspection pod
+      was also reclaimed and had to be resubmitted.</li>
 </ul>
 
 <!-- ============================================================ -->
@@ -722,7 +729,52 @@ entering layer <i>l</i>; <code>hb_in</code> / <code>hb_out</code> = base-stream 
       recurrence, base stream bit-identical, disabled = bare, gradient checkpointing exact, KV-cache generation, save/load, and materialize.</li>
 </ul>
 <h3>Results</h3>
-<div class="note" id="ablation-status"><strong>Pending.</strong> 12 jobs; filled in as they finish.</div>
+<div class="note" id="ablation-status"><strong>Attention is where the value is.</strong> Read-out + adapter attention closes the gap to vanilla SR on
+guardian (+0.59, better than vanilla) and requirement check (&minus;0.54, n.s.), and halves it on answerability (&minus;3.96). Adding the MLP instead
+helps only answerability. The parameter-matched dense layer barely helps: no attention-free extra capacity compensates.</div>
+
+<table>
+  <tr><th>Intrinsic (headline)</th><th>read-out</th><th>+attn</th><th>+mlp</th><th>+dense</th><th>vanilla SR</th></tr>
+  <tr><td>answerability (acc)</td><td>78.12 <span class="small">(&minus;8.22)</span></td><td><strong>82.38</strong> <span class="small">(&minus;3.96 [&minus;4.77, &minus;3.11])</span></td>
+      <td>81.80 <span class="small">(&minus;4.54 [&minus;5.50, &minus;3.56])</span></td><td>80.17 <span class="small">(&minus;6.17 [&minus;7.24, &minus;5.11])</span></td><td>86.34</td></tr>
+  <tr><td>guardian_core (acc)</td><td>76.94 <span class="small">(&minus;3.30)</span></td><td><strong>80.82</strong> <span class="small">(+0.59 [+0.10, +1.09], p=0.03)</span></td>
+      <td>77.58 <span class="small">(&minus;2.65 [&minus;3.26, &minus;2.01])</span></td><td>77.13 <span class="small">(&minus;3.10 [&minus;3.75, &minus;2.44])</span></td><td>80.24</td></tr>
+  <tr><td>query_clarification (overall acc)</td><td>89.25 <span class="small">(&minus;3.23, p=0.05)</span></td><td><strong>89.61</strong> <span class="small">(&minus;2.87 [&minus;6.09, 0.00], p=0.07)</span></td>
+      <td>88.53 <span class="small">(&minus;3.94 [&minus;7.53, &minus;0.72])</span></td><td>87.46 <span class="small">(&minus;5.02 [&minus;8.60, &minus;1.43])</span></td><td>92.47</td></tr>
+  <tr><td>requirement_check (bal. acc)</td><td>54.51 <span class="small">(&minus;10.38)</span></td><td><strong>64.35</strong> <span class="small">(&minus;0.54 [&minus;1.91, +0.92], p=0.48)</span></td>
+      <td>55.93 <span class="small">(&minus;8.97 [&minus;10.90, &minus;7.10])</span></td><td>56.11 <span class="small">(&minus;8.78 [&minus;10.71, &minus;6.86])</span></td><td>64.90</td></tr>
+  <tr><td>trainable params (3B)</td><td>52.5M</td><td>65.6M</td><td>93.8M</td><td>65.6M</td><td>60.9M</td></tr>
+</table>
+<p class="small">Parentheses: &Delta; vs vanilla SR with its paired-bootstrap 95% CI (1&nbsp;000 resamples, bench scorers;
+<code>scripts/readout_paired_bootstrap.py &lt;arm&gt;</code> &rarr; <code>/danieloh_cos/granite-switch/sr_readout/runs/v1/paired_bootstrap_&lt;arm&gt;_vs_vanilla.json</code>).
+All arms use the &sect;8 protocol, pinned to <code>1d25626</code>. Every eval loaded all trained &gamma; and LoRA weights.</p>
+
+<h3>Final eval loss (epoch 2) and step-0 train loss</h3>
+<table>
+  <tr><th>Intrinsic</th><th>read-out</th><th>+attn</th><th>+mlp</th><th>+dense</th><th>vanilla SR</th></tr>
+  <tr><td>answerability</td><td>0.0255</td><td><strong>0.0170</strong></td><td>0.0232</td><td>0.0244</td><td>0.0142</td></tr>
+  <tr><td>guardian_core</td><td>0.0232</td><td><strong>0.0148</strong></td><td>0.0218</td><td>0.0230</td><td>0.0133</td></tr>
+  <tr><td>query_clarification</td><td>0.890</td><td><strong>0.245</strong></td><td>0.479</td><td>0.737</td><td>0.149</td></tr>
+  <tr><td>requirement_check</td><td>0.0662</td><td><strong>0.0553</strong></td><td>0.0663</td><td>0.0654</td><td>0.0561</td></tr>
+  <tr><td>step-0 train loss (all tasks)</td><td>149&ndash;154</td><td>50&ndash;59</td><td>11&ndash;13</td><td>149&ndash;154</td><td>(base-model loss)</td></tr>
+</table>
+
+<h3>Reading</h3>
+<ul>
+  <li><strong>The &sect;9 hypothesis holds.</strong> Giving the adapter its own query against the shared base K/V brings the fit to vanilla's level on 3 of 4 tasks.
+      Requirement check goes from base level (54.5) to vanilla level (64.4). Guardian slightly <em>beats</em> vanilla SR at about the same parameter count (65.6M vs 60.9M).
+      These are the tasks whose decision depends on re-reading the input: the response against the requirement, or the conversation against the policy.</li>
+  <li><strong>The MLP and the dense layer do not substitute for attention.</strong> +mlp has the most parameters (93.8M) yet leaves requirement check at base level and
+      guardian at read-out level. It starts at a far lower loss (about 12, because the frozen base MLP branch makes the untrained stream more base-like), so init was not the main problem.
+      +dense, parameter-matched to +attn, gains only 1&ndash;2 pt. A per-position learned map of the base states cannot recover information that has to be gathered across positions.</li>
+  <li><strong>Answerability needs both components.</strong> It is the one task where the MLP helps as much as attention (+3.7 vs +4.3). The two gains roughly add up to the
+      vanilla gap: 78.1 + 4.3 + 3.7 &asymp; 86.1 vs 86.3. The natural next arm is <code>readout+attn+mlp</code>. With a norm carry and a rank-256 cross it differs from vanilla
+      only in the carry recurrence, so it would show whether that recurrence costs anything on its own.</li>
+  <li><strong>Query clarification stays 3&ndash;5 pt below vanilla in every arm.</strong> With n = 279 only +mlp and +dense are significant. +attn has the best fit (eval loss 0.245
+      vs 0.149) but still trails, so this task may need the MLP as well.</li>
+  <li><strong>Practical upshot.</strong> An attention-free adapter stream is not viable for these intrinsics. The cheapest stream that matches vanilla on judge-style tasks
+      (guardian, requirement check) is the read-out with adapter Q/O attention on the shared K/V: one extra attention query per layer, no adapter MLP, one KV cache.</li>
+</ul>
 
 </div>
 </body>
