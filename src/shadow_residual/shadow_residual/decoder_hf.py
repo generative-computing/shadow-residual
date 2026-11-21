@@ -49,22 +49,7 @@ from ._stream_gated_linear import _StreamGatedLinear, _base_only
 from .attention_hf import ShadowResidualAttention
 from .cross_stream import CrossStream
 
-ADAPTER_STREAMS = ("full", "readout", "readout+attn", "readout+mlp", "readout+dense")
-READOUT_COMPONENTS = ("attn", "mlp", "dense")
-
-
-def readout_components(adapter_stream: str) -> Optional[frozenset]:
-    """Branches added to the read-out step, or ``None`` for the full adapter stream.
-
-    ``"readout"`` → ``frozenset()``; ``"readout+attn"`` → ``{"attn"}``; ``"full"`` → ``None``.
-    """
-    if adapter_stream not in ADAPTER_STREAMS:
-        raise ValueError(
-            f"unknown adapter_stream {adapter_stream!r}; expected one of {ADAPTER_STREAMS}"
-        )
-    if adapter_stream == "full":
-        return None
-    return frozenset(adapter_stream.split("+")[1:])
+from .adapter_streams import parse_adapter_stream
 
 
 class ShadowResidualMLP(nn.Module):
@@ -258,21 +243,30 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         # zero to h_adapt.
         self.cross_stream = CrossStream(config.hidden_size)
 
-        # Read-out stream (``config.adapter_stream`` = "readout[+attn|+mlp|+dense]"):
-        # the adapter stream is h = readout_norm(h) + [branch(h)] + W_cross(h_base).
-        # The norm is frozen at gamma=1 here; PEFT's stock modules_to_save makes
-        # the trainable per-adapter copy. Built only in read-out modes so the
-        # "full" module tree (and its checkpoints) are unchanged. The "dense"
-        # branch is a second frozen zero-init site that stock LoRA wraps.
+        # Non-"full" adapter streams (see adapter_streams.py): the adapter stream
+        # runs no transformer of its own, only a carry (readout / layermix), the
+        # cross_stream tap and optional branches. The readout carry's norm is frozen
+        # at gamma=1 here; PEFT's stock modules_to_save makes the trainable copy.
+        # dense / pool / heads are extra frozen zero-init sites stock LoRA wraps.
+        # Built only in these modes so the "full" module tree is unchanged.
         self.adapter_stream = getattr(config, "adapter_stream", "full")
-        self.readout_components = readout_components(self.adapter_stream)
-        if self.readout_components is not None:
-            self.readout_norm = GraniteMoeHybridRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps,
-            )
-            self.readout_norm.weight.requires_grad_(False)
-            if "dense" in self.readout_components:
+        self.stream_spec = parse_adapter_stream(self.adapter_stream)
+        if self.stream_spec is not None:
+            branches = self.stream_spec.branches
+            if "attn" in branches and branches & {"pool", "heads"}:
+                raise ValueError(f"adapter_stream {self.adapter_stream!r}: attn cannot combine with pool/heads")
+            if self.stream_spec.carry == "readout":
+                self.readout_norm = GraniteMoeHybridRMSNorm(
+                    config.hidden_size, eps=config.rms_norm_eps,
+                )
+                self.readout_norm.weight.requires_grad_(False)
+            if "dense" in branches:
                 self.readout_dense = CrossStream(config.hidden_size)
+            q_size = self.self_attn.q_size
+            if "pool" in branches:
+                self.readout_pool = CrossStream(config.hidden_size, in_features=q_size)
+            if "heads" in branches:
+                self.readout_heads = CrossStream(config.hidden_size, in_features=q_size)
 
     def forward(
         self,
@@ -293,7 +287,7 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         loop keeps its own reference).
         """
         del kwargs
-        if self.readout_components is not None:
+        if self.stream_spec is not None:
             return self._forward_readout(
                 hs,
                 attention_mask=attention_mask,
@@ -355,17 +349,22 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor],
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
-        """Read-out stream: ``h_adapt' = c + branches + W_cross(h_base_out)``, ``c = readout_norm(h_adapt)``.
+        """Non-full adapter streams: ``h_adapt' = carry + W_cross(h_base_out) + branches``.
 
+        carry: ``readout`` → ``c = readout_norm(h_adapt)``; ``layermix`` →
+        ``h_base_out + (h_adapt - h_base_in)`` (base state + running tap sum).
         The base stream is the frozen layer on ``base_layer`` weights (owner of the
-        single KV cache). Optional branches (ablations of the full adapter stream):
-        ``attn`` = rm * adapter attention (adapter Q on the shared base K/V),
-        ``mlp`` = rm * MLP(post_attention_layernorm(h_adapt)), ``dense`` = D(c).
+        single KV cache). Branches: ``attn`` = rm * adapter attention (adapter Q on
+        the shared base K/V), ``mlp`` = rm * MLP(post_attention_layernorm(h_adapt)),
+        ``dense`` = D(c), ``pool`` = P(uniform causal mean of base V),
+        ``heads`` = W(base per-head attention outputs before o_proj).
         """
         h_base, h_adapt = hs[0], hs[1]
-        comps = self.readout_components
+        h_base_in = h_base
+        comps = self.stream_spec.branches
         rm = self.residual_multiplier
         branch = None
+        tapped = {}
         if "attn" in comps:
             o_base, o_adapt, _ = self.self_attn(
                 normed_base=self.input_layernorm(h_base),
@@ -388,15 +387,26 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 base_only=True,
+                taps=comps & {"pool", "heads"},
+                tapped=tapped,
             )
         if "mlp" in comps:
             m = self.mlp(self.post_attention_layernorm(h_adapt)) * rm
             branch = m if branch is None else branch + m
-        # gamma may be kept in fp32 (see factory); keep the stream in its dtype.
-        carry = self.readout_norm(h_adapt).to(h_adapt.dtype)
+        if self.stream_spec.carry == "readout":
+            # gamma may be kept in fp32 (see factory); keep the stream in its dtype.
+            carry = self.readout_norm(h_adapt).to(h_adapt.dtype)
+        else:
+            carry = h_base + (h_adapt - h_base_in)
         if "dense" in comps:
             d = self.readout_dense(carry)
             branch = d if branch is None else branch + d
+        if "pool" in comps:
+            p = self.readout_pool(tapped["pool"])
+            branch = p if branch is None else branch + p
+        if "heads" in comps:
+            t = self.readout_heads(tapped["heads"])
+            branch = t if branch is None else branch + t
         h_adapt = carry + self.cross_stream(h_base)
         if branch is not None:
             h_adapt = h_adapt + branch
@@ -412,9 +422,13 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor],
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         base_only: bool,
+        taps: frozenset = frozenset(),
+        tapped: Optional[dict] = None,
     ) -> torch.Tensor:
+        """One frozen base layer. ``taps`` (read-out streams) fills ``tapped`` with
+        attention internals (see ``ShadowResidualAttention.forward_bare``)."""
         normed = self.input_layernorm(h)
-        o, _ = self.self_attn.forward_bare(
+        out = self.self_attn.forward_bare(
             normed,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
@@ -422,7 +436,11 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             base_only=base_only,
+            taps=taps,
         )
+        o = out[0]
+        if taps:
+            tapped.update(out[2])
         h = h + o * self.residual_multiplier
         normed = self.post_attention_layernorm(h)
         mlp = self.mlp.forward_base_only if base_only else self.mlp

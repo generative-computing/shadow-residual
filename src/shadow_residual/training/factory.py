@@ -39,7 +39,11 @@ from shadow_residual.shadow_residual import (
     ShadowResidualForCausalLM,
 )
 from shadow_residual.shadow_residual.cross_stream import CrossStream
-from shadow_residual.shadow_residual.decoder_hf import readout_components
+from shadow_residual.shadow_residual.adapter_streams import (
+    lora_sites,
+    needs_readout_norm,
+    parse_adapter_stream,
+)
 from shadow_residual.shadow_residual.weight_transfer import (
     transfer_base_weights,
 )
@@ -289,42 +293,34 @@ def _reject_kv_lora(lora_config: LoraConfig) -> None:
 
 
 READOUT_NORM_NAME = "readout_norm"
-READOUT_DENSE_NAME = "readout_dense"
-_READOUT_BRANCH_TARGETS = {
-    "attn": {"q_proj", "o_proj"},
-    "mlp": {"gate_proj", "up_proj", "down_proj"},
-    "dense": {READOUT_DENSE_NAME},
-}
 
 
 def _validate_readout_lora(lora_config: LoraConfig, adapter_stream: str) -> None:
-    """Read-out modes train ``cross_stream`` LoRA + the ``readout_norm`` gamma,
-    plus LoRA on the projections of whichever branch the mode adds.
+    """Non-full streams train ``cross_stream`` LoRA, LoRA on the projections of
+    whichever branch the mode adds, and (readout carry) the ``readout_norm`` gamma.
 
-    A delta on a projection the read-out stream never runs (e.g. q/o without the
-    ``attn`` branch) would be trained, saved, and never fire, so reject it rather
-    than ship dead weights. The ``dense`` site is a zero no-op unless wrapped, so
-    ``readout+dense`` requires it to be targeted.
+    A delta on a projection the stream never runs (e.g. q/o without the ``attn``
+    branch) would be trained, saved, and never fire, so reject it rather than ship
+    dead weights. Zero-init branch sites (dense / pool / heads) are no-ops unless
+    wrapped, so their modes require them to be targeted.
     """
-    comps = readout_components(adapter_stream)
-    allowed = {CROSS_STREAM_NAME}.union(*(_READOUT_BRANCH_TARGETS[c] for c in comps))
+    allowed, required = lora_sites(adapter_stream)
     targets = lora_config.target_modules
     names = [targets] if isinstance(targets, str) else list(targets or [])
     extra = sorted(set(names) - allowed)
-    if CROSS_STREAM_NAME not in names or extra:
+    missing = sorted(required - set(names))
+    if missing or extra:
         raise ValueError(
             f'adapter_stream="{adapter_stream}" allows target_modules within {sorted(allowed)} '
-            f"and requires cross_stream (no other projection runs on the read-out stream); got {names}."
+            f"and requires {sorted(required)} (no other projection runs on this stream; "
+            f"zero-init sites are no-ops until LoRA wraps them); got {names}."
         )
-    if "dense" in comps and READOUT_DENSE_NAME not in names:
+    saved = lora_config.modules_to_save or []
+    if needs_readout_norm(adapter_stream) != (READOUT_NORM_NAME in saved):
         raise ValueError(
-            f'adapter_stream="{adapter_stream}" requires "{READOUT_DENSE_NAME}" in target_modules '
-            "(the dense site is a frozen zero no-op until LoRA wraps it)."
-        )
-    if READOUT_NORM_NAME not in (lora_config.modules_to_save or []):
-        raise ValueError(
-            f'adapter_stream="{adapter_stream}" requires modules_to_save=["readout_norm"] '
-            "(the per-layer RMSNorm gamma is the read-out stream's other trainable)."
+            f'adapter_stream="{adapter_stream}": modules_to_save must '
+            f'{"" if needs_readout_norm(adapter_stream) else "not "}include "readout_norm" '
+            "(only the readout carry has a per-layer RMSNorm gamma)."
         )
 
 
@@ -391,17 +387,16 @@ def get_shadow_residual_peft_model(
         adapter_stream: ``"full"`` (default — the adapter stream is a second
             LoRA-adapted transformer) or ``"readout"`` (the adapter stream is
             ``readout_norm(h) + W_cross(h_base)`` only; trains ``cross_stream``
-            LoRA + ``modules_to_save=["readout_norm"]``), or a read-out ablation
-            ``"readout+attn"`` / ``"readout+mlp"`` / ``"readout+dense"`` that adds
-            one branch (and allows LoRA on its projections). Recorded into
-            ``adapter_config.json`` by train.py.
+            LoRA + ``modules_to_save=["readout_norm"]``), or another attention-free
+            or ablation stream from ``adapter_streams.ADAPTER_STREAMS`` (e.g.
+            ``"readout+attn"``, ``"layermix+pool"``) that allows LoRA on its branch
+            sites. Recorded into ``adapter_config.json`` by train.py.
 
     Returns:
         :class:`peft.PeftModel`.
     """
     _reject_kv_lora(lora_config)
-    is_readout = readout_components(adapter_stream) is not None
-    if is_readout:
+    if parse_adapter_stream(adapter_stream) is not None:
         _validate_readout_lora(lora_config, adapter_stream)
     logger.info(
         "Building SR base from upstream HF Granite. target_modules=%s "
@@ -440,7 +435,7 @@ def get_shadow_residual_peft_model(
     # ACCELERATE_USE_FSDP env (set by `accelerate launch --config_file <fsdp>`).
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     fsdp_active = os.environ.get("ACCELERATE_USE_FSDP", "").lower() == "true"
-    if is_readout:
+    if needs_readout_norm(adapter_stream):
         _upcast_readout_gamma(peft_model, fsdp_active=fsdp_active)
     if local_rank == 0 or not fsdp_active:
         _materialize_and_transfer(

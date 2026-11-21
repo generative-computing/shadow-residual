@@ -45,8 +45,9 @@ class CrossStream(nn.Linear):
         in_features / out_features: hidden size ``H`` (cross-stream is square).
     """
 
-    def __init__(self, hidden_size: int):
-        super().__init__(hidden_size, hidden_size, bias=False)
+    def __init__(self, hidden_size: int, in_features: int | None = None):
+        # in_features: non-square read-out sites (e.g. per-head attention outputs).
+        super().__init__(in_features or hidden_size, hidden_size, bias=False)
         # Zero-init + freeze: base contribution is exactly zero and never
         # trained. A stock LoRA wrapper's delta is then the sole output.
         nn.init.zeros_(self.weight)

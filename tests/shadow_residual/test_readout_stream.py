@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Read-out-stream SR (``adapter_stream="readout[+attn|+mlp|+dense]"``) invariants, CPU only.
+"""Attention-free / read-out SR (``adapter_stream`` = readout[+…] / layermix[+…]) invariants, CPU only.
 
 The read-out adapter stream is
 ``h_{l+1} = c_l + branch_l + W_cross_l(h_base_out_l)`` with ``c_l = readout_norm_l(h_l)``,
@@ -25,8 +25,18 @@ STREAM_TARGETS = {
     "readout+attn": ["cross_stream", "q_proj", "o_proj"],
     "readout+mlp": ["cross_stream", "gate_proj", "up_proj", "down_proj"],
     "readout+dense": ["cross_stream", "readout_dense"],
+    "readout+pool": ["cross_stream", "readout_pool"],
+    "readout+heads": ["cross_stream", "readout_heads"],
+    "layermix": ["cross_stream"],
+    "layermix+pool": ["cross_stream", "readout_pool"],
+    "layermix+heads": ["cross_stream", "readout_heads"],
 }
 STREAMS = list(STREAM_TARGETS)
+ZERO_SITES = ("readout_dense", "readout_pool", "readout_heads")
+
+
+def _is_readout(stream):
+    return stream.split("+")[0] == "readout"
 
 
 def _config(adapter_stream="readout"):
@@ -49,7 +59,8 @@ def _config(adapter_stream="readout"):
 def _lora(stream="readout", **kw):
     return LoraConfig(
         r=4, lora_alpha=8, target_modules=STREAM_TARGETS[stream],
-        modules_to_save=["readout_norm"], lora_dropout=0.0, **kw,
+        modules_to_save=["readout_norm"] if _is_readout(stream) else None,
+        lora_dropout=0.0, **kw,
     )
 
 
@@ -87,15 +98,44 @@ def test_full_mode_has_no_readout_modules():
     assert not any("readout" in n for n, _ in model.named_parameters())
 
 
-def test_readout_norm_frozen_identity_on_bare(base, stream):
+def test_readout_modules_frozen_identity_on_bare(base, stream):
     for layer in base.model.layers:
-        assert torch.equal(layer.readout_norm.weight, torch.ones_like(layer.readout_norm.weight))
-        assert not layer.readout_norm.weight.requires_grad
-        if stream == "readout+dense":
-            assert torch.equal(layer.readout_dense.weight, torch.zeros_like(layer.readout_dense.weight))
-            assert not layer.readout_dense.weight.requires_grad
+        if _is_readout(stream):
+            assert torch.equal(layer.readout_norm.weight, torch.ones_like(layer.readout_norm.weight))
+            assert not layer.readout_norm.weight.requires_grad
         else:
-            assert not hasattr(layer, "readout_dense")
+            assert not hasattr(layer, "readout_norm")
+        for site in ZERO_SITES:
+            if site in STREAM_TARGETS[stream]:
+                w = getattr(layer, site).weight
+                assert torch.equal(w, torch.zeros_like(w)) and not w.requires_grad
+            else:
+                assert not hasattr(layer, site)
+
+
+def test_attn_with_taps_rejected():
+    from shadow_residual.shadow_residual.adapter_streams import ADAPTER_STREAMS
+    assert not any("attn" in s and ("pool" in s or "heads" in s) for s in ADAPTER_STREAMS)
+
+
+def test_training_config_literal_matches_grammar():
+    import typing
+    from shadow_residual.config.training_config import AdapterConfig
+    from shadow_residual.shadow_residual.adapter_streams import ADAPTER_STREAMS
+    literal = AdapterConfig.model_fields["adapter_stream"].annotation
+    assert set(typing.get_args(literal)) == set(ADAPTER_STREAMS)
+
+
+@pytest.mark.parametrize("stream", [s for s in STREAMS if not _is_readout(s)])
+def test_untrained_layermix_equals_base(stream, ids):
+    """layermix is base-seeded: with zero-init LoRA B the logits equal the bare base."""
+    torch.manual_seed(0)
+    base = ShadowResidualForCausalLM(_config(stream)).eval()
+    with torch.no_grad():
+        bare = base(input_ids=ids).logits
+        wrapped = get_peft_model(base, _lora(stream)).eval()
+        got = wrapped(input_ids=ids).logits
+    assert torch.equal(got, bare)
 
 
 @pytest.mark.parametrize("bad", ["bogus", "readout+bogus"])
@@ -140,6 +180,26 @@ def _ref_adapter_attn(layer, h, hb_in, mask, pe):
     return attn.o_proj(o)
 
 
+def _ref_base_taps(layer, hb_in, mask, pe):
+    """Base per-head attention outputs (pre o_proj) and the uniform causal mean of V, by hand."""
+    attn = layer.self_attn
+    x = layer.input_layernorm(hb_in)
+    q, k, v = (_base_only(p, x) for p in (attn.q_proj, attn.k_proj, attn.v_proj))
+    b, s, _ = q.shape
+    q = q.view(b, s, attn.num_heads, attn.head_dim).transpose(1, 2)
+    k = k.view(b, s, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+    v = v.view(b, s, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+    from transformers.models.granitemoehybrid.modeling_granitemoehybrid import apply_rotary_pos_emb
+    q, k = apply_rotary_pos_emb(q, k, *pe)
+    k = k.repeat_interleave(attn.num_key_value_groups, dim=1)
+    v = v.repeat_interleave(attn.num_key_value_groups, dim=1)
+    w = torch.softmax(q @ k.transpose(-1, -2) * attn.scaling + mask, dim=-1)
+    heads = (w @ v).transpose(1, 2).reshape(b, s, -1)
+    counts = torch.arange(1, s + 1, dtype=v.dtype).view(1, 1, s, 1)
+    pool = (v.cumsum(dim=2) / counts).transpose(1, 2).reshape(b, s, -1)
+    return heads, pool
+
+
 def test_logits_match_reference_recurrence(base, stream, ids):
     """Model logits == the hand-written read-out recurrence over bare base layers."""
     peft_model = _trained(base, stream)
@@ -150,8 +210,14 @@ def test_logits_match_reference_recurrence(base, stream, ids):
         trace, mask, pe = _base_trace(inner, ids)
         h = inner.model.embed_tokens(ids) * inner.config.embedding_multiplier
         for layer, (hb_in, hb_out) in zip(inner.model.layers, trace):
-            c = layer.readout_norm(h)
+            c = layer.readout_norm(h) if _is_readout(stream) else hb_out + (h - hb_in)
             new = c + layer.cross_stream(hb_out)
+            if stream.endswith("+pool") or stream.endswith("+heads"):
+                heads, pool = _ref_base_taps(layer, hb_in, mask, pe)
+                if stream.endswith("+pool"):
+                    new = new + layer.readout_pool(pool)
+                else:
+                    new = new + layer.readout_heads(heads)
             if stream == "readout+attn":
                 new = new + rm * _ref_adapter_attn(layer, h, hb_in, mask, pe)
             if stream == "readout+mlp":
@@ -199,7 +265,7 @@ def test_only_allowed_params_train_and_all_get_grad(base, stream, ids):
         )
         assert ok, n
     n_layers = base.config.num_hidden_layers
-    assert sum("readout_norm" in n for n in trainable) == n_layers
+    assert sum("readout_norm" in n for n in trainable) == (n_layers if _is_readout(stream) else 0)
     for site in lora_sites:
         assert sum(f"{site}.lora_A" in n for n in trainable) == n_layers, site
     out = peft_model(input_ids=ids, labels=ids)
@@ -219,7 +285,9 @@ def test_save_load_round_trip(base, stream, ids, tmp_path):
 
     from safetensors.torch import load_file
     saved = load_file(str(tmp_path / "adapter_model.safetensors"))
-    assert any("readout_norm" in k for k in saved), sorted(saved)[:5]
+    assert any("readout_norm" in k for k in saved) == _is_readout(stream), sorted(saved)[:5]
+    for site in STREAM_TARGETS[stream]:
+        assert any(f"{site}.lora_B" in k for k in saved), site
 
     torch.manual_seed(123)  # a fresh base with different random init would differ...
     fresh = ShadowResidualForCausalLM(_config(stream))
@@ -258,6 +326,19 @@ def test_kv_cache_generation_matches_no_cache(base, stream, ids):
             nxt = peft_model(input_ids=seq, use_cache=False).logits[:, -1].argmax(-1, keepdim=True)
             seq = torch.cat([seq, nxt], dim=1)
     assert torch.equal(cached, seq)
+
+
+def test_left_padded_batch_matches_unpadded(base, stream):
+    """Batched eval left-pads; padding must not leak into the read-out (e.g. the pool mean)."""
+    peft_model = _trained(base, stream)
+    short, long = [5, 17, 42], [9, 8, 7, 6, 5]
+    pad = 0
+    ids = torch.tensor([[pad, pad] + short, long])
+    mask = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
+    with torch.no_grad():
+        batched = peft_model(input_ids=ids, attention_mask=mask).logits
+        alone = peft_model(input_ids=torch.tensor([short])).logits
+    torch.testing.assert_close(batched[0, 2:], alone[0], atol=1e-5, rtol=1e-4)
 
 
 # --- factory / config ----------------------------------------------------------
@@ -302,6 +383,9 @@ def _patch(monkeypatch, upstream):
     ("readout+mlp", dict(target_modules=["cross_stream", "q_proj"], modules_to_save=["readout_norm"]), "q_proj"),
     ("readout+attn", dict(target_modules=["cross_stream", "readout_dense"], modules_to_save=["readout_norm"]), "readout_dense"),
     ("readout+dense", dict(target_modules=["cross_stream"], modules_to_save=["readout_norm"]), "readout_dense"),
+    ("readout+pool", dict(target_modules=["cross_stream"], modules_to_save=["readout_norm"]), "readout_pool"),
+    ("layermix", dict(target_modules=["cross_stream"], modules_to_save=["readout_norm"]), "readout_norm"),
+    ("layermix+heads", dict(target_modules=["cross_stream", "readout_pool"], modules_to_save=None), "readout_heads"),
 ])
 def test_factory_rejects_bad_readout_lora(adapter_stream, lora_kw, match):
     from shadow_residual.training.factory import get_shadow_residual_peft_model
@@ -320,20 +404,39 @@ def test_factory_meta_materialize_resets_gamma_and_keeps_fp32(monkeypatch, strea
         "ignored", _lora(stream), torch_dtype=torch.bfloat16, adapter_stream=stream,
     )
     norms = [(n, p) for n, p in model.named_parameters() if "readout_norm" in n]
-    assert len(norms) == 2 * 2  # frozen original + trainable copy, per layer
+    # frozen original + trainable copy, per layer (readout carry only)
+    assert len(norms) == (2 * 2 if _is_readout(stream) else 0)
     for n, p in norms:
         assert torch.equal(p.float(), torch.ones_like(p, dtype=torch.float32)), n
         if p.requires_grad:
             assert p.dtype == torch.float32, n
         assert ("modules_to_save" in n) == p.requires_grad, n
-    dense = [p for n, p in model.named_parameters() if "readout_dense.base_layer" in n]
-    assert len(dense) == (2 if stream == "readout+dense" else 0)
-    for p in dense:
-        assert torch.equal(p, torch.zeros_like(p)) and not p.requires_grad
+    for site in ZERO_SITES:
+        ws = [p for n, p in model.named_parameters() if f"{site}.base_layer" in n]
+        assert len(ws) == (2 if site in STREAM_TARGETS[stream] else 0), site
+        for p in ws:
+            assert torch.equal(p, torch.zeros_like(p)) and not p.requires_grad
     ids = torch.tensor([[1, 2, 3, 4]])
     with torch.no_grad():
         out = model(input_ids=ids).logits
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("stream", ["layermix", "layermix+pool", "layermix+heads"])
+def test_factory_untrained_layermix_matches_upstream(monkeypatch, stream):
+    """Through the real meta-materialize path, an untrained layermix adapter == the upstream base."""
+    from shadow_residual.training.factory import get_shadow_residual_peft_model
+    up = _tiny_upstream()
+    _patch(monkeypatch, up)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.delenv("ACCELERATE_USE_FSDP", raising=False)
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    with torch.no_grad():
+        want = up(input_ids=ids).logits
+    model = get_shadow_residual_peft_model("ignored", _lora(stream), adapter_stream=stream).eval()
+    with torch.no_grad():
+        got = model(input_ids=ids).logits
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
 
 
 def test_untrained_readout_is_normed_embedding_model(monkeypatch):
@@ -386,6 +489,11 @@ def test_training_config_readout_validation():
     ("readout+mlp", {"cross_stream": 256, "gate_proj": 32, "up_proj": 32, "down_proj": 32},
      {"cross_stream": 256, "q_proj": 32}),
     ("readout+dense", {"cross_stream": 256, "readout_dense": 64}, {"cross_stream": 256}),
+    ("readout+pool", {"cross_stream": 256, "readout_pool": 64}, {"cross_stream": 256}),
+    ("readout+heads", {"cross_stream": 256, "readout_heads": 64}, {"cross_stream": 256, "readout_pool": 64}),
+    ("layermix", {"cross_stream": 32}, {"cross_stream": 32, "readout_dense": 32}),
+    ("layermix+pool", {"cross_stream": 256, "readout_pool": 64}, {"cross_stream": 256}),
+    ("layermix+heads", {"cross_stream": 256, "readout_heads": 64}, {"readout_heads": 64}),
 ])
 def test_training_config_readout_ablation_validation(stream, ok, bad):
     from shadow_residual.config.adapters import to_peft_config
@@ -397,9 +505,9 @@ def test_training_config_readout_ablation_validation(stream, ok, bad):
         {**base, "adapter": {"adapter_stream": stream, "target_modules": ok, "alpha": alpha}}
     )
     lc = to_peft_config(cfg)
-    assert lc.modules_to_save == ["readout_norm"]
+    assert lc.modules_to_save == (["readout_norm"] if _is_readout(stream) else None)
     assert lc.rank_pattern == ok and lc.alpha_pattern == alpha
-    with pytest.raises(ValueError, match="readout"):
+    with pytest.raises(ValueError, match="adapter_stream"):
         TrainingConfig.model_validate({**base, "adapter": {"adapter_stream": stream, "target_modules": bad}})
 
 
@@ -409,6 +517,12 @@ def test_training_config_readout_ablation_validation(stream, ok, bad):
     ("sr-readout-mlp-c256-mlp32-g42.yaml", "readout+mlp",
      {"cross_stream": 256, "gate_proj": 32, "up_proj": 32, "down_proj": 32}),
     ("sr-readout-dense-c256-d64-g42.yaml", "readout+dense", {"cross_stream": 256, "readout_dense": 64}),
+    ("sr-readout-pool-c256-p64-g42.yaml", "readout+pool", {"cross_stream": 256, "readout_pool": 64}),
+    ("sr-readout-heads-c256-h64-g42.yaml", "readout+heads", {"cross_stream": 256, "readout_heads": 64}),
+    ("sr-layermix-c256-g42.yaml", "layermix", {"cross_stream": 256}),
+    ("sr-layermix-c32-g42.yaml", "layermix", {"cross_stream": 32}),
+    ("sr-layermix-pool-c256-p64-g42.yaml", "layermix+pool", {"cross_stream": 256, "readout_pool": 64}),
+    ("sr-layermix-heads-c256-h64-g42.yaml", "layermix+heads", {"cross_stream": 256, "readout_heads": 64}),
 ])
 def test_readout_yaml_loads(monkeypatch, name, stream, targets):
     from pathlib import Path

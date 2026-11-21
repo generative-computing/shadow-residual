@@ -776,6 +776,61 @@ All arms use the &sect;8 protocol, pinned to <code>1d25626</code>. Every eval lo
       (guardian, requirement check) is the read-out with adapter Q/O attention on the shared K/V: one extra attention query per layer, no adapter MLP, one KV cache.</li>
 </ul>
 
+<!-- ============================================================ -->
+<h2 id="attnfree">12. Minimal attention-free adapters: literature and a second sweep</h2>
+<h3>What the literature says</h3>
+<p>Survey run on 2026-11-21. Sources are arXiv papers fetched directly; &ldquo;[inf]&rdquo; marks our own inference, not a cited result.</p>
+<ul>
+  <li><strong>Attention-free PEFT in ordinary models works through a path SR closes.</strong> FFN/Pfeiffer adapters, MLP-only LoRA, LayerNorm tuning, RED/SSF scale-and-shift,
+      (IA)&sup3;, BitFit and ReFT all edit the context positions too. Those edits change the K/V that later tokens read, so they reach the decision token through the base
+      model's own attention. No paper separates that route from the per-position effect. ReFT (prompt-position edits), ActAdd and KV-cache steering rely on it explicitly.
+      The closest published analogue to our &sect;11 result is BitFit: query bias plus FFN bias &asymp; all biases, while FFN bias alone is &ldquo;substantially worse&rdquo;
+      (<a href="https://arxiv.org/abs/2106.10199">2106.10199</a>).</li>
+  <li><strong>Under SR an attention-free adapter is a per-position multi-layer probe.</strong> The probing literature predicts the &sect;9 task split.
+      Answerability is linearly decodable from frozen states, probe F1 77&ndash;90 (<a href="https://arxiv.org/abs/2310.11877">2310.11877</a>).
+      Harmfulness probes with cross-layer aggregation match LlamaGuard/Qwen3Guard (SIREN, <a href="https://arxiv.org/html/2604.18519v1">2604.18519</a>).
+      Instruction following has no global linear direction: probes are near chance on unseen instruction types (<a href="https://arxiv.org/html/2410.14516v1">2410.14516</a>),
+      and judge probes are weak on logic and consistency (<a href="https://arxiv.org/html/2601.22588v2">2601.22588</a>).
+      [inf] Answerability, harm and clarification are properties of the input, which the base already summarises at end-of-turn positions. Requirement check needs a
+      comparison between the requirement and the response that the base never computes, so a readout has nothing to read.</li>
+  <li><strong>Our read-out is probably near the attention-free ceiling.</strong> It is essentially Ladder Side-Tuning's attention-free side network, which LST measured at
+      only 0.7 GLUE below a side network with attention (<a href="https://arxiv.org/abs/2206.06522">2206.06522</a>; T5, sentence-level tasks).
+      Learned layer mixes add 0.3&ndash;8 pt over the top layer (ELMo, SIREN). Mean pooling over long inputs dilutes the signal, and EMA/max pooling or per-token
+      scoring is better (<a href="https://alignment.anthropic.com/2025/cheap-monitors/">Anthropic 2025</a>). Retraining a single layer, attention included, recovers
+      nearly everything (same source), consistent with &sect;11.</li>
+</ul>
+<h3>Arms (6 &times; 4 intrinsics = 24 jobs, &sect;8 protocol)</h3>
+<p>New attention-free building blocks, all in <code>shadow_residual/adapter_streams.py</code>:</p>
+<ul>
+  <li><strong><code>layermix</code> carry</strong>: <code>h' = hb_out + (h &minus; hb_in) + cross(hb_out)</code>, i.e. <code>h_l = hb_l + &Sigma;<sub>j&lt;l</sub> W<sub>j</sub>(hb_out<sub>j</sub>)</code>,
+      with the head on <code>norm(h_N)</code>. It is a linear multi-layer probe with one low-rank tap per layer (Head2Toe/ELMo style), with no per-layer norm recurrence.
+      With zero-init LoRA it <em>is</em> the base model, bit-exactly (tested). That fixes the read-out's step-0 loss of about 150 and separates
+      &ldquo;readout capacity&rdquo; from &ldquo;bad init&rdquo;.</li>
+  <li><strong><code>pool</code> branch</strong>: <code>P<sub>l</sub>(mean<sub>j&le;t</sub> V<sub>base,l</sub>[j])</code>, the uniform causal mean of the base V at each layer, followed by a low-rank map.
+      It is a fixed average, computed as a zero-query pass through the same attention kernel, so it reuses the base K/V cache and padding mask and adds no learned attention
+      parameters. It is the only attention-free way to mix information across positions.</li>
+  <li><strong><code>heads</code> branch</strong>: <code>W<sub>l</sub>(base per-head attention outputs, before o_proj)</code>. It shows the adapter <em>what each base head retrieved</em>
+      (an ITI/LoFiT-style head-resolved readout) instead of only the o_proj-mixed residual. It changes no attention weights or patterns.</li>
+</ul>
+<table>
+  <tr><th>Arm (<code>adapter_stream</code>)</th><th>Ranks (scale 2)</th><th>Trainable (3B)</th><th>Question</th><th>Config</th></tr>
+  <tr><td>layermix</td><td>cross 256</td><td>52.4M</td><td>Is the per-layer norm recurrence (and its bad init) needed? Compare with read-out at equal params.</td><td><code>sr-layermix-c256-g42.yaml</code></td></tr>
+  <tr><td>layermix (small)</td><td>cross 32</td><td>6.6M</td><td>How small can an attention-free readout be?</td><td><code>sr-layermix-c32-g42.yaml</code></td></tr>
+  <tr><td>layermix+pool</td><td>cross 256, pool 64</td><td>65.5M</td><td>Does a task-agnostic context summary help?</td><td><code>sr-layermix-pool-c256-p64-g42.yaml</code></td></tr>
+  <tr><td>layermix+heads</td><td>cross 256, heads 64</td><td>65.5M</td><td>Does head-resolved access to the base's retrievals help?</td><td><code>sr-layermix-heads-c256-h64-g42.yaml</code></td></tr>
+  <tr><td>readout+pool</td><td>cross 256, pool 64</td><td>65.6M</td><td>Same as layermix+pool, on the &sect;9 carry; parameter-matched to &sect;11's +attn / +dense</td><td><code>sr-readout-pool-c256-p64-g42.yaml</code></td></tr>
+  <tr><td>readout+heads</td><td>cross 256, heads 64</td><td>65.6M</td><td>Same as layermix+heads, on the &sect;9 carry; parameter-matched to &sect;11's +attn / +dense</td><td><code>sr-readout-heads-c256-h64-g42.yaml</code></td></tr>
+</table>
+<p class="small">Not run: a tuned-lens logit ensemble (per-layer affine maps into the LM head, logits summed). It needs one LM-head projection per tapped layer per token,
+which at 4096 tokens and a 100k vocabulary is GBs of extra activations per layer. <code>layermix</code> asks the same question in hidden space.
+<strong>Predictions [inf]:</strong> layermix &ge; read-out at equal params, thanks to the better init. Pool/heads give small gains on guardian and answerability.
+Requirement check stays near base level in every attention-free arm.</p>
+<p class="small">CPU tests (all 9 non-full streams): hand-written reference recurrence, including a cumulative-mean reference for pool and manual attention for heads;
+base stream bit-identical; disabled = bare; untrained layermix = base, both bit-exact and through the factory's meta-materialize path; gradient checkpointing exact;
+KV-cache generation; save/load; and left-padded batches equal unpadded ones, which matters for the pool mean.</p>
+<h3>Results</h3>
+<div class="note" id="attnfree-status"><strong>Pending.</strong></div>
+
 </div>
 </body>
 </html>

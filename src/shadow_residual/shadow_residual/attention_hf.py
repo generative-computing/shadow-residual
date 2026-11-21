@@ -215,14 +215,18 @@ class ShadowResidualAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         base_only: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Cache]]:
+        taps: frozenset = frozenset(),
+    ):
         """Single-stream attention for a bare (no-adapter) model.
 
         One plain Q/K/V/O pass. On a bare model the projections are ordinary
         ``nn.Linear`` (or LoRA-disabled), so this is exactly the unadapted base
         model's attention. ``base_only=True`` calls each projection's frozen
         ``base_layer`` (the read-out stream's base half, which must never see a
-        delta even if a projection is wrapped). Returns ``(o, present_kv)``.
+        delta even if a projection is wrapped). Returns ``(o, present_kv)``, or
+        ``(o, present_kv, tapped)`` when ``taps`` is non-empty: ``tapped["heads"]``
+        is the per-head output before o_proj, ``tapped["pool"]`` the uniform causal
+        mean of V (a zero query over the same K/V, mask and cache — no parameters).
         """
         proj = _base_only if base_only else (lambda m, x: m(x))
         q = proj(self.q_proj, normed)
@@ -236,4 +240,12 @@ class ShadowResidualAttention(nn.Module):
             )
         attn = self._run_attention(q, k_shaped, v_shaped, attention_mask)
         o = proj(self.o_proj, attn)
-        return o, past_key_values if use_cache else None
+        present = past_key_values if use_cache else None
+        if not taps:
+            return o, present
+        tapped = {}
+        if "heads" in taps:
+            tapped["heads"] = attn
+        if "pool" in taps:
+            tapped["pool"] = self._run_attention(torch.zeros_like(q), k_shaped, v_shaped, attention_mask)
+        return o, present, tapped

@@ -1,0 +1,63 @@
+# Read-out SR + head-resolved taps, attention-free (docs/sr_readout_stream_design.html §12) — Granite 4.2.
+#
+# Identical to sr-readout-c256-g42.yaml plus the heads branch: h' = c + cross(hb_out) +
+# W_l(base per-head attention outputs before o_proj). W_l: frozen zero-init site + LoRA r64
+# (alpha 128). 52.5M + 13.1M = 65.6M trainables (parameter-matched to §11's +attn / +dense).
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  adapter_stream: readout+heads
+  target_modules:
+    cross_stream: 256
+    readout_heads: 64
+  alpha:
+    cross_stream: 512
+    readout_heads: 128
+  dropout: 0.05
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]

@@ -172,9 +172,16 @@ class AdapterConfig(_Strict):
     # gamma trains via PEFT modules_to_save. "readout+attn" / "readout+mlp" /
     # "readout+dense" add one branch back (adapter attention on the shared base
     # K/V, the adapter MLP, or a dense layer on the carry) and also allow LoRA on
-    # that branch's projections (q/o, gate/up/down, readout_dense). Recorded into
+    # that branch's projections (q/o, gate/up/down, readout_dense). "layermix" is the
+    # attention-free base-seeded carry (adapter state = base state + sum of per-layer
+    # cross_stream taps); "+pool" / "+heads" add a low-rank map of the uniform causal
+    # mean of the base V / of the base per-head attention outputs. Full grammar in
+    # shadow_residual/adapter_streams.py (kept in sync by a test). Recorded into
     # adapter_config.json.
-    adapter_stream: Literal["full", "readout", "readout+attn", "readout+mlp", "readout+dense"] = "full"
+    adapter_stream: Literal[
+        "full", "readout", "readout+attn", "readout+mlp", "readout+dense",
+        "readout+pool", "readout+heads", "layermix", "layermix+pool", "layermix+heads",
+    ] = "full"
 
     @field_validator("target_modules")
     @classmethod
@@ -185,25 +192,19 @@ class AdapterConfig(_Strict):
 
     @model_validator(mode="after")
     def _validate_readout_targets(self):
-        if not self.adapter_stream.startswith("readout"):
+        if self.adapter_stream == "full":
             return self
-        branch_targets = {
-            "attn": {"q_proj", "o_proj"},
-            "mlp": {"gate_proj", "up_proj", "down_proj"},
-            "dense": {"readout_dense"},
-        }
-        allowed = {"cross_stream"}.union(
-            *(branch_targets[c] for c in self.adapter_stream.split("+")[1:])
-        )
+        # Lazy: the stream grammar lives with the model (pure Python, no torch).
+        from shadow_residual.shadow_residual.adapter_streams import lora_sites
+
+        allowed, required = lora_sites(self.adapter_stream)
         keys = set(self.target_modules) if isinstance(self.target_modules, dict) else None
-        if keys is None or "cross_stream" not in keys or not keys <= allowed:
+        if keys is None or not required <= keys or not keys <= allowed:
             raise ValueError(
                 f'adapter_stream="{self.adapter_stream}" requires the dict form of target_modules '
-                f"with cross_stream and only keys within {sorted(allowed)} (no other projection "
-                "runs on the read-out stream)"
+                f"with {sorted(required)} and only keys within {sorted(allowed)} (no other "
+                "projection runs on this adapter stream)"
             )
-        if self.adapter_stream == "readout+dense" and "readout_dense" not in keys:
-            raise ValueError('adapter_stream="readout+dense" requires a readout_dense rank in target_modules')
         return self
 
     @model_validator(mode="after")

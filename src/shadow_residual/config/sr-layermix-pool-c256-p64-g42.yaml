@@ -1,0 +1,65 @@
+# Layer-mix read-out + causal pooling, attention-free (docs/sr_readout_stream_design.html §12) — Granite 4.2.
+#
+# Same as sr-layermix-c256-g42.yaml plus the pool branch: each layer also adds
+# P_l(uniform causal mean of the base V_l). The mean is a fixed average over the visible
+# context (computed as a zero-query pass over the base K/V, mask and cache — no learned
+# attention); P_l is a frozen zero-init site wrapped by LoRA r64 (alpha 128).
+# 52.4M + 13.1M = 65.5M trainables.
+
+# yaml-language-server: $schema=./schema/training_config.schema.json
+
+model:
+  base: ${BASE_MODEL}
+
+data:
+  train_path: ${DATA_ROOT}/train.jsonl
+  val_path:   ${DATA_ROOT}/val.jsonl
+  max_length: 4096
+  assistant_marker: "<|im_start|>assistant\n<think></think>"
+
+adapter:
+  adapter_stream: layermix+pool
+  target_modules:
+    cross_stream: 256
+    readout_pool: 64
+  alpha:
+    cross_stream: 512
+    readout_pool: 128
+  dropout: 0.05
+  last_context_token: "</think>"
+  last_token: "<|im_end|>"
+
+optimizer:
+  name: adamw_torch
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+  warmup_ratio: 0.05
+
+batch:
+  per_device_train: 2
+  gradient_accumulation: 4
+  per_device_eval: 1
+  gradient_checkpointing: true
+
+validation:
+  strategy: epoch
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  early_stopping_patience: 3
+  stop_on_nan: true
+
+save:
+  strategy: epoch
+  total_limit: 3
+  output_dir: ${RUN_DIR}/checkpoints
+
+runtime:
+  num_train_epochs: 2
+  seed: 2
+  logging_steps: 1
+  dataloader_num_workers: 4
+  report_to: [wandb]

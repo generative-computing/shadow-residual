@@ -93,7 +93,12 @@
             "readout",
             "readout+attn",
             "readout+mlp",
-            "readout+dense"
+            "readout+dense",
+            "readout+pool",
+            "readout+heads",
+            "layermix",
+            "layermix+pool",
+            "layermix+heads"
           ],
           "title": "Adapter Stream",
           "type": "string"
