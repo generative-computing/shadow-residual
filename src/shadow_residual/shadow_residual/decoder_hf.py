@@ -260,11 +260,17 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
         loop keeps its own reference).
         """
         del kwargs
+        # Training only: keep the frozen base stream out of autograd so backward
+        # skips it.
         h_base, h_adapt = hs[0], hs[1]
+        if self.training:
+            h_base = h_base.detach()
         bsz = h_base.shape[0]
 
         normed = self.input_layernorm(torch.cat([h_base, h_adapt], dim=0))
         normed_base, normed_adapt = normed[:bsz], normed[bsz:]
+        if self.training:
+            normed_base = normed_base.detach()
 
         o_base, o_adapt, _ = self.self_attn(
             normed_base=normed_base,
@@ -280,6 +286,8 @@ class ShadowResidualDecoderLayer(GradientCheckpointingLayer):
 
         normed = self.post_attention_layernorm(torch.cat([h_base, h_adapt], dim=0))
         normed_base, normed_adapt = normed[:bsz], normed[bsz:]
+        if self.training:
+            normed_base = normed_base.detach()
 
         if self.mlp.is_moe and self.share_moe_routing:
             # Route once on the base stream; run both streams' experts through
