@@ -66,9 +66,10 @@
 <div class="wrap">
 
 <div class="note">
-  <strong>Status (2026-11-18): read-out SR trails vanilla SR by 3&ndash;10 pt on all 4 intrinsics (&sect;9). The ablations (&sect;11) show the missing value is the adapter's
+  <strong>Status (2026-11-22): read-out SR trails vanilla SR by 3&ndash;10 pt on all 4 intrinsics (&sect;9). The ablations (&sect;11) show the missing value is the adapter's
   own attention: read-out + Q/O attention on the shared K/V matches vanilla on guardian and requirement check and halves the answerability gap. Neither the MLP
-  nor a dense layer compensates.</strong> Sections 1&ndash;5 are the original
+  nor a dense layer compensates. Among attention-free designs (&sect;12), the base-seeded <code>layermix</code> (a sum of per-layer low-rank taps) is within about 1.5 pt of
+  vanilla on 3 of 4 tasks but 5 pt behind on requirement check. Pooling and head taps add nothing.</strong> Sections 1&ndash;5 are the original
   design (unchanged). Section 6 records how every open question was resolved,
   &sect;7 the implementation, &sect;8 the experiment and evaluation protocol, &sect;9 the
   results, and &sect;10 the issues hit along the way. For the current (shared-base-K/V)
@@ -829,7 +830,76 @@ Requirement check stays near base level in every attention-free arm.</p>
 base stream bit-identical; disabled = bare; untrained layermix = base, both bit-exact and through the factory's meta-materialize path; gradient checkpointing exact;
 KV-cache generation; save/load; and left-padded batches equal unpadded ones, which matters for the pool mean.</p>
 <h3>Results</h3>
-<div class="note" id="attnfree-status"><strong>Pending.</strong></div>
+<div class="note"><strong>The best attention-free adapter is <code>layermix</code>:</strong> the base model plus a sum of per-layer low-rank linear taps, with no norms,
+no attention and no MLP, at 52.4M params. It is within 1.4&ndash;1.7 pt of vanilla SR on answerability, guardian and query clarification (the last not significant),
+5.1 pt behind on requirement check, and well ahead of the &sect;9 read-out on every task. Neither the pool nor the heads branch adds anything. Only adapter attention
+(&sect;11) closes the requirement-check gap.</div>
+
+<table>
+  <tr><th>Intrinsic (headline)</th><th>read-out (&sect;9)</th><th>layermix r256</th><th>layermix r32</th><th>layermix +pool</th><th>layermix +heads</th>
+      <th>readout +pool</th><th>readout +heads</th><th>readout +attn (&sect;11)</th><th>vanilla SR</th></tr>
+  <tr><td>answerability (acc)</td><td>78.12</td><td><strong>84.68</strong><br><span class="small">&minus;1.65 [&minus;2.50, &minus;0.84]</span></td>
+      <td>83.34<br><span class="small">&minus;3.00 [&minus;3.96, &minus;2.05]</span></td><td>82.95<br><span class="small">&minus;3.39 [&minus;4.32, &minus;2.44]</span></td>
+      <td>84.35<br><span class="small">&minus;1.99 [&minus;2.78, &minus;1.26]</span></td><td>74.05<br><span class="small">&minus;12.29 [&minus;13.55, &minus;10.94]</span></td>
+      <td>78.23<br><span class="small">&minus;8.11 [&minus;9.23, &minus;6.96]</span></td><td>82.38</td><td>86.34</td></tr>
+  <tr><td>guardian_core (acc)</td><td>76.94</td><td>78.68<br><span class="small">&minus;1.56 [&minus;2.08, &minus;0.97]</span></td>
+      <td>77.82<br><span class="small">&minus;2.42 [&minus;3.02, &minus;1.76]</span></td><td>76.85<br><span class="small">&minus;3.38 [&minus;4.04, &minus;2.71]</span></td>
+      <td><strong>79.04</strong><br><span class="small">&minus;1.20 [&minus;1.74, &minus;0.65]</span></td><td>77.80<br><span class="small">&minus;2.44 [&minus;3.04, &minus;1.83]</span></td>
+      <td>77.61<br><span class="small">&minus;2.63 [&minus;3.31, &minus;1.95]</span></td><td>80.82</td><td>80.24</td></tr>
+  <tr><td>query_clarification (overall acc)</td><td>89.25</td><td>91.04<br><span class="small">&minus;1.43 [&minus;3.58, +1.08] n.s.</span></td>
+      <td>86.38<br><span class="small">&minus;6.09 [&minus;9.68, &minus;2.51]</span></td><td><strong>92.11</strong><br><span class="small">&minus;0.36 [&minus;2.87, +2.15] n.s.</span></td>
+      <td>91.40<br><span class="small">&minus;1.08 [&minus;3.23, +1.08] n.s.</span></td><td>87.10<br><span class="small">&minus;5.38 [&minus;8.96, &minus;2.15]</span></td>
+      <td>88.89<br><span class="small">&minus;3.58 [&minus;7.17, &minus;0.72]</span></td><td>89.61</td><td>92.47</td></tr>
+  <tr><td>requirement_check (bal. acc)</td><td>54.51</td><td>59.83<br><span class="small">&minus;5.06 [&minus;6.85, &minus;3.21]</span></td>
+      <td>55.52<br><span class="small">&minus;9.38 [&minus;11.29, &minus;7.52]</span></td><td>59.01<br><span class="small">&minus;5.89 [&minus;7.66, &minus;4.24]</span></td>
+      <td><strong>59.97</strong><br><span class="small">&minus;4.92 [&minus;6.49, &minus;3.26]</span></td><td>56.39<br><span class="small">&minus;8.50 [&minus;10.39, &minus;6.65]</span></td>
+      <td>56.52<br><span class="small">&minus;8.37 [&minus;10.30, &minus;6.40]</span></td><td>64.35</td><td>64.90</td></tr>
+  <tr><td>trainable params (3B)</td><td>52.5M</td><td>52.4M</td><td>6.6M</td><td>65.5M</td><td>65.5M</td><td>65.6M</td><td>65.6M</td><td>65.6M</td><td>60.9M</td></tr>
+</table>
+<p class="small">Below each score: &Delta; vs vanilla SR with its paired-bootstrap 95% CI (1&nbsp;000 resamples, bench scorers; <code>scripts/readout_paired_bootstrap.py &lt;arm&gt;</code>
+&rarr; <code>/danieloh_cos/granite-switch/sr_readout/runs/v1/paired_bootstrap_&lt;arm&gt;_vs_vanilla.json</code>). n.s. = CI covers 0. Base model (bench): 73.8 / 64.3 / 30.1 / 54.8.</p>
+
+<h3>Final eval loss (epoch 2)</h3>
+<table>
+  <tr><th>Intrinsic</th><th>read-out</th><th>layermix r256</th><th>layermix r32</th><th>+pool</th><th>+heads</th><th>readout+pool</th><th>readout+heads</th><th>readout+attn</th><th>vanilla</th></tr>
+  <tr><td>answerability</td><td>0.0255</td><td>0.0225</td><td>0.0244</td><td>0.0220</td><td>0.0206</td><td>0.0237</td><td>0.0234</td><td>0.0170</td><td>0.0142</td></tr>
+  <tr><td>guardian_core</td><td>0.0232</td><td>0.0201</td><td>0.0214</td><td>0.0189</td><td>0.0188</td><td>0.0202</td><td>0.0227</td><td>0.0148</td><td>0.0133</td></tr>
+  <tr><td>query_clarification</td><td>0.890</td><td>0.219</td><td>0.272</td><td>0.220</td><td>0.216</td><td>0.830</td><td>0.722</td><td>0.245</td><td>0.149</td></tr>
+  <tr><td>requirement_check</td><td>0.0662</td><td>0.0596</td><td>0.0619</td><td>0.0584</td><td>0.0583</td><td>0.0625</td><td>0.0640</td><td>0.0553</td><td>0.0561</td></tr>
+</table>
+
+<h3>Reading</h3>
+<ul>
+  <li><strong>Starting from the base model matters most.</strong> At equal parameters, layermix beats the &sect;9 read-out by +6.6 / +1.7 / +1.8 / +5.3 pt. On query clarification
+      its eval loss drops from 0.89 to 0.22, near the attention arms. The two arms differ in two ways: layermix starts exactly at the base model (step-0 loss 5.3 vs about 150
+      on query clarification), and it drops the per-layer RMSNorm recurrence. This sweep cannot separate the two. Either way, the read-out's step-0 loss of about 150 was
+      costing far more than &sect;9 assumed.</li>
+  <li><strong>An attention-free adapter is competitive on "property of the input" tasks.</strong> On answerability, layermix is 2.3 pt <em>better</em> than readout+attn
+      (84.7 vs 82.4) and 1.7 pt below vanilla. On query clarification it is within noise of vanilla. On guardian it is 1.6 pt below vanilla and 2.1 below readout+attn.
+      For these tasks a linear multi-layer probe of the frozen base, seeded at the base, recovers most of what a full adapter stream buys.</li>
+  <li><strong>Requirement check confirms the &sect;11 finding, but only partly the prediction.</strong> Every attention-free arm stays 5&ndash;10 pt behind vanilla. The best
+      ones (layermix, +heads: about 59.9) recover only half the way from base (54.8) to vanilla (64.9), while readout+attn reaches 64.4. Requirement check did <em>not</em> stay at
+      base level as predicted, so some of the comparison is linearly readable from base states. The rest needs a query of the adapter's own.</li>
+  <li><strong>Pool and heads add nothing.</strong> Head-resolved taps are within about 0.4 pt of plain layermix everywhere, so the o_proj-mixed residual already carries what the
+      heads retrieved. Uniform causal pooling <em>hurts</em>: &minus;1.7 ans and &minus;1.8 guard on layermix, &minus;4.1 ans on the read-out (74.1). An unweighted average over a
+      long RAG context is a noisy feature that is easy to overfit, as the Anthropic cheap-monitors paper warns for mean pooling. On the read-out carry neither branch helps,
+      which matches &sect;11's +dense.</li>
+  <li><strong>Capacity matters.</strong> Layermix at r32 (6.6M, 9&times; fewer params than vanilla) loses 0.9&ndash;4.7 pt against r256, most on query clarification (&minus;4.7)
+      and requirement check (&minus;4.3). It still beats the r256 &sect;9 read-out on 3 of 4 tasks.</li>
+  <li><strong>Practical upshot.</strong> The minimal attention-free SR adapter is <code>layermix</code> at r256. Per layer and per token it costs one rank-256 matmul pair
+      (about 2&middot;2&middot;H&middot;r FLOPs), adds no extra KV, and its untrained state equals the base exactly. It is within about 1.5 pt of vanilla on 3 of 4 intrinsics.
+      For judge-style tasks such as requirement check, the cheapest complete fix is still the adapter's own Q/O attention on the shared K/V (&sect;11). The natural next arm
+      is <code>layermix+attn</code>: the base-seeded carry plus Q/O. It would combine layermix's answerability and query-clarification results with attention's requirement check.</li>
+</ul>
+<div class="note" id="attnfree-status"><strong>Run notes.</strong> 24 jobs were submitted on 2026-11-21, pinned to <code>17686e9</code>, and all were admitted at once; the last finished on 2026-11-22.
+Run dirs are <code>/danieloh_cos/granite-switch/sr_readout/runs/v1/&lt;arm&gt;-&lt;task&gt;/</code>. Sanity checks:
+<ul>
+  <li>Trainable counts match the plan: 6,553,600 for layermix-c32; 65,536,000 for layermix+pool/heads; 65,638,400 for readout+pool/heads.</li>
+  <li>Every layermix arm's step-0 loss equals the base model's (5.304 on query clarification, identical across the arms). The readout-carry arms start at about 151, as in &sect;9.</li>
+  <li><code>layermix-c256 / query_clarification</code> died twice at step 0 with <code>CUDA error: an illegal memory access</code> on rank 2. Both attempts ran on node
+      <code>dmf-nnnqh-gpu-worker-3-kvjm6</code>, while the same config trained normally on guardian and requirement check. It was resubmitted with
+      <code>hostIgnoreList: [dmf-nnnqh-gpu-worker-3-kvjm6]</code> (a chart option) and trains normally on another node, so it was a bad node, not the code.</li>
+</ul></div>
 
 </div>
 </body>
