@@ -146,9 +146,62 @@ Notes:
 | `requirement_check` | `{"requirements"}`, lifted out of the `<requirements>` instruction turn | `{"score": "yes"\|"no"}` |
 | `query_clarification` | `{"query": <last user turn>}` | `{"clarification": "CLEAR" \| <question>}` |
 
-To add a task, write a converter in `tool_data/` that returns the row shape
-above and register it in `tool_data/convert.py`. The formatting layer is
-task-agnostic.
+### Adding a task
+
+The formatting layer (`tool_data/formatting.py`), the loader, the collator and
+the trainer have no per-task code. A new `tool_task` is a converter plus its
+registration. Use `tool_data/intrinsics.py` (several tasks, one module) or
+`tool_data/answerability.py` (one task) as the template.
+
+1. **Tool definition.** An OpenAI-style function schema
+   (`{"type": "function", "function": {"name", "description", "parameters"}}`).
+   Its `name` is the task name and is what the trigger `tool_call` calls.
+2. **`to_tool_row(row, *, include_response=True) -> dict | None`.** Returns the
+   [tool row](#1-data-one-row-shape-for-both-modes): `messages` ending with the
+   trigger assistant turn (`content: ""`, exactly one `tool_calls` entry with
+   the arguments lifted out of the source row), then, only if
+   `include_response`, a `tool` message whose content is the gold payload as a
+   JSON string; `tools: [<the tool definition>]`; `documents` if the task uses
+   them; `ground_truth` copied through for the scorer.
+   - `include_response=False` is the eval shape (`sr-generate`, post-training
+     generation). It must work on eval source rows, whose gold may be only in
+     `ground_truth` or absent.
+   - Return `None` to drop an unusable row (it is counted in the log). Raise
+     `ValueError` / `KeyError` for a malformed row; the loader adds the file and
+     line number.
+3. **`to_vanilla_row(row) -> dict`.** The source row as a plain chat row:
+   `messages` ending with the gold assistant turn (build it from
+   `ground_truth` if the row has none), plus `documents` if any. Raise
+   `ValueError` if there is no gold. This is required: `vanilla_frac` defaults
+   to 0.5, so without it the task trains only with `--vanilla-frac 0`.
+4. **Register in `tool_data/convert.py`.** Add the name to `TASKS` and a branch
+   to each of `tool_name()`, `convert()` and `to_vanilla()`.
+5. **Config enum.** Add a member to `ToolTask` in
+   `config/training_config.py`, in the same order as `TASKS`
+   (`test_tool_task_enum_matches_converters` compares the tuples). The
+   `--tool-task` choices of `sr-train` and `sr-generate` come from this enum.
+6. **Schema.** Regenerate it with
+   `python src/shadow_residual/config/schema/generate_config_schema.py`
+   (`tests/config/test_config_schema.py` fails on a stale schema).
+7. **Tests.** Add the task to the hard-coded list in
+   `test_tool_task_defaults_none_and_accepts_tasks`
+   (`tests/config/test_training_config.py`). Add converter cases to
+   `tests/training/test_tool_data.py` (row shape, eval shape, dropped rows,
+   errors) and vanilla-row cases to `tests/training/test_tool_vanilla_rows.py`.
+   The template-level tests take their rows from `_tool_rows()` in
+   `test_tool_data.py`, which converts the source fixtures (`ANS_SRC`,
+   `INTRINSIC_SRC`); add a source row for the new task and convert it there. Run
+   `SR_REQUIRE_TOKENIZERS=1 pytest tests/` with the Granite 4.2 tokenizer cached,
+   so the tokenizer-dependent cases run and are not skipped.
+8. **Docs.** Add a row to the table above, and add the name to the task lists in
+   `README.md` (tool section), `src/shadow_residual/training/README.md`
+   (`--tool-task`) and the header comment of
+   `src/shadow_residual/config/sr-tool-g42.yaml`.
+
+Before a full run, check the format on the real data: a short run with
+`--debug-collator 0.05` logs the first batch and about 5% of later batches,
+decoded with their labels. Confirm that the supervised span is exactly the
+payload (tool rows) or the gold answer (vanilla rows).
 
 ---
 
