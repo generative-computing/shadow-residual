@@ -39,7 +39,7 @@ src/shadow_residual/
 ├── config/                 # training_config.py schema, adapters.py, reference *.yaml
 ├── training/               # train.py, generate.py, data.py, collator.py, add_labels.py,
 │   │                       #   pack_stats.py, chat_render.py, README.md
-│   ├── tool_data/          SR-adapter-as-tool: mode rendering + task converters (+ CLI)
+│   ├── tool_data/          SR-adapter-as-tool: mode rendering + task converters
 │   └── factory.py          get_shadow_residual_peft_model: FSDP meta-init/materialize + PEFT-wrap
 └── eval/                   # answerability_eval.py (standalone --mode peft eval)
 tests/                      # run with pytest (CPU-only cases pass without a GPU)
@@ -109,7 +109,9 @@ Config essentials:
   of the two markers ends last, and every row is checked for that at load.
   `--vanilla-frac 0` = tool rows only. Reference config: `sr-tool-g42.yaml`
   (`tool_task: answerability`). Details:
-  [`docs/tool_formatting.md`](docs/tool_formatting.md).
+  [`docs/tool_formatting.md`](docs/tool_formatting.md). **Adding a new
+  `tool_task`:** follow the checklist in
+  [Adding a task](docs/tool_formatting.md#adding-a-task).
 
 **How checkpointing works.** The decoder layer is a `GradientCheckpointingLayer`
 with a single stacked-tensor (`[2,B,S,H]`) dual-stream forward and a pure
