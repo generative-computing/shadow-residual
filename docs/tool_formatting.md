@@ -80,11 +80,6 @@ the train rows instead of reading `data.val_path`. Set exactly one of the two.
 tool, it has already been converted, so loading it with `tool_task` set raises
 an error. For pre-converted files, unset `tool_task`.
 
-Answerability source rows may carry their documents as inline `tool` turns (the
-adapter-bench `g42-alora-4.1-split` shape) instead of a `documents` field. The
-converter moves them into `documents` as `{"document_id": <index>, "content":
-...}`, the same records the benchmark's own renderer builds.
-
 ### Vanilla rows: `data.vanilla_frac`
 
 Tool training from source rows (`tool_task`) renders a seeded (`runtime.seed`)
@@ -125,10 +120,9 @@ boundary validator runs per kind, each against its own last context token.
 Notes:
 - The split is exact per file, before a `--val-frac` split; train and val then
   each hold about F vanilla rows.
-- Rows the tool converter drops (answerability `conversational`) are dropped for
-  both kinds. A vanilla row keeps the source label as is (answerability
-  `"partial"` stays `"partial"`); a row with only `ground_truth` gets its gold
-  turn built from it.
+- Rows the task drops (its `keep` returns `False`) are dropped for both kinds.
+  A vanilla row keeps the source row's own gold as is; a row with only
+  `ground_truth` gets its gold turn from the task's `vanilla_gold`.
 - In tool mode (with or without vanilla rows), rows of at least
   `data.max_length` tokens are dropped and counted in the log. The trainer would
   truncate them from the end, which cuts off the supervised span and leaves an
@@ -137,27 +131,25 @@ Notes:
   vanilla side with the plain generation prompt (for example the adapter
   benchmark's own HF+PEFT runner).
 
-### What each task's tool row holds
+### Shipped tasks
 
-| `tool_task` | tool call arguments | payload |
-|---|---|---|
-| `answerability` | `{"question": <last user turn>}` | `{"answerable": true\|false}` (`partial` counts as answerable; `conversational` rows are dropped) |
-| `guardian_core` | `{"criteria", "target"}`, lifted out of the `<guardian>` instruction turn | `{"score": "yes"\|"no"}` |
-| `requirement_check` | `{"requirements"}`, lifted out of the `<requirements>` instruction turn | `{"score": "yes"\|"no"}` |
-| `query_clarification` | `{"query": <last user turn>}` | `{"clarification": "CLEAR" \| <question>}` |
+Four tasks ship as examples, in `tool_data/tasks/`. Each module's docstring
+describes its source rows, the tool call's arguments, the payload, which rows it
+drops and whether its tool rows keep the documents.
 
-Answerability and query clarification tool rows keep the row's documents.
-Guardian and requirement check judge the conversation itself, so their tool
-rows carry none (their vanilla rows keep them).
+- `answerability` (`tasks/answerability.py`)
+- `guardian_core` and `requirement_check` (`tasks/scored_instruction.py`)
+- `query_clarification` (`tasks/query_clarification.py`)
 
 ### Adding a task
 
 The formatting layer (`tool_data/formatting.py`), the loader, the collator and
 the trainer have no per-task code. A new `tool_task` is one module with a
-`ToolDataRenderer` subclass (`tool_data/renderer.py`), plus its registration.
-The base class builds the tool row and the vanilla row; the task supplies only
-what is specific to it. Use `tool_data/query_clarification.py` (the smallest)
-or `tool_data/answerability.py` (every hook overridden) as the template.
+`ToolDataRenderer` subclass (`tool_data/tasks/base.py`), plus its
+registration. The base class builds the tool row and the vanilla row; the task
+supplies only what is specific to it. Use `tool_data/tasks/query_clarification.py`
+(the smallest) or `tool_data/tasks/answerability.py` (every hook overridden) as
+the template.
 
 | member | required | what it does |
 |---|---|---|
@@ -190,7 +182,8 @@ class MyTask(ToolDataRenderer[MyRow]):
         return json.loads(final) if final else None
 ```
 
-1. **The module.** `tool_data/<task>.py` with the subclass and its `TOOL`.
+1. **The module.** `tool_data/tasks/<task>.py` with the subclass and its
+   tool definition; export the class from `tool_data/tasks/__init__.py`.
 2. **Gold for vanilla rows.** `vanilla_frac` defaults to 0.5, so the source
    rows must end with the gold assistant turn, or `vanilla_gold` must build it.
    Otherwise the task trains only with `--vanilla-frac 0`.

@@ -19,7 +19,7 @@ from shadow_residual.training.tool_data import (
     TOOL_FORMATTING_MARKERS,
     extract_tool_payload,
 )
-from shadow_residual.training.tool_data import answerability
+from shadow_residual.training.tool_data.tasks import answerability
 from shadow_residual.training.tool_data.convert import RENDERERS, renderer
 
 G42 = "ibm-granite/granite-4.2-3b"

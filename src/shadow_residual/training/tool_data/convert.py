@@ -7,11 +7,14 @@ load, no intermediate file).
 
 from __future__ import annotations
 
-from shadow_residual.training.tool_data.answerability import Answerability
-from shadow_residual.training.tool_data.guardian_core import GuardianCore
-from shadow_residual.training.tool_data.query_clarification import QueryClarification
-from shadow_residual.training.tool_data.renderer import Row, ToolDataRenderer
-from shadow_residual.training.tool_data.requirement_check import RequirementCheck
+from shadow_residual.training.tool_data.tasks import (
+    Answerability,
+    GuardianCore,
+    QueryClarification,
+    RequirementCheck,
+    Row,
+    ToolDataRenderer,
+)
 
 RENDERERS: dict[str, ToolDataRenderer] = {
     r.name: r for r in (Answerability(), GuardianCore(), RequirementCheck(), QueryClarification())

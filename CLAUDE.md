@@ -40,8 +40,8 @@ src/shadow_residual/
 ├── training/               # train.py, generate.py, data.py, collator.py, add_labels.py,
 │   │                       #   pack_stats.py, chat_render.py, README.md
 │   ├── tool_data/          SR-adapter-as-tool: mode rendering (formatting.py), the
-│   │                         ToolDataRenderer interface (renderer.py), one module per
-│   │                         task, and the task registry (convert.py)
+│   │                         task registry (convert.py), and tasks/: the
+│   │                         ToolDataRenderer base (base.py) + the shipped example tasks
 │   └── factory.py          get_shadow_residual_peft_model: FSDP meta-init/materialize + PEFT-wrap
 └── eval/                   # answerability_eval.py (standalone --mode peft eval)
 tests/                      # run with pytest (CPU-only cases pass without a GPU)

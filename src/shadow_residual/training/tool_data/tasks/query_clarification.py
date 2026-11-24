@@ -3,7 +3,7 @@
 
 The user's latest query becomes the call's argument ``{"query"}`` (the turn
 stays in the conversation); the tool response is ``{"clarification": "CLEAR" |
-<question>}``. Eval rows carry no gold dict, so they convert only without the
+<question>}``. The tool row keeps the row's documents. Eval rows carry no gold dict, so they convert only without the
 response.
 """
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 
-from shadow_residual.training.tool_data.renderer import Row, ToolDataRenderer, final_assistant, make_tool
+from shadow_residual.training.tool_data.tasks.base import Row, ToolDataRenderer, final_assistant, make_tool
 
 TOOL = make_tool(
     "query_clarification",

@@ -13,7 +13,7 @@ import pytest
 
 from shadow_residual.training.tool_data import Row, ToolDataRenderer
 from shadow_residual.training.tool_data.convert import RENDERERS, TASKS, convert, renderer, to_vanilla
-from shadow_residual.training.tool_data.renderer import final_assistant, make_tool
+from shadow_residual.training.tool_data.tasks import final_assistant, make_tool
 
 G42 = "ibm-granite/granite-4.2-3b"
 

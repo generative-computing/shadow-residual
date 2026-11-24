@@ -9,19 +9,25 @@ The gold verdict is ``ground_truth`` or, failing that, the final assistant turn
 (a quoted label). ``partial`` counts as answerable; ``conversational`` and
 unrecognized rows are dropped (no grounding decision to learn). Documents may
 also arrive as inline ``tool`` / ``documents`` turns (the adapter-bench
-g42-alora-4.1-split shape); they are moved into ``documents``.
+g42-alora-4.1-split shape); they are moved into ``documents`` as
+``{"document_id": <index>, "content": ...}``, the records the benchmark's own
+renderer builds. The tool row keeps the documents.
 
 Tool row: the base calls ``answerability(question=...)`` and the adapter's
-tool response is ``{"answerable": <bool>}``::
+tool response is ``{"answerable": <bool>}``. The conversation is rebuilt as the
+fixed ``SYSTEM`` text and the last user question (the chat template appends
+``TOOL`` to that system turn)::
 
-    {"messages": [system, user(question),
+    {"messages": [system(SYSTEM), user(question),
                   assistant(tool_calls=[answerability]), tool('{"answerable": true}')],
      "tools": [TOOL], "ground_truth": "answerable", "documents": [...]}
+
+A vanilla row keeps the source label as is (``partial`` stays ``"partial"``).
 """
 
 from __future__ import annotations
 
-from shadow_residual.training.tool_data.renderer import Row, ToolDataRenderer
+from shadow_residual.training.tool_data.tasks.base import Row, ToolDataRenderer
 
 TOOL = {
     "type": "function",
