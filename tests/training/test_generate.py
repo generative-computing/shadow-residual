@@ -482,13 +482,14 @@ def test_run_generation_tool_mode_prompts_and_payload(tmp_path, mode, continuati
     import json
     pytest.importorskip("torch")
     from shadow_residual.training import generate as gen_mod
-    from shadow_residual.training.tool_data import answerability, render_tool_prompt
+    from shadow_residual.training.tool_data import render_tool_prompt
+    from shadow_residual.training.tool_data.convert import RENDERERS
 
     tok = _g42_tokenizer()
     src = {"messages": [{"role": "user", "content": "What is the CEO's salary?"}],
            "documents": [{"document_id": "d", "content": "Vacation is 20 days."}],
            "ground_truth": "unanswerable"}
-    rows = [answerability.to_tool_row(src), answerability.to_tool_row(src, include_response=False)]
+    rows = [RENDERERS["answerability"].to_tool_row(src), RENDERERS["answerability"].to_tool_row(src, include_response=False)]
     data_path = tmp_path / "eval.jsonl"
     data_path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     out_path = tmp_path / "preds.jsonl"
@@ -516,7 +517,8 @@ def test_run_generation_tool_task_converts_eval_source_rows(tmp_path):
     import json
     pytest.importorskip("torch")
     from shadow_residual.training import generate as gen_mod
-    from shadow_residual.training.tool_data import answerability, render_tool_prompt
+    from shadow_residual.training.tool_data import render_tool_prompt
+    from shadow_residual.training.tool_data.convert import RENDERERS
 
     tok = _g42_tokenizer()
     mode = "external_tool_formatting"
@@ -537,7 +539,7 @@ def test_run_generation_tool_task_converts_eval_source_rows(tmp_path):
     )
 
     assert n == 1
-    eval_row = answerability.to_tool_row(src, include_response=False)
+    eval_row = RENDERERS["answerability"].to_tool_row(src, include_response=False)
     assert model.prompts == [render_tool_prompt(tok, eval_row["messages"], tools=eval_row["tools"],
                                                 documents=eval_row["documents"], mode=mode)]
     written = [json.loads(l) for l in out_path.read_text().splitlines()]

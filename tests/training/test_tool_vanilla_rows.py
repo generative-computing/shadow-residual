@@ -72,7 +72,7 @@ def test_vanilla_answerability_lifts_documents_and_keeps_conversation():
     ]
 
 
-def test_vanilla_intrinsic_is_the_source_row():
+def test_vanilla_adapter_row_is_the_source_row():
     v = to_vanilla("guardian_core", GUARD_ROWS[1])
     assert v == {"messages": GUARD_ROWS[1]["messages"]}
     qc = {"messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": '{"clarification": "CLEAR"}'}],

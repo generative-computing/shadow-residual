@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Answerability as a tool: source rows -> tool-formatted training/eval rows.
+"""Answerability as a tool.
 
 Source rows (either shape):
     {"messages": [...], "documents": [...], "ground_truth": "answerable" | ...}
@@ -7,21 +7,23 @@ Source rows (either shape):
 
 The gold verdict is ``ground_truth`` or, failing that, the final assistant turn
 (a quoted label). ``partial`` counts as answerable; ``conversational`` and
-unrecognized rows are dropped (no grounding decision to learn).
+unrecognized rows are dropped (no grounding decision to learn). Documents may
+also arrive as inline ``tool`` / ``documents`` turns (the adapter-bench
+g42-alora-4.1-split shape); they are moved into ``documents``.
 
-Output row: the base calls ``answerability(question=...)`` and the adapter's
+Tool row: the base calls ``answerability(question=...)`` and the adapter's
 tool response is ``{"answerable": <bool>}``::
 
     {"messages": [system, user(question),
                   assistant(tool_calls=[answerability]), tool('{"answerable": true}')],
-     "tools": [ANSWERABILITY_TOOL], "documents": [...], "ground_truth": "answerable"}
+     "tools": [TOOL], "ground_truth": "answerable", "documents": [...]}
 """
 
 from __future__ import annotations
 
-import json
+from shadow_residual.training.tool_data.renderer import Row, ToolDataRenderer
 
-ANSWERABILITY_TOOL = {
+TOOL = {
     "type": "function",
     "function": {
         "name": "answerability",
@@ -63,7 +65,7 @@ def _last_user_question(messages: list[dict]) -> str | None:
     return None
 
 
-def _verdict(row: dict) -> str | None:
+def _verdict(row: Row) -> str | None:
     gt = row.get("ground_truth")
     if gt is None:
         final = next((m for m in reversed(row.get("messages", [])) if m.get("role") == "assistant"), None)
@@ -78,11 +80,10 @@ def _is_document_turn(m: dict) -> bool:
     return m.get("role") in ("tool", "documents")
 
 
-def documents(row: dict) -> list:
-    """The row's ``documents`` plus its inline document turns (``tool`` /
-    ``documents`` messages, the adapter-bench g42-alora-4.1-split shape), the
-    latter as ``{"document_id": <index>, "content": ...}`` like the benchmark's
-    own training-set renderer."""
+def documents(row: Row) -> list:
+    """The row's ``documents`` plus its inline document turns, the latter as
+    ``{"document_id": <index>, "content": ...}`` like the benchmark's own
+    training-set renderer."""
     docs = list(row.get("documents") or [])
     for m in row.get("messages", []):
         if _is_document_turn(m):
@@ -90,53 +91,37 @@ def documents(row: dict) -> list:
     return docs
 
 
-def to_vanilla_row(row: dict) -> dict:
-    """The source row as a plain chat row: inline document turns move into
-    ``documents``; the final assistant turn (the quoted label) is the gold, built
-    from ``ground_truth`` when the row has none."""
-    messages = [m for m in row.get("messages", []) if not _is_document_turn(m)]
-    if messages and messages[-1].get("role") != "assistant" and _verdict(row):
-        messages.append({"role": "assistant", "content": f'"{_verdict(row)}"'})
-    if not messages or messages[-1].get("role") != "assistant":
-        raise ValueError("a vanilla answerability row must end with the gold assistant turn")
-    out = {"messages": messages}
-    docs = documents(row)
-    if docs:
-        out["documents"] = docs
-    return out
+class Answerability(ToolDataRenderer[Row]):
+    tool_definition = TOOL
+
+    def keep(self, row: Row) -> bool:
+        return _verdict(row) not in (None, "conversational") and bool(_last_user_question(row.get("messages", [])))
+
+    def to_tool_call(self, row: Row) -> list[dict]:
+        question = _last_user_question(row["messages"])
+        return [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": question},
+            self.tool_call({"question": question}),
+        ]
+
+    def format_response(self, row: Row) -> dict:
+        return {"answerable": _verdict(row) in ("answerable", "partial")}
+
+    def carried_fields(self, row: Row) -> dict:
+        out = {"ground_truth": "answerable" if self.format_response(row)["answerable"] else "unanswerable"}
+        docs = documents(row)
+        if docs:
+            out["documents"] = docs
+        return out
+
+    def vanilla_gold(self, row: Row) -> str | None:
+        verdict = _verdict(row)
+        return f'"{verdict}"' if verdict else None
+
+    def to_vanilla_row(self, row: Row) -> Row:
+        messages = [m for m in row.get("messages", []) if not _is_document_turn(m)]
+        return super().to_vanilla_row({**row, "messages": messages, "documents": documents(row)})
 
 
-def to_tool_row(row: dict, *, include_response: bool = True) -> dict | None:
-    """Convert one source row; ``None`` if it has no usable verdict or question.
-
-    ``include_response=False`` drops the gold tool message, giving the eval
-    shape (generation prompts; the gold stays in ``ground_truth``).
-    """
-    verdict = _verdict(row)
-    question = _last_user_question(row.get("messages", []))
-    if verdict in (None, "conversational") or not question:
-        return None
-    answerable = verdict in ("answerable", "partial")
-    messages = [
-        {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": question},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "type": "function",
-                "function": {"name": "answerability", "arguments": {"question": question}},
-            }],
-        },
-    ]
-    if include_response:
-        messages.append({"role": "tool", "content": json.dumps({"answerable": answerable})})
-    out = {
-        "messages": messages,
-        "tools": [ANSWERABILITY_TOOL],
-        "ground_truth": "answerable" if answerable else "unanswerable",
-    }
-    docs = documents(row)
-    if docs:
-        out["documents"] = docs
-    return out
+__all__ = ["Answerability", "SYSTEM", "TOOL", "documents"]
