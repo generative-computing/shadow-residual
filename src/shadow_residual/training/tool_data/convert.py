@@ -25,10 +25,6 @@ def renderer(task: str) -> ToolDataRenderer:
     return RENDERERS[task]
 
 
-def tool_name(task: str) -> str:
-    return RENDERERS[task].name
-
-
 def convert(task: str, row: Row, *, include_response: bool) -> Row | None:
     """Convert one source row; ``None`` if the renderer drops it as unusable.
 
@@ -50,4 +46,4 @@ def to_vanilla(task: str, row: Row) -> Row:
     return renderer(task).to_vanilla_row(row)
 
 
-__all__ = ["RENDERERS", "TASKS", "convert", "renderer", "to_vanilla", "tool_name"]
+__all__ = ["RENDERERS", "TASKS", "convert", "renderer", "to_vanilla"]
