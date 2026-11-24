@@ -10,7 +10,7 @@ leaves as garbage (non-persistent RoPE ``inv_freq`` buffers).
 Two kinds of source are accepted wherever a base id/path is taken:
 
 - an **SR checkpoint** (``model_type: "shadow_residual"``, produced once by
-  :mod:`shadow_residual.shadow_residual.convert`) — loaded directly with
+  :mod:`shadow_residual.base_model.export_base`) — loaded directly with
   ``from_pretrained``; its config and weights are already in SR layout;
 - an **upstream Granite checkpoint** — converted in memory on every load (the
   original path).
@@ -146,50 +146,6 @@ def _apply_runtime_options(
     return sr_config
 
 
-def load_sr_checkpoint(
-    model_name_or_path: str,
-    *,
-    torch_dtype: Optional[torch.dtype] = None,
-    attn_implementation: Optional[str] = None,
-    share_moe_routing: bool = True,
-) -> ShadowResidualForCausalLM:
-    """Load a converted SR checkpoint with stock ``from_pretrained``.
-
-    Strict: any missing, unexpected or shape-mismatched weight raises instead of
-    being silently re-initialized. The frozen all-zero cross-stream weights are
-    deliberately absent from the checkpoint and re-zeroed on load, so they are
-    not reported as missing.
-    """
-    sr_config = build_sr_config(
-        model_name_or_path,
-        torch_dtype=torch_dtype,
-        attn_implementation=attn_implementation,
-        share_moe_routing=share_moe_routing,
-    )
-    load_kwargs = {"config": sr_config, "output_loading_info": True}
-    if torch_dtype is not None:
-        load_kwargs["dtype"] = torch_dtype
-    if attn_implementation is not None:
-        load_kwargs["attn_implementation"] = attn_implementation
-    sr_model, info = ShadowResidualForCausalLM.from_pretrained(model_name_or_path, **load_kwargs)
-    problems = {
-        kind: sorted(info.get(kind) or [])
-        for kind in ("missing_keys", "unexpected_keys", "mismatched_keys")
-    }
-    if any(problems.values()) or info.get("error_msgs"):
-        raise ValueError(
-            f"SR checkpoint {model_name_or_path!r} does not match the SR model "
-            f"built from its config: {problems} {info.get('error_msgs') or ''}. "
-            "Re-convert it with the current shadow_residual version (sr-convert)."
-        )
-    if torch_dtype is not None:
-        # Same cast as the in-memory conversion path (build_sr_base below and the
-        # training factory), so a base built either way is tensor-for-tensor
-        # identical and an adapter sees the same numerics at train and serve time.
-        sr_model = to_dtype_keep_rope_fp32(sr_model, torch_dtype)
-    return sr_model
-
-
 def build_sr_base(
     base_model_name_or_path: str,
     *,
@@ -216,14 +172,14 @@ def build_sr_base(
     :func:`shadow_residual.training.generation_utils.read_share_moe_routing_from_adapter`
     (train.py records it in ``adapter_config.json``) rather than hand-passing.
 
-    ``base_model_name_or_path`` may be an SR checkpoint (loaded directly via
-    :func:`load_sr_checkpoint`) or an upstream Granite checkpoint (converted in
-    memory below).
+    ``base_model_name_or_path`` may be an SR checkpoint (loaded with stock
+    ``from_pretrained``) or an upstream Granite checkpoint (converted in memory
+    below).
     """
     if is_sr_checkpoint(base_model_name_or_path):
-        return load_sr_checkpoint(
+        return ShadowResidualForCausalLM.from_pretrained(
             base_model_name_or_path,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_implementation,
             share_moe_routing=share_moe_routing,
         )
@@ -357,7 +313,6 @@ __all__ = [
     "is_sr_checkpoint",
     "build_sr_config",
     "build_sr_base",
-    "load_sr_checkpoint",
     "reinit_rope_buffers",
     "to_dtype_keep_rope_fp32",
     "diagnose_materialized",

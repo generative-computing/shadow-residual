@@ -4,8 +4,8 @@
 Builds a :class:`ShadowResidualForCausalLM` and layers PEFT on top.
 
 The base is either an **SR checkpoint** (``model_type: "shadow_residual"``,
-converted once with ``sr-convert`` — the default in the reference configs) or an
-**upstream Granite checkpoint** (converted in memory on every load).
+exported once with ``sr-export-base``) or an **upstream Granite checkpoint**
+(converted in memory on every load).
 
 - SR checkpoint, single process / DDP: stock ``from_pretrained`` of the SR model,
   then ``get_peft_model``.
@@ -58,7 +58,6 @@ from shadow_residual.shadow_residual.build import (
     build_sr_config as _build_sr_config,
     build_sr_base as _build_sr_base,
     is_sr_checkpoint as _is_sr_checkpoint,
-    load_sr_checkpoint as _load_sr_checkpoint,
     reinit_rope_buffers as _reinit_rope_buffers,
     to_dtype_keep_rope_fp32 as _to_dtype_keep_rope_fp32,
     diagnose_materialized as _diagnose_materialized,
@@ -114,12 +113,12 @@ def _materialize_and_transfer(
     sr_inner = peft_model.base_model.model  # PeftModel → LoraModel → SR causal-LM
 
     if from_sr_checkpoint:
-        # Already in SR layout: stock from_pretrained (strict), then a by-name
-        # copy into the skeleton. drain_src=True frees each source tensor as
-        # soon as it is copied, so peak host RAM stays near one model copy.
-        sr_src = _load_sr_checkpoint(
+        # Already in SR layout: from_pretrained, then a by-name copy into
+        # the skeleton. Peak host RAM is about two model copies (skeleton +
+        # sr_src); drain_src=True frees sr_src tensor by tensor during the copy.
+        sr_src = ShadowResidualForCausalLM.from_pretrained(
             base_model_name_or_path,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_implementation,
             share_moe_routing=share_moe_routing,
         )
@@ -259,9 +258,9 @@ def _load_sr_peft_model(
     :func:`_build_sr_peft_model_meta`), freshly initialized LoRA, zero frozen
     cross-stream sites and a tied lm_head on tied bases.
     """
-    sr_model = _load_sr_checkpoint(
+    sr_model = ShadowResidualForCausalLM.from_pretrained(
         base_model_name_or_path,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         attn_implementation=attn_implementation,
         share_moe_routing=share_moe_routing,
     )
@@ -350,7 +349,7 @@ def get_shadow_residual_peft_model(
 
     Args:
         base_model_name_or_path: HF model id or local path of the base — an SR
-            checkpoint (from ``sr-convert``, loaded with ``from_pretrained``) or
+            checkpoint (from ``sr-export-base``, loaded with ``from_pretrained``) or
             an upstream Granite model (converted in memory).
         lora_config: a stock :class:`peft.LoraConfig`.  Driving fields:
 

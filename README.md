@@ -116,21 +116,22 @@ importing `shadow_residual.shadow_residual` registers the model type.
 import shadow_residual.shadow_residual  # registers the SR model type
 from transformers import AutoModelForCausalLM
 
-model = AutoModelForCausalLM.from_pretrained("AlonMal/granite-4.1-3b-sr")
+model = AutoModelForCausalLM.from_pretrained("<SR_BASE_MODEL>")
 ```
 
-With no adapter attached it produces the upstream model's outputs. Convert a base
-once with `sr-convert` (it reloads the result and checks every tensor), and
+With no adapter attached it produces the upstream model's outputs. Export a base
+once with `sr-export-base` (it reloads the result and checks every tensor), and
 optionally push it to the Hub:
 
 ```bash
-sr-convert --base ibm-granite/granite-4.1-3b --output ./granite-4.1-3b-sr \
-           --repo-id AlonMal/granite-4.1-3b-sr --push
+sr-export-base --base ibm-granite/granite-4.1-3b --output ./granite-4.1-3b-sr \
+               --repo-id <SR_BASE_MODEL> --push
 ```
 
 Anywhere a base id is taken (`model.base` in the training YAML, `build_sr_base`,
-the eval CLI), an upstream Granite id still works: it is converted in memory on
-every load.
+the eval CLI), either kind works. The reference configs use the upstream Granite
+id, which is converted in memory on every load; pass `--base-model
+<SR_BASE_MODEL>` to train on an exported SR base instead.
 
 ## Training SR adapters
 
@@ -138,7 +139,6 @@ Training is driven by a single Pydantic-validated YAML (the schema does not name
 architectures — behavior follows the fields you set). Reference configs live in
 [`src/shadow_residual/config/`](src/shadow_residual/config/); `sr-*` configs
 enable the dual-stream forward by listing `cross_stream` in `target_modules`.
-The default config trains on the SR checkpoint `AlonMal/granite-4.1-3b-sr`.
 
 ### On the current server
 

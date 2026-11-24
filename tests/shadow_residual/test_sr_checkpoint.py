@@ -13,7 +13,6 @@ download):
 - The training factory builds the same PEFT model from the SR checkpoint as from
   the upstream base, on the single-process path and the FSDP rank-0 / meta paths.
 - ``build_sr_base`` (serving) accepts either kind of base.
-- Loading is strict: a checkpoint whose weights don't match its config raises.
 """
 
 from __future__ import annotations
@@ -34,12 +33,8 @@ from transformers import (
 )
 
 from shadow_residual.shadow_residual import ShadowResidualForCausalLM
-from shadow_residual.shadow_residual.build import (
-    build_sr_base,
-    is_sr_checkpoint,
-    load_sr_checkpoint,
-)
-from shadow_residual.shadow_residual.convert import convert_to_sr_checkpoint
+from shadow_residual.shadow_residual.build import build_sr_base, is_sr_checkpoint
+from shadow_residual.base_model.export_base import convert_to_sr_checkpoint
 from shadow_residual.shadow_residual.cross_stream import CrossStream
 from shadow_residual.shadow_residual.model_config import ShadowResidualConfig
 
@@ -171,7 +166,7 @@ def test_auto_from_pretrained_is_base_identical(converted):
 def test_load_matches_in_memory_conversion(converted):
     """The SR checkpoint and the in-memory conversion give identical models."""
     for dtype in (torch.float32, torch.bfloat16):
-        from_ckpt = load_sr_checkpoint(converted["sr"], torch_dtype=dtype).state_dict()
+        from_ckpt = ShadowResidualForCausalLM.from_pretrained(converted["sr"], dtype=dtype).state_dict()
         in_memory = build_sr_base(converted["upstream"], torch_dtype=dtype).state_dict()
         assert set(from_ckpt) == set(in_memory)
         for key, val in in_memory.items():
@@ -187,24 +182,10 @@ def test_build_sr_base_accepts_sr_checkpoint(converted):
     torch.testing.assert_close(logits, converted["logits"], atol=1e-5, rtol=1e-4)
 
 
-def test_load_is_strict(converted, tmp_path):
-    """A checkpoint missing a real weight raises instead of random-initializing it."""
-    from safetensors.torch import load_file, save_file
-    import shutil
-
-    broken = tmp_path / "broken"
-    shutil.copytree(converted["sr"], broken)
-    state = load_file(str(broken / "model.safetensors"))
-    del state["model.layers.0.self_attn.q_proj.weight"]
-    save_file(state, str(broken / "model.safetensors"), metadata={"format": "pt"})
-    with pytest.raises(ValueError, match="does not match"):
-        load_sr_checkpoint(str(broken))
-
-
 def test_share_moe_routing_is_caller_controlled(converted):
     """The routing mode is a runtime choice even though config.json stores one."""
     for value in (True, False):
-        model = load_sr_checkpoint(converted["sr"], share_moe_routing=value)
+        model = ShadowResidualForCausalLM.from_pretrained(converted["sr"], share_moe_routing=value)
         assert model.config.share_moe_routing is value
 
 
@@ -261,14 +242,10 @@ def test_factory_sr_checkpoint_matches_upstream(converted, monkeypatch, rank, dt
 
 def test_factory_sr_checkpoint_fsdp_non_rank0_stays_on_meta(converted, monkeypatch):
     """FSDP non-rank-0 builds the same meta skeleton, loading nothing."""
-    from shadow_residual.shadow_residual import build as build_mod
-    from shadow_residual.training import factory as factory_mod
-
     def _fail(*a, **kw):
         raise AssertionError("non-rank-0 must not load weights")
 
-    monkeypatch.setattr(factory_mod, "_load_sr_checkpoint", _fail)
-    monkeypatch.setattr(build_mod, "load_sr_checkpoint", _fail)
+    monkeypatch.setattr(ShadowResidualForCausalLM, "from_pretrained", classmethod(_fail))
     meta = _build(converted["sr"], monkeypatch, rank=1)
     assert all(p.is_meta for p in meta.parameters())
 

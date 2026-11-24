@@ -1,23 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Convert an upstream HF Granite checkpoint into a standalone SR checkpoint.
+"""Export an upstream HF Granite checkpoint as a standalone SR base checkpoint.
 
-The SR model is otherwise assembled in memory on every load (upstream config →
-SR config, fused→unfused weight slicing, zero cross-stream sites — see
-:mod:`shadow_residual.shadow_residual.build`). Converting once writes that model
-to disk as a regular HF checkpoint (``model_type: "shadow_residual"``) that loads
-with stock ``from_pretrained`` and can be pushed to the Hub::
+Mainly needed to train SR adapters with third-party training libraries, which
+load the base with ``AutoModelForCausalLM.from_pretrained``. This repo's own
+tools (``sr-train``, ``sr-generate``, ``build_sr_base``, the eval CLI) also take
+an upstream Granite id and build the SR model from it in memory on every load
+(upstream config → SR config, fused→unfused weight slicing, zero cross-stream
+sites — see :mod:`shadow_residual.shadow_residual.build`).
 
-    sr-convert --base ibm-granite/granite-4.1-3b --output ./granite-4.1-3b-sr \\
-               --repo-id AlonMal/granite-4.1-3b-sr --push
+Exporting once writes that model to disk as a regular HF checkpoint
+(``model_type: "shadow_residual"``) that loads with stock ``from_pretrained``
+and can be pushed to the Hub::
+
+    sr-export-base --base ibm-granite/granite-4.1-3b --output ./granite-4.1-3b-sr \\
+                   --repo-id <SR_BASE_MODEL> --push
 
     import shadow_residual.shadow_residual  # registers the SR model type
-    model = AutoModelForCausalLM.from_pretrained("AlonMal/granite-4.1-3b-sr")
+    model = AutoModelForCausalLM.from_pretrained("<SR_BASE_MODEL>")
 
-The checkpoint carries the upstream tokenizer, chat template and generation
-config, so one model id is enough for training and serving. The frozen all-zero
-cross-stream weights are not written (``_keys_to_ignore_on_save``); they are
-re-zeroed on load. Conversion is generic over the bases ``build_sr_base``
-supports (dense Granite 4.x, tied or untied lm_head, and granitemoe).
+Importing :mod:`shadow_residual.shadow_residual` registers the model type with
+the HF auto classes, so no ``trust_remote_code`` is needed. The checkpoint
+carries the upstream tokenizer, chat template and generation config, so one
+model id is enough for training and serving. The frozen all-zero cross-stream
+weights are not written (``_keys_to_ignore_on_save``); they are re-zeroed on
+load. With no adapter attached the loaded model reproduces the upstream logits.
+
+Use the exported id as ``model.base`` (or ``--base-model``) anywhere a base is
+taken. Under FSDP the training factory keeps its meta-init + rank-0 fill +
+broadcast pattern; rank 0 fills from the SR checkpoint by name instead of
+slicing upstream weights.
+
+Export works for the bases ``build_sr_base`` supports (dense Granite 4.x, tied
+or untied lm_head, and granitemoe). After writing, the checkpoint is reloaded
+and every tensor is checked (``--no-verify`` skips this).
 """
 
 from __future__ import annotations
@@ -30,7 +45,8 @@ from typing import Optional, Union
 
 import torch
 
-from .build import build_sr_base, is_sr_checkpoint, load_sr_checkpoint
+from shadow_residual.shadow_residual import ShadowResidualForCausalLM
+from shadow_residual.shadow_residual.build import build_sr_base, is_sr_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +73,7 @@ def convert_to_sr_checkpoint(
         torch_dtype: dtype of the saved weights. ``"auto"`` (default) keeps the
             upstream checkpoint's dtype.
         max_shard_size: safetensors shard size passed to ``save_pretrained``.
-        verify: reload the written checkpoint with strict ``from_pretrained`` and
+        verify: reload the written checkpoint with ``from_pretrained`` and
             check every tensor is identical to the converted model. Holds two
             copies of the model in host RAM; disable for very large bases.
         repo_id: Hub repo id (``"user/name"``) the checkpoint is published under;
@@ -208,8 +224,8 @@ they are re-created on load.
 
 
 def _verify_round_trip(sr_model, out: Path, dtype: torch.dtype) -> None:
-    logger.info("Verifying: reloading %s with strict from_pretrained ...", out)
-    reloaded = load_sr_checkpoint(str(out), torch_dtype=dtype)
+    logger.info("Verifying: reloading %s with from_pretrained ...", out)
+    reloaded = ShadowResidualForCausalLM.from_pretrained(out, dtype=dtype)
     got = reloaded.state_dict()
     expected = sr_model.state_dict()
     if set(got) != set(expected):
@@ -239,7 +255,7 @@ def _push_to_hub(out: Path, repo_id: str, base_model_name_or_path: str, *, priva
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="sr-convert",
+        prog="sr-export-base",
         description="Convert an upstream HF Granite checkpoint into an SR checkpoint.",
     )
     p.add_argument("--base", required=True, help="Upstream HF model id or local path.")
@@ -251,7 +267,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-shard-size", default="5GB")
     p.add_argument(
         "--no-verify", dest="verify", action="store_false",
-        help="Skip the strict reload check (it holds two model copies in host RAM).",
+        help="Skip the reload check (it holds two model copies in host RAM).",
     )
     p.add_argument(
         "--repo-id", help="Hub repo the checkpoint is published under, e.g. user/name "

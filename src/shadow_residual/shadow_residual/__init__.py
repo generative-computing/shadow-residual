@@ -35,8 +35,9 @@ from .model_config import ShadowResidualConfig
 from .weight_transfer import transfer_base_weights
 
 # Register the SR model type with the HF auto classes so a saved SR checkpoint
-# (see ``convert.py``) loads with stock ``AutoConfig`` / ``AutoModelForCausalLM``
-# ``.from_pretrained`` once this package is imported — no ``trust_remote_code``.
+# (see ``shadow_residual.base_model.export_base``) loads with stock
+# ``AutoConfig`` / ``AutoModelForCausalLM`` ``.from_pretrained`` once this
+# package is imported — no ``trust_remote_code``.
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 AutoConfig.register(ShadowResidualConfig.model_type, ShadowResidualConfig, exist_ok=True)
