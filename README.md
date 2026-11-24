@@ -104,6 +104,35 @@ checkpoint's `target_modules` (shared when `cross_stream` is present, else
 disjoint), which is correct for any adapter trained with the auto-default. If the
 adapter was trained with a non-default value, pass the same value explicitly.
 
+## SR base checkpoints
+
+The SR base model can be saved as a regular Hugging Face checkpoint
+(`model_type: "shadow_residual"`): the upstream Granite weights re-laid-out for
+SR, plus the upstream tokenizer and chat template. It loads with stock
+`from_pretrained` — no conversion at load time and no `trust_remote_code`;
+importing `shadow_residual.shadow_residual` registers the model type.
+
+```python
+import shadow_residual.shadow_residual  # registers the SR model type
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("<SR_BASE_MODEL>")
+```
+
+With no adapter attached it produces the upstream model's outputs. Export a base
+once with `sr-export-base` (it reloads the result and checks every tensor), and
+optionally push it to the Hub:
+
+```bash
+sr-export-base --base ibm-granite/granite-4.1-3b --output ./granite-4.1-3b-sr \
+               --repo-id <SR_BASE_MODEL> --push
+```
+
+Anywhere a base id is taken (`model.base` in the training YAML, `build_sr_base`,
+the eval CLI), either kind works. The reference configs use the upstream Granite
+id, which is converted in memory on every load; pass `--base-model
+<SR_BASE_MODEL>` to train on an exported SR base instead.
+
 ## Training SR adapters
 
 Training is driven by a single Pydantic-validated YAML (the schema does not name

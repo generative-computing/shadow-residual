@@ -74,13 +74,12 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
     Args:
         drain_src: when True, each source tensor is unbound from
             ``src_model`` immediately after it has been copied (or
-            sliced and copied) into the destination. This drops peak
-            CPU RAM during construction from ``|src| + |dst|`` to
-            roughly ``|dst| + one_tensor``, which is the difference
-            between OOM and not for 30B-scale bases at 4 ranks × 400Gi.
-            After this call ``src_model`` is unusable — its parameters
-            are gone — so the caller must ``del`` it. Defaults to
-            False to preserve the historical "src is read-only"
+            sliced and copied) into the destination, so host RAM falls
+            back toward one model copy during the transfer. The peak,
+            both models fully loaded, comes before the transfer and is
+            not reduced. After this call ``src_model`` is unusable — its
+            parameters are gone — so the caller must ``del`` it. Defaults
+            to False to preserve the historical "src is read-only"
             contract that tests rely on.
     """
     config = dst_model.config
@@ -279,4 +278,58 @@ def transfer_base_weights(src_model, dst_model, *, drain_src: bool = False) -> N
     )
 
 
-__all__ = ["transfer_base_weights"]
+def copy_sr_weights(src_model, dst_model, *, drain_src: bool = False) -> None:
+    """Copy an SR model's weights into a same-config SR model, strictly by name.
+
+    Fills an SR model that was built from its config and wrapped with PEFT
+    before any weights were loaded. FSDP needs this: every rank builds the
+    model on meta in the same order, so ``sync_module_states`` can broadcast
+    rank 0's values, and ``from_pretrained`` cannot load into such a model.
+    Both sides use the SR layout, so each tensor copies by name with no
+    slicing. ``.base_layer.`` is removed from destination names, and LoRA
+    tensors are skipped and keep their current values; reset them after the
+    copy. Any missing or unexpected key, or shape mismatch, raises. (Compare
+    :func:`transfer_base_weights`, which maps an upstream Granite layout and
+    skips what it can't place.)
+
+    Args:
+        src_model: an SR model with real weights, e.g. an SR base checkpoint
+            loaded with ``from_pretrained``.
+        dst_model: an SR model with the same config, possibly wrapped with
+            PEFT, whose tensors are already real (for example after
+            ``to_empty``), not meta.
+        drain_src: when True, each source tensor is unbound from ``src_model``
+            as soon as it is copied, so host RAM falls back toward one model copy
+            during the copy. The peak, both models fully loaded, comes before
+            the copy and is not reduced. ``src_model`` is unusable afterwards.
+    """
+    dst_state = {
+        key.replace(".base_layer.", "."): val
+        for key, val in dst_model.state_dict().items()
+        if "lora_" not in key
+    }
+    src_state = dict(src_model.state_dict())
+    missing = sorted(set(dst_state) - set(src_state))
+    unexpected = sorted(set(src_state) - set(dst_state))
+    mismatched = sorted(
+        key for key in set(src_state) & set(dst_state)
+        if src_state[key].shape != dst_state[key].shape
+    )
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            "SR weight copy: source and destination layouts differ "
+            f"(missing={missing[:5]}, unexpected={unexpected[:5]}, "
+            f"mismatched={mismatched[:5]})."
+        )
+
+    for key in list(src_state):
+        src_val = src_state.pop(key)
+        with torch.no_grad():
+            dst_state[key].copy_(src_val)
+        if drain_src:
+            _unbind_param(src_model, key)
+        del src_val
+    logger.info("Shadow-residual weight copy from SR checkpoint: copied %d.", len(dst_state))
+
+
+__all__ = ["transfer_base_weights", "copy_sr_weights"]

@@ -31,11 +31,13 @@ src/shadow_residual/
 │   ├── cross_stream.py         frozen zero-init nn.Linear cross-stream site
 │   ├── model_config.py         vendored ShadowResidualConfig
 │   ├── config_helpers.py       validate / set_shadow_residual
-│   ├── build.py                SR config/model construction + RoPE reinit (no PEFT)
-│   ├── weight_transfer.py      fused→unfused QKV / gate-up slicing
+│   ├── build.py                SR config/model construction + RoPE reinit (no PEFT);
+│   │                             loads SR checkpoints or converts upstream in memory
+│   ├── weight_transfer.py      fused→unfused QKV / gate-up slicing; SR→SR by-name copy
 │   └── _stream_gated_linear.py   _StreamGatedLinear marker + _base_only helper
 │                           #   (100% stock PEFT-adaptable — no custom LoRA classes; the
 │                           #    publishable HF model, needs nothing from training/)
+├── base_model/             # export_base.py: sr-export-base (upstream Granite → SR base ckpt)
 ├── config/                 # training_config.py schema, adapters.py, reference *.yaml
 ├── training/               # train.py, generate.py, data.py, collator.py, add_labels.py,
 │   │                       #   pack_stats.py, chat_render.py, README.md
@@ -76,6 +78,9 @@ environment variable of the same name (the flag wins). Explicit paths
 fields before resolution, so their placeholders need no value.
 
 Config essentials:
+- **`model.base`** — an **upstream Granite** id (the reference-config default;
+  converted in memory on every load) or an **SR base checkpoint** (see "SR base
+  checkpoints" below).
 - **`"cross_stream"` in `adapter.target_modules`** engages the dual-stream SR
   forward. Do NOT list `k_proj` / `v_proj` (K/V LoRA is rejected).
 - **`adapter.last_context_token`** (optional, single token) → train.py validates
@@ -133,9 +138,17 @@ Single-GPU / non-FSDP runs are unaffected and can generate in-job.
 Vela: use the YAMLs in `examples/vela/`. Pin `trl<1.7` (already in pyproject).
 `eval_loss: nan` per epoch is expected for prompt-only eval rows.
 
+## SR base checkpoints
+
+`sr-export-base` saves the SR base as a regular HF checkpoint. Mainly needed for
+third-party training libraries that load the base with
+`AutoModelForCausalLM.from_pretrained`. Usage and details:
+[`src/shadow_residual/base_model/export_base.py`](src/shadow_residual/base_model/export_base.py).
+
 ## Serving / evaluation
 
-No custom loader — build an SR base, then attach the adapter with stock PEFT:
+No custom loader — build an SR base, then attach the adapter with stock PEFT.
+`base_id` may be an SR checkpoint or an upstream Granite id:
 
 ```python
 from shadow_residual.shadow_residual.build import build_sr_base

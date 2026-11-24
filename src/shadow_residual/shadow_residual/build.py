@@ -7,6 +7,14 @@ This module is pure model/HF code with **no PEFT dependency**. It builds a
 unfused projections, and repairs the tensors that a meta-init ``to_empty()``
 leaves as garbage (non-persistent RoPE ``inv_freq`` buffers).
 
+Two kinds of source are accepted wherever a base id/path is taken:
+
+- an **SR checkpoint** (``model_type: "shadow_residual"``, produced once by
+  :mod:`shadow_residual.base_model.export_base`) — loaded directly with
+  ``from_pretrained``; its config and weights are already in SR layout;
+- an **upstream Granite checkpoint** — converted in memory on every load (the
+  original path).
+
 It is imported by :mod:`shadow_residual.training.factory` (the
 PEFT-wrapping training factory) and can be used standalone to build a bare SR
 model for plain inference — no adapters involved.
@@ -28,6 +36,20 @@ from .weight_transfer import transfer_base_weights
 logger = logging.getLogger(__name__)
 
 
+def is_sr_checkpoint(model_name_or_path: str) -> bool:
+    """True iff ``model_name_or_path`` is an already-converted SR checkpoint.
+
+    Reads only the config (cheap, cached). An SR checkpoint's ``config.json``
+    carries ``model_type: "shadow_residual"``, which resolves to
+    :class:`ShadowResidualConfig` through the auto-class registration in this
+    package's ``__init__``; an upstream Granite checkpoint resolves to its own
+    config class.
+    """
+    from transformers import AutoConfig
+
+    return isinstance(AutoConfig.from_pretrained(model_name_or_path), ShadowResidualConfig)
+
+
 def build_sr_config(
     base_model_name_or_path: str,
     *,
@@ -45,10 +67,21 @@ def build_sr_config(
     init: from_pretrained has its own meta→load-in-place machinery that
     historically diverged the parameter insertion order, breaking FSDP's
     sync_module_states broadcast.
+
+    For an SR checkpoint the stored config is already final; only the runtime
+    choices (``share_moe_routing``, dtype, attention backend) are applied.
     """
     from transformers import AutoConfig
 
     base_config = AutoConfig.from_pretrained(base_model_name_or_path)
+    if isinstance(base_config, ShadowResidualConfig):
+        return _apply_runtime_options(
+            set_shadow_residual(base_config, enabled=True),
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            share_moe_routing=share_moe_routing,
+        )
+
     config_dict = base_config.to_dict()
     # Normalize layer_types to all-attention. Some Granite configs ship a
     # `layer_types` list that includes non-"attention" entries (e.g. mamba
@@ -86,9 +119,25 @@ def build_sr_config(
         config_dict["shared_intermediate_size"] = config_dict["intermediate_size"]
     sr_config = ShadowResidualConfig(**config_dict)
     set_shadow_residual(sr_config, enabled=True)
-    # MoE-only routing mode (no-op on dense bases). Not serialized — it is a
-    # forward-path choice, not a weight, so a saved adapter carries no record of
-    # it; train and serve must pass the same value (see build_sr_base).
+    return _apply_runtime_options(
+        sr_config,
+        torch_dtype=torch_dtype,
+        attn_implementation=attn_implementation,
+        share_moe_routing=share_moe_routing,
+    )
+
+
+def _apply_runtime_options(
+    sr_config: ShadowResidualConfig,
+    *,
+    torch_dtype: Optional[torch.dtype],
+    attn_implementation: Optional[str],
+    share_moe_routing: bool,
+) -> ShadowResidualConfig:
+    # MoE-only routing mode (no-op on dense bases). It is a forward-path choice,
+    # not a weight: a saved adapter's weights carry no record of it, so train and
+    # serve must pass the same value (see build_sr_base). An SR checkpoint's
+    # config.json does store it, but always as the caller's value here.
     sr_config.share_moe_routing = bool(share_moe_routing)
     if torch_dtype is not None:
         sr_config.torch_dtype = torch_dtype
@@ -122,7 +171,19 @@ def build_sr_base(
     prefer sourcing it from the adapter itself via
     :func:`shadow_residual.training.generation_utils.read_share_moe_routing_from_adapter`
     (train.py records it in ``adapter_config.json``) rather than hand-passing.
+
+    ``base_model_name_or_path`` may be an SR checkpoint (loaded with stock
+    ``from_pretrained``) or an upstream Granite checkpoint (converted in memory
+    below).
     """
+    if is_sr_checkpoint(base_model_name_or_path):
+        return ShadowResidualForCausalLM.from_pretrained(
+            base_model_name_or_path,
+            dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            share_moe_routing=share_moe_routing,
+        )
+
     sr_config = build_sr_config(
         base_model_name_or_path,
         torch_dtype=torch_dtype,
@@ -249,6 +310,7 @@ def diagnose_materialized(model) -> None:
 
 
 __all__ = [
+    "is_sr_checkpoint",
     "build_sr_config",
     "build_sr_base",
     "reinit_rope_buffers",
