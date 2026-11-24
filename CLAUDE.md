@@ -90,7 +90,10 @@ Config essentials:
   records it into the saved `adapter_config.json`. Does NOT gate the adapter.
 - **`adapter.last_token`** (optional, single token) → end-of-completion marker;
   train.py appends it to any row that doesn't already end with it, and records it
-  into `adapter_config.json`.
+  into `adapter_config.json`. Every row ends exactly on `last_token` / the
+  tokenizer's `eos_token` (the template's trailing `\n` is dropped): TRL's
+  SFTTrainer appends `eos_token` to any text not ending in it, which would
+  otherwise supervise a second `\n<eos>` after the gold.
 - **`data.enable_thinking` / `--thinking`** → forwarded to
   `apply_chat_template(enable_thinking=...)`. CLI wins over YAML. Default False.
 - **`data.tool_formatting` / `--tool-formatting`** (opt-in, **Granite 4.2 only**)

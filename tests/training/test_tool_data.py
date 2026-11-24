@@ -450,12 +450,13 @@ def test_debug_collator_prints_first_batch_with_supervised_span(tok, mode, caplo
 
 
 def test_loader_without_tool_formatting_is_unchanged(tok, tmp_path):
-    """With tool_formatting unset a tool row renders as a plain stock chat row."""
+    """With tool_formatting unset a tool row renders as a plain stock chat row,
+    ending on its final <|im_end|>."""
     pytest.importorskip("datasets")
     from shadow_residual.training.data import load_jsonl_dataset
     row = ANS.to_tool_row(ANS_SRC[0])
     ds = load_jsonl_dataset(_write_jsonl(tmp_path / "rows.jsonl", [row]), tok)
-    assert ds[0]["text"] == _stock(tok, row)
+    assert ds[0]["text"] == _stock(tok, row).rstrip()
 
 
 # --- model gate -----------------------------------------------------------------

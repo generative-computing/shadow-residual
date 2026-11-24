@@ -151,7 +151,8 @@ def test_tool_and_vanilla_rows_match_the_single_formats(tok, tmp_path, mode, tas
 
 def test_vanilla_answerability_matches_bench_document_placement(tok, tmp_path):
     """The vanilla row equals the benchmark renderer's output (data_v1): one JSON
-    tool message after the last user turn, documents indexed 0..n-1."""
+    tool message after the last user turn, documents indexed 0..n-1. The row ends on
+    its final <|im_end|>, without the template's trailing newline."""
     from shadow_residual.training.chat_render import render_chat
     path = _write(tmp_path / "src.jsonl", ANS_ROWS[:2])
     ds = _load(tok, path, EXTERNAL, "answerability", frac=0.5, seed=0)
@@ -161,7 +162,16 @@ def test_vanilla_answerability_matches_bench_document_placement(tok, tmp_path):
             for k, m in enumerate(m for m in row["messages"] if m["role"] == "tool")]
     msgs = [m for m in row["messages"] if m["role"] != "tool"]
     bench = [*msgs[:3], {"role": "tool", "content": json.dumps(docs, indent=2)}, msgs[3]]
-    assert ds[i]["text"] == render_chat(tok, bench, add_generation_prompt=False, enable_thinking=False)
+    assert ds[i]["text"] == render_chat(tok, bench, add_generation_prompt=False, enable_thinking=False).rstrip()
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_every_row_ends_on_eos(tok, tmp_path, mode):
+    """TRL's SFTTrainer appends eos_token to text not ending in it; both kinds must
+    already end on it so no second EOS is supervised."""
+    ds = _load(tok, _write(tmp_path / "src.jsonl", ANS_ROWS), mode, "answerability")
+    assert set(ds["kind"]) == {"tool", "vanilla"}
+    assert all(t.endswith(tok.eos_token) for t in ds["text"])
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -178,7 +188,7 @@ def test_collator_supervises_each_kind_exactly(tok, tmp_path, mode):
         sup = tok.decode([v for v in labels if v != -100])
         if kind == "vanilla":
             assert tok.decode(ids[first - 1]) == "</think>"
-            assert sup == src["messages"][-1]["content"] + IM_END + "\n"
+            assert sup == src["messages"][-1]["content"] + IM_END
         else:
             payload = json.dumps({"answerable": src["messages"][-1]["content"] == '"answerable"'})
             assert tok.decode(ids[first - 1]) == TOOL_FORMATTING_MARKERS[mode].last_context_token

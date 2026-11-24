@@ -97,7 +97,7 @@ assistant turn. The response formats differ. For answerability the vanilla gold
 is the quoted label and the tool gold is the dict:
 
 ```
-vanilla  ...<|im_start|>assistant\n<think></think>   "unanswerable"<|im_end|>\n
+vanilla  ...<|im_start|>assistant\n<think></think>   "unanswerable"<|im_end|>
 tool     ...<|im_start|>user\n<tool_response>\n       {"answerable": false}<|im_end|>
 ```
 

@@ -146,9 +146,14 @@ def load_jsonl_dataset(
     emits ``<|im_end|>\n`` (a trailing newline after the terminator), so the
     literal last token is the newline, not the marker — checking only the very
     last token id would wrongly re-append the marker and produce a doubled
-    ``<|im_end|>\n<|im_end|>`` tail on every row. Rows already ending in the
-    marker (with or without trailing whitespace) are left unchanged. The string
-    must encode to exactly one token id (enforced by the caller).
+    ``<|im_end|>\n<|im_end|>`` tail on every row. The string must encode to
+    exactly one token id (enforced by the caller).
+
+    Every row ends exactly on its final marker (``last_token`` or the
+    tokenizer's ``eos_token``): whitespace after it is dropped. TRL's
+    SFTTrainer appends ``eos_token`` to any text that doesn't end with it, so a
+    row ending ``<|im_end|>\n`` would otherwise train a second, supervised
+    ``\n<|im_end|>`` after the gold.
 
     ``tool_formatting`` (``data.tool_formatting``; SR adapter as a tool, Granite
     4.2 only) renders each row with
@@ -190,6 +195,7 @@ def load_jsonl_dataset(
                 f"got {ids}."
             )
         last_token_id = ids[0]
+    end_markers = tuple(t for t in (last_token, tokenizer.eos_token) if t)
 
     if tool_task is not None and tool_formatting is None:
         raise ValueError("tool_task requires tool_formatting")
@@ -272,6 +278,9 @@ def load_jsonl_dataset(
                 )
         except (ValueError, KeyError) as e:
             raise ValueError(f"{path}:{lineno}: {e}") from e
+        stripped = text.rstrip()
+        if end_markers and stripped.endswith(end_markers):
+            text = stripped
         row_ids = None
         if last_token_id is not None:
             # Append the end-of-completion marker unless the row already
@@ -287,8 +296,8 @@ def load_jsonl_dataset(
         if tool_formatting is not None and max_length is not None:
             # The trainer truncates from the end, which would cut the supervised
             # span off and leave an earlier marker (documents, trigger turn) as
-            # the cut point. Drop such rows instead. ">=" leaves room for the EOS
-            # the trainer appends to rows that end in "<|im_end|>\n".
+            # the cut point. Drop such rows instead; ">=" leaves room for an EOS
+            # the trainer appends to a row that doesn't end in eos_token.
             if row_ids is None:
                 row_ids = tokenizer.encode(text, add_special_tokens=False)
             if len(row_ids) >= max_length:
