@@ -19,12 +19,15 @@ from shadow_residual.training.tool_data import (
     TOOL_FORMATTING_MARKERS,
     extract_tool_payload,
 )
-from shadow_residual.training.tool_data import answerability, intrinsics
+from shadow_residual.training.tool_data.tasks import answerability
+from shadow_residual.training.tool_data.convert import RENDERERS, renderer
 
 G42 = "ibm-granite/granite-4.2-3b"
 G41 = "ibm-granite/granite-4.1-3b"
 IM_END = "<|im_end|>"
 MODES = [EXTERNAL, AUTOREGRESSIVE]
+ANS = RENDERERS["answerability"]
+ADAPTER_TASKS = ("guardian_core", "requirement_check", "query_clarification")
 
 ANS_SRC = [
     {
@@ -53,7 +56,7 @@ REQ_INSTR = (
     'if the constraints are satisfied or respond with {"score": "no"} if the '
     "constraints are not satisfied."
 )
-INTRINSIC_SRC = {
+ADAPTER_SRC = {
     "guardian_core": {
         "messages": [
             {"role": "user", "content": "How do I hurt my neighbor?"},
@@ -80,8 +83,8 @@ INTRINSIC_SRC = {
 
 
 def _tool_rows() -> list[dict]:
-    rows = [answerability.to_tool_row(r) for r in ANS_SRC]
-    rows += [intrinsics.to_tool_row(k, v) for k, v in INTRINSIC_SRC.items()]
+    rows = [ANS.to_tool_row(r) for r in ANS_SRC]
+    rows += [RENDERERS[k].to_tool_row(v) for k, v in ADAPTER_SRC.items()]
     return rows
 
 
@@ -98,13 +101,13 @@ def _write_jsonl(path: Path, rows: list[dict]) -> Path:
 
 
 def test_answerability_row_shape():
-    row = answerability.to_tool_row(ANS_SRC[0])
+    row = ANS.to_tool_row(ANS_SRC[0])
     roles = [m["role"] for m in row["messages"]]
     assert roles == ["system", "user", "assistant", "tool"]
     call = row["messages"][2]["tool_calls"][0]["function"]
     assert call == {"name": "answerability", "arguments": {"question": "How long is parental leave?"}}
     assert json.loads(_gold(row)) == {"answerable": True}
-    assert row["tools"] == [answerability.ANSWERABILITY_TOOL]
+    assert row["tools"] == [answerability.TOOL]
     assert row["documents"] == ANS_SRC[0]["documents"]
     assert row["ground_truth"] == "answerable"
 
@@ -122,7 +125,7 @@ def test_answerability_verdict_sources(src, expected):
         row = {"messages": messages}
     else:
         row = {"messages": messages, "ground_truth": src["ground_truth"]}
-    out = answerability.to_tool_row(row)
+    out = ANS.to_tool_row(row)
     assert json.loads(_gold(out)) == {"answerable": expected}
 
 
@@ -133,7 +136,7 @@ def test_answerability_verdict_sources(src, expected):
     {"messages": [{"role": "user", "content": "hi"}]},
 ])
 def test_answerability_drops_unusable_rows(row):
-    assert answerability.to_tool_row(row) is None
+    assert ANS.to_tool_row(row) is None
 
 
 def test_answerability_lifts_inline_document_turns():
@@ -146,7 +149,7 @@ def test_answerability_lifts_inline_document_turns():
         {"role": "user", "content": "q?"},
         {"role": "assistant", "content": '"unanswerable"'},
     ]}
-    out = answerability.to_tool_row(row)
+    out = ANS.to_tool_row(row)
     assert out["documents"] == [
         {"document_id": 0, "content": "doc A"},
         {"document_id": 1, "content": "doc B"},
@@ -155,52 +158,55 @@ def test_answerability_lifts_inline_document_turns():
 
 
 def test_answerability_eval_row_has_no_response():
-    row = answerability.to_tool_row(ANS_SRC[1], include_response=False)
+    row = ANS.to_tool_row(ANS_SRC[1], include_response=False)
     assert row["messages"][-1]["role"] == "assistant"
     assert row["ground_truth"] == "unanswerable"
 
 
-def test_intrinsic_instruction_moves_into_tool_call():
-    row = intrinsics.to_tool_row("guardian_core", INTRINSIC_SRC["guardian_core"])
+def test_instruction_turn_moves_into_tool_call():
+    row = RENDERERS["guardian_core"].to_tool_row(ADAPTER_SRC["guardian_core"])
     assert all("<guardian>" not in (m.get("content") or "") for m in row["messages"])
     args = row["messages"][-2]["tool_calls"][0]["function"]["arguments"]
     assert args == {"criteria": "Violence refers to content that promotes or depicts physical harm.",
                     "target": "user"}
     assert json.loads(_gold(row)) == {"score": "yes"}
 
-    row = intrinsics.to_tool_row("requirement_check", INTRINSIC_SRC["requirement_check"])
+    row = RENDERERS["requirement_check"].to_tool_row(ADAPTER_SRC["requirement_check"])
     assert all("<requirements>" not in (m.get("content") or "") for m in row["messages"])
     args = row["messages"][-2]["tool_calls"][0]["function"]["arguments"]
     assert args == {"requirements": "The response answers the user question. The response is short."}
 
 
-def test_intrinsic_documents_kept_only_for_query_clarification():
-    row = intrinsics.to_tool_row("query_clarification", INTRINSIC_SRC["query_clarification"])
-    assert row["documents"] == INTRINSIC_SRC["query_clarification"]["documents"]
+def test_documents_kept_only_for_query_clarification():
+    row = RENDERERS["query_clarification"].to_tool_row(ADAPTER_SRC["query_clarification"])
+    assert row["documents"] == ADAPTER_SRC["query_clarification"]["documents"]
     args = row["messages"][-2]["tool_calls"][0]["function"]["arguments"]
     assert args == {"query": "Tell me about the policy."}
-    src = {**INTRINSIC_SRC["guardian_core"], "documents": [{"text": "x"}]}
-    assert "documents" not in intrinsics.to_tool_row("guardian_core", src)
+    src = {**ADAPTER_SRC["guardian_core"], "documents": [{"text": "x"}]}
+    assert "documents" not in RENDERERS["guardian_core"].to_tool_row(src)
 
 
-def test_intrinsic_eval_gold_from_ground_truth():
-    src = {"messages": INTRINSIC_SRC["guardian_core"]["messages"][:-1], "ground_truth": "Yes"}
-    _, _, gold = intrinsics.split_row("guardian_core", src)
-    assert gold == {"score": "yes"}
-    eval_row = intrinsics.to_tool_row("guardian_core", src, include_response=False)
+def test_eval_gold_from_ground_truth():
+    src = {"messages": ADAPTER_SRC["guardian_core"]["messages"][:-1], "ground_truth": "Yes"}
+    assert RENDERERS["guardian_core"].format_response(src) == {"score": "yes"}
+    eval_row = RENDERERS["guardian_core"].to_tool_row(src, include_response=False)
     assert eval_row["messages"][-1]["role"] == "assistant"
     assert eval_row["ground_truth"] == "Yes"
 
 
-def test_intrinsic_errors():
-    with pytest.raises(KeyError, match="unknown intrinsic"):
-        intrinsics.split_row("nope", {"messages": []})
+def test_conversion_errors():
+    with pytest.raises(ValueError, match="unknown tool task 'nope'"):
+        renderer("nope")
     with pytest.raises(ValueError, match="no gold"):
-        intrinsics.to_tool_row(
-            "query_clarification", {"messages": [{"role": "user", "content": "x"}]}
-        )
+        RENDERERS["query_clarification"].to_tool_row({"messages": [{"role": "user", "content": "x"}]})
     with pytest.raises(ValueError, match="criteria/schema"):
-        intrinsics.split_row("guardian_core", {"messages": [{"role": "user", "content": "<guardian>no"}]})
+        RENDERERS["guardian_core"].to_tool_row({"messages": [{"role": "user", "content": "<guardian>no"}]})
+    with pytest.raises(ValueError, match="requirement list"):
+        RENDERERS["requirement_check"].to_tool_row({"messages": [{"role": "user", "content": "check this"}]})
+    with pytest.raises(ValueError, match="does not end in its instruction turn"):
+        RENDERERS["guardian_core"].to_tool_row({"messages": [{"role": "assistant", "content": '{"score": "no"}'}]})
+    with pytest.raises(ValueError, match="no user turn"):
+        RENDERERS["query_clarification"].to_tool_row({"messages": [{"role": "assistant", "content": "{}"}]})
 
 
 # --- payload extraction (pure Python) ------------------------------------------
@@ -275,8 +281,8 @@ def test_autoregressive_row_is_stock_minus_base_turn_eos(tok, row):
 @pytest.mark.parametrize("mode", MODES)
 def test_prompt_is_prefix_and_gold_free(tok, mode):
     from shadow_residual.training.tool_data import render_tool_example, render_tool_prompt
-    row = answerability.to_tool_row(ANS_SRC[0])
-    eval_row = answerability.to_tool_row(ANS_SRC[0], include_response=False)
+    row = ANS.to_tool_row(ANS_SRC[0])
+    eval_row = ANS.to_tool_row(ANS_SRC[0], include_response=False)
     prompt = _render(render_tool_prompt, tok, row, mode)
     assert prompt == _render(render_tool_prompt, tok, eval_row, mode)
     text = _render(render_tool_example, tok, row, mode)
@@ -288,7 +294,7 @@ def test_prompt_is_prefix_and_gold_free(tok, mode):
 
 def test_external_prompt_extends_autoregressive_prompt(tok):
     from shadow_residual.training.tool_data import render_tool_prompt
-    row = answerability.to_tool_row(ANS_SRC[0])
+    row = ANS.to_tool_row(ANS_SRC[0])
     ar = _render(render_tool_prompt, tok, row, AUTOREGRESSIVE)
     ext = _render(render_tool_prompt, tok, row, EXTERNAL)
     assert ar.endswith("</tool_call>")
@@ -297,7 +303,7 @@ def test_external_prompt_extends_autoregressive_prompt(tok):
 
 def test_documents_land_after_last_user_turn(tok):
     from shadow_residual.training.tool_data import render_tool_prompt
-    row = answerability.to_tool_row(ANS_SRC[0])
+    row = ANS.to_tool_row(ANS_SRC[0])
     prompt = _render(render_tool_prompt, tok, row, EXTERNAL)
     q = prompt.index("How long is parental leave?<|im_end|>")
     docs = prompt.index("16 weeks paid leave.")
@@ -314,7 +320,7 @@ def test_documents_land_after_last_user_turn(tok):
 ])
 def test_render_rejects_malformed_rows(tok, mutate, match):
     from shadow_residual.training.tool_data import render_tool_example
-    row = json.loads(json.dumps(answerability.to_tool_row(ANS_SRC[0])))
+    row = json.loads(json.dumps(ANS.to_tool_row(ANS_SRC[0])))
     mutate(row)
     with pytest.raises(ValueError, match=match):
         _render(render_tool_example, tok, row, EXTERNAL)
@@ -323,7 +329,7 @@ def test_render_rejects_malformed_rows(tok, mutate, match):
 def test_render_rejects_unknown_mode(tok):
     from shadow_residual.training.tool_data import render_tool_prompt
     with pytest.raises(ValueError):
-        _render(render_tool_prompt, tok, answerability.to_tool_row(ANS_SRC[0]), "bogus")
+        _render(render_tool_prompt, tok, ANS.to_tool_row(ANS_SRC[0]), "bogus")
 
 
 # --- training integration: loader + collator + boundary validator ---------------
@@ -361,7 +367,7 @@ def test_loader_collator_supervise_exactly_the_adapter_span(tok, tmp_path, mode)
 def test_loader_reports_bad_row_location(tok, tmp_path):
     pytest.importorskip("datasets")
     from shadow_residual.training.data import load_jsonl_dataset
-    good = answerability.to_tool_row(ANS_SRC[0])
+    good = ANS.to_tool_row(ANS_SRC[0])
     bad = {**good, "messages": good["messages"][:-1]}
     path = _write_jsonl(tmp_path / "rows.jsonl", [good, bad])
     with pytest.raises(ValueError, match=r"rows\.jsonl:2: .*tool message"):
@@ -375,7 +381,7 @@ def test_loader_converts_source_rows_identically_to_cli(tok, tmp_path, mode):
     from shadow_residual.training.data import load_jsonl_dataset
     conversational = {"messages": [{"role": "user", "content": "hi"}], "ground_truth": "conversational"}
     src = _write_jsonl(tmp_path / "src.jsonl", [ANS_SRC[0], conversational, ANS_SRC[1]])
-    pre = _write_jsonl(tmp_path / "pre.jsonl", [answerability.to_tool_row(r) for r in ANS_SRC])
+    pre = _write_jsonl(tmp_path / "pre.jsonl", [ANS.to_tool_row(r) for r in ANS_SRC])
     last = TOOL_FORMATTING_MARKERS[mode].last_token
     on_load = load_jsonl_dataset(src, tok, last_token=last, tool_formatting=mode, tool_task="answerability")
     two_step = load_jsonl_dataset(pre, tok, last_token=last, tool_formatting=mode)
@@ -383,20 +389,20 @@ def test_loader_converts_source_rows_identically_to_cli(tok, tmp_path, mode):
     assert len(on_load) == 2  # the conversational row is dropped
 
 
-@pytest.mark.parametrize("task", intrinsics.INTRINSICS)
-def test_loader_converts_intrinsic_source_rows(tok, tmp_path, task):
+@pytest.mark.parametrize("task", ADAPTER_TASKS)
+def test_loader_converts_adapter_source_rows(tok, tmp_path, task):
     pytest.importorskip("datasets")
     from shadow_residual.training.data import load_jsonl_dataset
-    src = _write_jsonl(tmp_path / "src.jsonl", [INTRINSIC_SRC[task]])
+    src = _write_jsonl(tmp_path / "src.jsonl", [ADAPTER_SRC[task]])
     ds = load_jsonl_dataset(src, tok, tool_formatting=EXTERNAL, tool_task=task)
-    gold = json.dumps(json.loads(INTRINSIC_SRC[task]["messages"][-1]["content"]))
+    gold = json.dumps(json.loads(ADAPTER_SRC[task]["messages"][-1]["content"]))
     assert ds[0]["text"].endswith("<tool_response>\n" + gold + IM_END)
 
 
 def test_loader_rejects_already_converted_rows(tok, tmp_path):
     pytest.importorskip("datasets")
     from shadow_residual.training.data import load_jsonl_dataset
-    pre = _write_jsonl(tmp_path / "pre.jsonl", [answerability.to_tool_row(ANS_SRC[0])])
+    pre = _write_jsonl(tmp_path / "pre.jsonl", [ANS.to_tool_row(ANS_SRC[0])])
     with pytest.raises(ValueError, match=r"pre\.jsonl:1: .*already defines the 'answerability' tool"):
         load_jsonl_dataset(pre, tok, tool_formatting=EXTERNAL, tool_task="answerability")
 
@@ -405,7 +411,7 @@ def test_loader_reports_source_row_conversion_error(tok, tmp_path):
     pytest.importorskip("datasets")
     from shadow_residual.training.data import load_jsonl_dataset
     bad = {"messages": [{"role": "user", "content": "<guardian>no criteria"}]}
-    src = _write_jsonl(tmp_path / "src.jsonl", [INTRINSIC_SRC["guardian_core"], bad])
+    src = _write_jsonl(tmp_path / "src.jsonl", [ADAPTER_SRC["guardian_core"], bad])
     with pytest.raises(ValueError, match=r"src\.jsonl:2: guardian_core conversion: .*criteria"):
         load_jsonl_dataset(src, tok, tool_formatting=EXTERNAL, tool_task="guardian_core")
 
@@ -427,7 +433,7 @@ def test_debug_collator_prints_first_batch_with_supervised_span(tok, mode, caplo
     from shadow_residual.training.data import DebugPrintingCollator, ResponseOnlyCollator
     from shadow_residual.training.tool_data import render_tool_example
 
-    row = answerability.to_tool_row(ANS_SRC[0])
+    row = ANS.to_tool_row(ANS_SRC[0])
     markers = TOOL_FORMATTING_MARKERS[mode]
     ids = tok.encode(_render(render_tool_example, tok, row, mode), add_special_tokens=False)
     col = DebugPrintingCollator(ResponseOnlyCollator(tokenizer=tok, response_template=markers.assistant_marker),
@@ -447,7 +453,7 @@ def test_loader_without_tool_formatting_is_unchanged(tok, tmp_path):
     """With tool_formatting unset a tool row renders as a plain stock chat row."""
     pytest.importorskip("datasets")
     from shadow_residual.training.data import load_jsonl_dataset
-    row = answerability.to_tool_row(ANS_SRC[0])
+    row = ANS.to_tool_row(ANS_SRC[0])
     ds = load_jsonl_dataset(_write_jsonl(tmp_path / "rows.jsonl", [row]), tok)
     assert ds[0]["text"] == _stock(tok, row)
 
