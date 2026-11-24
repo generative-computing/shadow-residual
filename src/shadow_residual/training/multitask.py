@@ -58,12 +58,15 @@ def _routed_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     names = router.task_names
     lora_A = self.lora_A[names[0]]
     dropout = self.lora_dropout[names[0]]
-    z = lora_A(dropout(x.to(lora_A.weight.dtype)))
+    xd = dropout(x.to(lora_A.weight.dtype))
+    z = lora_A(xd)
+    tied = getattr(self, "_sr_tie_a", True)
     shape = (x.shape[0],) + (1,) * (x.dim() - 1)
     delta = None
     for t, name in enumerate(names):
-        w = route[:, t].to(z.dtype).view(shape) * self.scaling[name]
-        term = self.lora_B[name](z) * w
+        z_t = z if (tied or t == 0) else self.lora_A[name](xd)
+        w = route[:, t].to(z_t.dtype).view(shape) * self.scaling[name]
+        term = self.lora_B[name](z_t) * w
         delta = term if delta is None else delta + term
     return result + delta.to(result.dtype)
 
@@ -74,12 +77,17 @@ def _lora_layers(model):
     return [m for m in model.modules() if isinstance(m, LoraLayer)]
 
 
-def setup_shared_a(peft_model, task_names: Sequence[str], lora_config, dtype=None) -> TaskRouter:
+def setup_shared_a(
+    peft_model, task_names: Sequence[str], lora_config, dtype=None, tie_a: bool = True
+) -> TaskRouter:
     """Turn a PEFT model holding adapter ``task_names[0]`` into a shared-A model.
 
     Adds the other tasks as adapters with ``lora_config``, ties every adapter's
     ``lora_A`` to the first task's, marks all LoRA params trainable, and installs
     the routed forward on every LoRA layer. Returns the router to drive it.
+
+    ``tie_a=False`` keeps one A per task (the joint-training control): same data
+    mix, schedule and dropout draw, only the A tying is removed.
     """
     names = list(task_names)
     if len(set(names)) != len(names) or len(names) < 2:
@@ -100,7 +108,9 @@ def setup_shared_a(peft_model, task_names: Sequence[str], lora_config, dtype=Non
         for name in names[1:]:
             if layer.r[name] != layer.r[names[0]]:
                 raise ValueError("shared A needs the same rank for every task")
-            layer.lora_A[name] = shared
+            if tie_a:
+                layer.lora_A[name] = shared
+        layer._sr_tie_a = tie_a
         layer._sr_task_router = router
         layer.forward = types.MethodType(_routed_forward, layer)
 

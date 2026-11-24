@@ -82,6 +82,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         "per module shared by all tasks, one B per task. Saves one stock SR "
                         "adapter per task under <output-dir>/<NAME>/. Overrides "
                         "--train-data/--val-data.")
+    p.add_argument("--untie-a", action="store_true",
+                   help="With --task: keep one A per task (joint-training control without A sharing).")
     p.add_argument("--wandb", action="store_true", help="Set runtime.report_to=['wandb']")
     p.add_argument("--debug-collator", action="store_true",
                    help="Periodically log a decoded training example + labels from the collator. "
@@ -366,8 +368,10 @@ def main(argv: list[str] | None = None) -> int:
     if task_specs:
         task_router = setup_shared_a(
             model, [n for n, _, _ in task_specs], peft_config, dtype=model_dtype,
+            tie_a=not args.untie_a,
         )
-        logger.info("Shared-A multi-task mode: tasks=%s", [n for n, _, _ in task_specs])
+        logger.info("Multi-task mode: tasks=%s, A %s", [n for n, _, _ in task_specs],
+                    "per task (untied)" if args.untie_a else "shared")
     model.print_trainable_parameters()
 
     # 4a. Activation checkpointing.

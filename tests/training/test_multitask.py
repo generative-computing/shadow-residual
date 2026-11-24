@@ -35,9 +35,9 @@ def _lora_cfg():
     return LoraConfig(r=4, lora_alpha=8, lora_dropout=0.0, target_modules=TARGETS, task_type="CAUSAL_LM")
 
 
-def _shared_model():
+def _shared_model(tie_a=True):
     model = get_peft_model(_tiny_sr(), _lora_cfg(), adapter_name=TASKS[0])
-    router = setup_shared_a(model, TASKS, _lora_cfg())
+    router = setup_shared_a(model, TASKS, _lora_cfg(), tie_a=tie_a)
     torch.manual_seed(1)
     with torch.no_grad():
         for n, p in model.named_parameters():
@@ -146,3 +146,41 @@ def test_parse_task_specs():
         parse_task_specs(["a:/x"])
     with pytest.raises(ValueError):
         parse_task_specs(["a:t:v", "a:t:v"])
+
+
+def test_untied_keeps_one_a_per_task():
+    model, _ = _shared_model(tie_a=False)
+    layers = _lora_layers(model)
+    for layer in layers:
+        ws = [layer.lora_A[t].weight for t in TASKS]
+        assert len({id(w) for w in ws}) == len(TASKS)
+        assert not torch.equal(ws[0], ws[1])
+    n_params = {id(p) for n, p in model.named_parameters() if "lora_" in n and p.requires_grad}
+    assert len(n_params) == len(layers) * 2 * len(TASKS)
+
+
+def test_untied_routed_forward_matches_single_adapter_forward(tmp_path):
+    model, router = _shared_model(tie_a=False)
+    ids = torch.randint(0, 300, (4, 7))
+    router.set(torch.tensor([0, 1, 2, 3]))
+    with torch.no_grad():
+        mixed = model(input_ids=ids).logits
+    model.save_pretrained(tmp_path)
+    for t, name in enumerate(TASKS):
+        ref = PeftModel.from_pretrained(_tiny_sr(), tmp_path / name).eval()
+        with torch.no_grad():
+            single = ref(input_ids=ids[t : t + 1]).logits
+        torch.testing.assert_close(mixed[t : t + 1], single, rtol=1e-4, atol=1e-4)
+
+
+def test_untied_gradients_route_to_own_a_and_b_only():
+    model, router = _shared_model(tie_a=False)
+    model.train()
+    ids = torch.randint(0, 300, (2, 6))
+    router.set(torch.tensor([2, 2]))
+    model(input_ids=ids, labels=ids).loss.backward()
+    for layer in _lora_layers(model):
+        for t, name in enumerate(TASKS):
+            for g in (layer.lora_A[name].weight.grad, layer.lora_B[name].weight.grad):
+                assert g is not None, "every A and B must stay in the graph (DDP)"
+                assert (g.abs().sum() > 0) == (t == 2)

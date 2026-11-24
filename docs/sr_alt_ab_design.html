@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>SR shared-A: alternating A/B training and one A for the whole model</title>
+<style>
+body{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:1050px;margin:2em auto;padding:0 1em;line-height:1.5;color:#222}
+table{border-collapse:collapse;margin:.8em 0}th,td{border:1px solid #ccc;padding:4px 9px;text-align:right}
+th:first-child,td:first-child{text-align:left}th{background:#f3f3f3}
+.sig{font-weight:600}.neg{color:#b00}.pos{color:#070}code{background:#f5f5f5;padding:0 3px}
+.box{background:#f7f9fc;border-left:4px solid #4a78c2;padding:.6em 1em;margin:1em 0}
+</style></head><body>
+<h1>SR shared LoRA-A: alternating A/B training, and one A for the whole model</h1>
+<p>Granite 4.2 3B (<code>granite-4.2-3b-prerelease-r260622a</code>), Shadow-Residual adapters, LoRA r&nbsp;32, α&nbsp;64 on q/o/gate/up/down/cross_stream.
+Four intrinsics: answerability (ans, acc), guardian_core (guard, acc), query_clarification (qc, overall acc), requirement_check (req, balanced acc).
+Study <code>sr_alt_ab</code>, 2026-11-22/23.</p>
+
+<div class="box"><b>Summary.</b>
+(1) At equal data (5K rows), a frozen random A shared by all four adapters <b>beats</b> vanilla LoRA on ans (+0.84) and guard (+0.45), CIs exclude 0, and ties on qc and req.
+(2) A second step that freezes those B's and jointly trains the shared A adds nothing (ans/guard/qc flat, req −1.6).
+(3) Training a shared A for the four <i>vanilla</i> B's recovers from a collapsed start (ans 4.4 → 83.9) but ends −2.0 points (mean) below vanilla; the training-free post-hoc compression with refit B (−0.14) is better.
+(4) <b>One</b> random A tensor for every site of every layer (32×8192, 262K values instead of 26.9M) matches vanilla: mean −0.14, ans +0.65 (significant).</div>
+
+<h2>1. Arms</h2>
+<table>
+<tr><th>arm</th><th>A</th><th>B</th><th>data</th><th>epochs</th><th>trainable / adapter</th></tr>
+<tr><td>vanilla (reference)</td><td>own, trained</td><td>trained</td><td>full (≈12K; qc 2,153)</td><td>2</td><td>60.9M</td></tr>
+<tr><td>v5k</td><td>own, trained</td><td>trained</td><td>5K</td><td>2</td><td>60.9M</td></tr>
+<tr><td>s1</td><td>frozen, shared kaiming bank (seed 0, = frzr bank)</td><td>trained</td><td>5K</td><td>2</td><td>34.1M</td></tr>
+<tr><td>s3a</td><td>shared, trained jointly, init = s1's A</td><td>frozen = s1's B</td><td>4×5K mixed (17,153 rows)</td><td>1</td><td>26.9M (shared)</td></tr>
+<tr><td>s3b-init</td><td>fresh kaiming bank, untrained</td><td>frozen = vanilla B</td><td>—</td><td>0</td><td>—</td></tr>
+<tr><td>s3b</td><td>shared, trained jointly, init = kaiming bank</td><td>frozen = vanilla B</td><td>4×5K mixed</td><td>1</td><td>26.9M (shared)</td></tr>
+<tr><td>wm</td><td>frozen, <b>one</b> kaiming-uniform [32, 8192] draw for every site and layer</td><td>trained</td><td>full</td><td>2</td><td>34.1M</td></tr>
+</table>
+<p>Recipe otherwise identical to vanilla: AdamW lr 2e-4, cosine, 5% warm-up, effective batch 32 (4×A100 DDP), seed 2, bf16, thinking off.
+5K subsets: <code>random.Random(0).sample</code> per task; val sets unchanged. wm: down_proj uses the draw as is; the 2,560-input sites use its first 2,560 columns × √(8192/2560), which keeps the kaiming per-entry variance (the scalar folds into B at serving time).</p>
+
+<h2>2. Scores</h2>
+<table>
+<tr><th>arm</th><th>ans</th><th>guard</th><th>qc</th><th>req</th></tr>
+<tr><td>vanilla (full)</td><td>86.34</td><td>80.24</td><td>92.47</td><td>64.90</td></tr>
+<tr><td>v5k</td><td>84.10</td><td>79.84</td><td>92.83</td><td>57.10</td></tr>
+<tr><td>s1</td><td>84.94</td><td>80.29</td><td>93.19</td><td>57.43</td></tr>
+<tr><td>s3a</td><td>84.88</td><td>80.37</td><td>92.83</td><td>55.85</td></tr>
+<tr><td>s3b-init</td><td>4.38</td><td>44.62</td><td>28.32</td><td>53.41</td></tr>
+<tr><td>s3b</td><td>83.90</td><td>79.58</td><td>92.47</td><td>59.94</td></tr>
+<tr><td>wm</td><td>86.98</td><td>80.33</td><td>90.68</td><td>65.38</td></tr>
+</table>
+
+<h2>3. Paired bootstrap (Δ in points, 95% CI over eval rows, 1,000 resamples, bench scorers; * = CI excludes 0)</h2>
+<table>
+<tr><th>comparison</th><th>ans</th><th>guard</th><th>qc</th><th>req</th></tr>
+<tr><td>v5k vs vanilla (cost of 5K data)</td><td class="neg sig">−2.24 [−3.11, −1.35]*</td><td class="neg sig">−0.40 [−0.71, −0.08]*</td><td>+0.36 [−1.43, +2.15]</td><td class="neg sig">−7.80 [−9.61, −5.93]*</td></tr>
+<tr><td>s1 vs v5k (frozen random A, same data)</td><td class="pos sig">+0.84 [+0.31, +1.46]*</td><td class="pos sig">+0.45 [+0.14, +0.82]*</td><td>+0.36 [−0.72, +1.79]</td><td>+0.34 [−0.64, +1.43]</td></tr>
+<tr><td>s3a vs s1 (train shared A after B)</td><td>−0.06 [−0.81, +0.62]</td><td>+0.08 [−0.21, +0.36]</td><td>−0.36 [−2.87, +2.15]</td><td class="neg sig">−1.58 [−2.42, −0.72]*</td></tr>
+<tr><td>s3a vs v5k</td><td class="pos sig">+0.79 [+0.06, +1.57]*</td><td class="pos sig">+0.53 [+0.15, +0.95]*</td><td>+0.00 [−2.15, +2.51]</td><td class="neg sig">−1.25 [−2.29, −0.16]*</td></tr>
+<tr><td>s3b vs vanilla</td><td class="neg sig">−2.44 [−3.34, −1.54]*</td><td class="neg sig">−0.65 [−1.00, −0.32]*</td><td>+0.00 [−1.79, +1.79]</td><td class="neg sig">−4.96 [−6.57, −3.33]*</td></tr>
+<tr><td>s3b vs s3b-init</td><td class="pos sig">+79.5*</td><td class="pos sig">+35.0*</td><td class="pos sig">+64.2*</td><td class="pos sig">+6.5*</td></tr>
+<tr><td>wm vs vanilla</td><td class="pos sig">+0.65 [+0.03, +1.21]*</td><td>+0.09 [−0.24, +0.44]</td><td>−1.79 [−3.94, +0.36]</td><td>+0.49 [−0.69, +1.71]</td></tr>
+<tr><td>wm vs frzr (random A per layer and site)</td><td class="pos sig">+0.65 [+0.08, +1.21]*</td><td>+0.38 [−0.04, +0.76]</td><td class="neg sig">−2.51 [−4.66, −0.72]*</td><td>+0.16 [−0.91, +1.22]</td></tr>
+<tr><td>wm vs st-xl (A per site, reused across layers)</td><td class="pos sig">+0.79 [+0.17, +1.40]*</td><td>+0.02 [−0.22, +0.26]</td><td>−1.43 [−3.94, +1.08]</td><td>+0.49 [−0.65, +1.55]</td></tr>
+</table>
+<p>The CIs cover row noise only. Training-seed noise from earlier random-A runs: qc SD ≈ 0.94, req SD ≈ 0.58 with occasional ≈7-point drops, guard ≈ 0.29.
+A req or qc difference below ≈1.3 / 2 points is therefore not conclusive even when its row CI excludes 0 (s3a vs s1 req −1.58; wm vs frzr qc −2.51).</p>
+
+<h2>4. Reading</h2>
+<ul>
+<li><b>Freezing A helps when data is limited.</b> With full data, frozen random A ≈ vanilla (frzr +0.19 mean). At 5K it is ahead on the two large eval sets. This fits the A–B asymmetry literature (Zhu et al. 2024, LoRA-FA, FFA-LoRA): B does the task-specific work, and freezing A halves the trainable parameters and removes a source of overfitting.</li>
+<li><b>The alternating A-step is not worth it.</b> With B fixed, one epoch of joint shared-A training leaves the s1 adapters unchanged or slightly worse. The random A was already as good a basis as a jointly trained one for these B's.</li>
+<li><b>Fitting a shared A to B's trained against other A's is hard by gradient descent.</b> s3b starts from collapsed adapters and recovers most of the way in one epoch, but ends 2–5 points below vanilla on ans/guard/req. The closed-form route (post-hoc dw:32: shared A + least-squares refit of B, −0.14) keeps more because it moves B, not A.</li>
+<li><b>One A for the whole model is enough.</b> A single 32×8192 random matrix serves all 240 (layer, site) LoRA A's at no measurable cost (ans significantly better, guard/req equal, qc −1.8 within its noise). Each site still applies A to its own input, so the shrink FLOPs are unchanged; the saving is A storage/loading (26.9M → 262K values) and, for training, the guarantee that A carries no task or layer information.</li>
+</ul>
+
+<h2>5. Implementation</h2>
+<ul>
+<li><code>src/shadow_residual/training/train_shared_a_fixed_b.py</code>: multi-task <code>train.py</code> with the tied A initialised from a bank (trainable) and each task's B copied from an existing adapter and frozen (patches <code>multitask.setup_shared_a</code>). Post-train check: saved B == source exactly, A identical across exports, A moved from init. <code>--export-init-only</code> writes the step-0 adapters. Test: <code>tests/training/test_shared_a_fixed_b.py</code>.</li>
+<li><code>frozen_a.install_frozen_a(..., freeze=True)</code>: <code>freeze=False</code> only initialises A.</li>
+<li><code>compress_a.structured_bank(..., whole_model=True)</code> / <code>python -m shadow_residual.training.compress_a --whole-model</code>: the single-draw bank.</li>
+<li>Jobs: <code>scratch/altab/gen_yamls.py</code> (prefix <code>antonp-altab-</code>), commit 5558a47 + working-tree overlay (<code>code_v1</code>, <code>code_v2</code>). Bootstrap: <code>scratch/altab/code_v1/boot_altab.py</code>.</li>
+</ul>
+
+<h2>6. Artifacts</h2>
+<p>COS <code>/danieloh_cos/granite-switch/sr_alt_ab/</code>: <code>data_5k/</code>, <code>code_v1/</code>, <code>code_v2/</code>, <code>runs/v1/{v5k,s1,wm}-{ans,guard,qc,req}/</code>, <code>runs/v1/{s3a,s3b,s3b-init}/checkpoints/&lt;task&gt;/</code>, eval under <code>eval/</code>, <code>boot.json</code>.</p>
+
+<h2>7. Operational notes</h2>
+<ul>
+<li>The first submission failed at the in-pod pytest gate: <code>test_frozen_a.py::test_pca_a_unit_variance</code> (fp64 atol 1e-8) fails on Linux BLAS. It is deselected in the gate (the PCA bank is not used here).</li>
+<li>JSONL clipping must split on <code>\n</code> only: <code>str.splitlines()</code> also splits on U+2028 inside JSON strings and broke 5 req rows in a first attempt (fixed before any training).</li>
+<li><code>oc exec cat</code> and <code>oc cp</code> truncated files above ≈4 MB; <code>dd</code> in 1 MB chunks with a sha256 check worked.</li>
+</ul>
+</body></html>

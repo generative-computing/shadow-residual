@@ -27,7 +27,7 @@
 
 <h1>SR-FrozenA: Shadow Residual with shared, compression-derived, frozen LoRA <code>A</code> matrices</h1>
 
-<p><small>Branch <code>feature/different-arch</code>. Status and results are at the bottom (§9–§11). This doc is updated as the work proceeds.</small></p>
+<p><small>Branch <code>feature/different-arch</code>. Status and results are at the bottom (§9–§12). §13 reviews the literature on ways to instantiate the LoRA A matrix. This doc is updated as the work proceeds.</small></p>
 
 <div class="box">
 <b>The idea.</b> In a normal SR adapter every LoRA site <code>W + (α/r)·B·A</code> learns both <code>A</code> (r×in) and <code>B</code> (out×r).
@@ -52,7 +52,7 @@ are shared. The reference SR config for the benchmark (<code>sr-qo-mlp-r32-c32-s
 </table>
 
 <p>Base model: <code>ibm-research/granite-4.2-3b-prerelease-r260622a</code>. Dense, 40 layers, hidden 2560, MLP 8192, 40 Q heads and 8 KV heads, untied lm_head.
-Regular SR has about 30.5M trainable parameters. The saved vanilla SR adapter is 121,961,048 bytes in fp32, which matches.</p>
+Regular SR trains <b>60,948,480</b> parameters, as <code>print_trainable_parameters</code> reports in the vanilla job logs. The saved adapter is 121,961,048 bytes because it is stored in bf16.</p>
 
 <h2>2. Literature: how to pick a frozen <code>A</code></h2>
 
@@ -88,7 +88,11 @@ Regular SR has about 30.5M trainable parameters. The saved vanilla SR adapter is
 
 <p><b>Scaling.</b> <code>V_rᵀS⁻¹</code> maps whitened inputs to an orthonormal basis: <code>A C Aᵀ = I_r</code>. Over the calibration data, each of the r
 features <code>A x</code> has unit variance and they are uncorrelated. That is the right conditioning for training <code>B</code> alone, because every feature
-reaches <code>B</code> at the same scale. Kaiming-random <code>A</code> gives features whose scale depends on the input norm.</p>
+reaches <code>B</code> at the same scale. The <i>overall</i> scale also matters: under AdamW, the output change per step on <code>B</code> is proportional to
+<code>‖A x‖</code>. So each group's A is multiplied by <code>s = √(tr C / (3·in))</code>, which is the per-feature standard deviation PEFT's stock
+<code>kaiming_uniform_(a=√5)</code> lora_A gives on the same inputs (entry variance <code>1/(3·in)</code>). Then <code>A C Aᵀ = s² I</code>: the features
+carry the same energy as vanilla LoRA's at step 0, so LR and α transfer unchanged. The only remaining difference from vanilla is <i>which</i> r directions
+are read, and that they are fixed (<code>feature_scale: kaiming</code> in the manifest).</p>
 
 <p><b>Sites with no informative weight</b>, namely <code>cross_stream</code> (W≡0, reads <code>h_base</code>): whitened SVD is undefined because <code>WS=0</code>. Here I use the
 ESPACE/EVA choice, the top-r principal components of the input, scaled to unit variance: <code>A = Λ_r^{-1/2} P_rᵀ</code> with <code>C = P Λ Pᵀ</code>. This is the same
@@ -151,8 +155,9 @@ ESPACE/EVA choice, the top-r principal components of the input, scaled to unit v
 Basis Sharing found that sharing across layers works for input-side projections (Q/K/V/gate/up) and hurts for O/down. A cross-layer A for q/gate/up/cross is
 recorded in §8 as a follow-up ablation. It is not in the main run.</p>
 
-<p><b>Calibration set.</b> The covariance is computed from the base stream of the unadapted base model on a <b>task-agnostic mix of all four intrinsics'
-training rows</b>: an equal share of each, 512 rows per intrinsic, 2048 rows total, truncated to 2048 tokens, all non-pad positions, in fp64.
+<p><b>Calibration set.</b> The covariance is computed from the unadapted base model (the bare SR model) on a <b>mix of all four intrinsics' training
+rows</b>: 512 rows sampled with a fixed seed from each <code>data_v1/&lt;intrinsic&gt;/train.jsonl</code>, 2048 rows total. Each row is rendered with the
+trainer's own <code>render_chat</code>, truncated to 2048 tokens, and every non-pad position is accumulated in fp64. No eval rows are used.
 <b>One A set serves all four adapters</b>, which is what makes it a property of the base model and not of each adapter. Each adapter still trains its own B.
 Using the base stream for the adapter-stream inputs is exact at step 0 (the streams are identical when B=0). It stays close later because the adapter is a
 low-rank perturbation. This is the standard calibration choice in SVD-LLM, ESPACE and CorDA.</p>
@@ -166,8 +171,17 @@ low-rank perturbation. This is the standard calibration choice in SVD-LLM, ESPAC
 <li><b>The PEFT model stays 100% stock.</b> A is installed into the existing <code>lora_A.default.weight</code> parameters and given
 <code>requires_grad=False</code>. The saved adapter is an ordinary PEFT LoRA checkpoint (A and B both saved), so <code>PeftModel.from_pretrained</code> on a
 <code>build_sr_base</code> base loads it with no new code. The benchmark's HF+PEFT SR path (<code>hf_generate.py</code>) and its loaded-weights check work unchanged.</li>
-<li><b>New config field</b> <code>adapter.frozen_a: {path: &lt;dir&gt;}</code>. The dir holds <code>frozen_a.safetensors</code> (keys <code>layers.{ℓ}.{site}</code>, fp32 r×in) and
-<code>manifest.json</code> (recipe, rank, calibration stats, per-group retained output energy).</li>
+<li><b>No shared file is edited.</b> Several sessions edit <code>train.py</code>, <code>factory.py</code> and <code>training_config.py</code> in the same
+working tree, so the feature is three new files:
+<ul>
+<li><code>training/frozen_a.py</code>: the recipes, <code>install_frozen_a</code>, and <code>saved_a_mismatches</code>.</li>
+<li><code>training/compute_frozen_a.py</code>: the calibration CLI.</li>
+<li><code>training/train_frozen_a.py</code>: an entry point that wraps <code>train.main</code>. It takes <code>--frozen-a &lt;dir&gt;</code> plus every
+<code>train.py</code> argument and swaps <code>factory.get_shadow_residual_peft_model</code> for a version that installs the A after building.
+<code>train.py</code> imports the factory lazily inside <code>main()</code>, so the patch takes effect.</li>
+</ul>
+The A dir holds <code>frozen_a.safetensors</code> (keys <code>layers.{ℓ}.{site}</code>, fp32 r×in) and <code>manifest.json</code> (recipe, rank, scale,
+calibration stats, and per-group retained output energy).</li>
 <li><b>Where A is installed:</b> after <code>get_shadow_residual_peft_model</code>. On the FSDP rank-0-materialize path A is copied after the LoRA reset and
 before FSDP's <code>sync_module_states</code> broadcast. On every non-FSDP rank it is copied directly. Freezing is applied on every rank before the
 Trainer builds the optimizer, so A never enters AdamW. <code>fsdp_use_orig_params: true</code> (already set) lets FSDP flat-params mix frozen and trainable parameters.</li>
@@ -185,36 +199,40 @@ input group, then whitened SVD or PCA per group, and writes the A dir and manife
 <tr><td>α, dropout</td><td>64, 0.05</td><td>same</td></tr>
 <tr><td>A</td><td>kaiming-uniform, trained</td><td><b>precomputed (§2–3), frozen</b></td></tr>
 <tr><td>B</td><td>zero-init, trained</td><td>zero-init, trained</td></tr>
-<tr><td>Trainable params</td><td>≈30.5M</td><td><b>≈18.4M</b> (B only, −40%)</td></tr>
+<tr><td>Trainable params</td><td>60,948,480</td><td><b>34,078,720</b> (B only, −44%)</td></tr>
 <tr><td>LR / sched / epochs</td><td>2e-4 AdamW, cosine, 5% warmup, 2 epochs, seed 2</td><td>same</td></tr>
 <tr><td>Batch</td><td>4 GPUs × 2 × grad-accum 4 = 32</td><td>same</td></tr>
-<tr><td>Data</td><td>per intrinsic, the same train/val files the staged SR adapters were trained on</td><td>same files</td></tr>
-<tr><td>Eval</td><td>benchmark HF+PEFT path, benchmark scorers</td><td>same path, same scorers</td></tr>
+<tr><td>Data</td><td><code>sr_shared_a/data_v1/&lt;intrinsic&gt;</code> (session 3a884bc0)</td><td>same files</td></tr>
+<tr><td>Code</td><td>commit <code>b1b24fb</code></td><td><code>b1b24fb</code> + the three frozen-A files copied in from COS (sha256-checked)</td></tr>
+<tr><td>Eval</td><td><code>scripts/bench_eval.py</code> = bench <code>hf_generate.py</code> (HF+PEFT, column sr) + bench scorers, harness <code>2506b7c</code></td><td>same script and harness</td></tr>
 </table>
 
-<p>Because B starts at 0 and the frozen A features have unit variance, a step on B at LR 2e-4 has about the same size as in vanilla LoRA, where
-<code>‖A x‖</code> under kaiming init is similar. LR is not retuned, so the comparison isolates the effect of A. Parameter count: A is 40·(2560·32·3 + 8192·32 + 2560·32)…
-it is frozen and not counted. B is 40·32·(2560+2560+8192+8192+2560+2560) = 34.1M at fp32 elements…</p>
-<p><small>The exact numbers come from <code>print_trainable_parameters</code> in the job logs. See §10.</small></p>
+<p>B starts at 0 and the frozen A is scale-matched to kaiming (§2.1), so a step on B at LR 2e-4 moves the output by the same amount as in vanilla
+LoRA at step 0. LR is not retuned, so the comparison isolates the choice of A. Trainable B = 40·32·(2560+2560+8192+8192+2560+2560) = 34,078,720.
+The frozen A is 40·32·(4·2560 + 8192) = 23.6M values: one set shared by all four adapters, never trained, and stored inside each checkpoint so stock
+PEFT can load it.</p>
 
 <h2>6. Data and evaluation</h2>
 
 <table>
-<tr><th>Intrinsic</th><th>Training data (same rows as the staged vanilla SR adapter)</th><th>Train/val rows</th><th>Eval set (bench v1)</th><th>Scorer / headline</th></tr>
-<tr><td>answerability</td><td><code>adapter-bench/datasets/train/answerability/g42-alora-4.1-split</code> (docs as tool turns)</td><td>11979 / 1351</td><td>3565</td><td><code>answerability</code> / accuracy</td></tr>
-<tr><td>guardian_core</td><td><code>.../output/guardian_compare/guardian_ood_12k</code></td><td>12000 / 577</td><td>11347</td><td><code>guardian</code> / accuracy</td></tr>
-<tr><td>query_clarification</td><td><code>.../output/unified_compare/query_clarification/data_v4</code></td><td>2153 / 240</td><td>279</td><td><code>query_clarification</code> / overall_accuracy</td></tr>
-<tr><td>requirement_check</td><td><code>.../Core_Library/Requirement_Check/train_v2</code></td><td>11882 / 500</td><td>2409</td><td><code>requirements</code> / balanced_accuracy</td></tr>
+<tr><th>Intrinsic</th><th>Source dataset (adapter-bench <code>datasets/train/</code>)</th><th>Train/val rows</th><th>Eval set (bench v1)</th><th>Scorer / headline</th></tr>
+<tr><td>answerability</td><td><code>answerability/g42-alora-4.1-split</code> (document tool turns rebuilt as <code>{document_id, content}</code>)</td><td>11979 / 1351</td><td>3565</td><td><code>answerability</code> / accuracy</td></tr>
+<tr><td>guardian_core</td><td><code>guardian_core/guardian-ood-12k</code></td><td>12000 / 577</td><td>11347</td><td><code>guardian</code> / accuracy</td></tr>
+<tr><td>query_clarification</td><td><code>query_clarification/unified-compare-data-v4</code></td><td>2153 / 240</td><td>279</td><td><code>query_clarification</code> / overall_accuracy</td></tr>
+<tr><td>requirement_check</td><td><code>requirement_check/core-library-train-v2</code></td><td>11882 / 500</td><td>2409</td><td><code>requirements</code> / balanced_accuracy</td></tr>
 </table>
+<p>Both arms train on <code>/danieloh_cos/granite-switch/sr_shared_a/data_v1/&lt;intrinsic&gt;</code>. These are the four sets above, rendered once by the
+shared-A session with the bench's own <code>prompts.with_documents(…, "tool_json_after_question")</code>, so the training prompts match the eval prompts byte
+for byte. The vanilla baseline was trained on exactly these files.</p>
 
-<p>Evaluation uses the benchmark's own reference generation (<code>benchmarks/adapter_eval/hf_generate.py</code>) and scorers, copied unchanged from the harness
-checkout into the job. Settings: SR on <code>build_sr_base</code> + <code>PeftModel</code>, greedy, bf16, SR prompt style <code>tool_json_after_question</code>,
+<p>Evaluation is <code>scripts/bench_eval.py</code>, the same script the vanilla runs used. It calls the benchmark's own reference generation
+(<code>benchmarks/adapter_eval/hf_generate.py</code>) and scorers from the unmodified harness copy at <code>sr_shared_a/bench_harness_2506b7c</code>. Settings: SR on <code>build_sr_base</code> + <code>PeftModel</code>, greedy, bf16, SR prompt style <code>tool_json_after_question</code>,
 <code>enable_thinking=false</code>, the per-intrinsic <code>max_new_tokens</code> from <code>adapters.yaml</code>, and <code>max_model_len 32768</code>. These numbers are directly comparable with
 the dashboard's "HF + PEFT / SR" reference column and with the vanilla SR run that another session is training.</p>
 
 <h2>7. Hypotheses</h2>
 <ol>
-<li><b>H1 (main).</b> SR-FrozenA comes within about 1 point of vanilla SR on each intrinsic while training 40% fewer parameters. All four tasks are
+<li><b>H1 (main).</b> SR-FrozenA comes within about 1 point of vanilla SR on each intrinsic while training 44% fewer parameters. All four tasks are
 short label or short-output classification-style tasks, which earlier SR sweeps found saturate at low rank (see the rank-grid notes).</li>
 <li><b>H2.</b> The whitened-SVD A beats a random frozen A (LoRA-FA). Planned ablation, §8.</li>
 <li><b>H3 (risk).</b> <code>down_proj</code> and <code>cross_stream</code> lose the most. Their inputs are high-dimensional or heavy-tailed, so a fixed 32-dim subspace keeps a small energy fraction.
@@ -230,21 +248,416 @@ The manifest's retained-energy numbers will show whether this is plausible.</li>
 </ul>
 
 <h2>9. Execution log and issues</h2>
-<p class="status">Status: design written. Implementation in progress.</p>
+<p class="status">Status: <b>complete.</b> Implemented, CPU-tested (8 tests, full suite 203 passed), calibrated, 4 adapters trained and evaluated on Vela. Results in §10–§11.</p>
 <ul>
-<li><b>Coordination.</b> Several Claude sessions share branch <code>feature/different-arch</code>. Another session trains vanilla SR, so I do not run it. A
-utility pod <code>antonp-shareda-util</code> already existed. I only read COS through it and use my own job names (<code>antonp-frza-*</code>) and COS root
-(<code>…/adapter-bench/sr-frozen-a/</code>).</li>
+<li><b>Coordination.</b> Several Claude sessions share branch <code>feature/different-arch</code> and one working tree.
+<ul>
+<li>Session <code>3a884bc0</code> (<code>docs/sr_shared_a_design.html</code>) tests a different idea, a <i>trained</i> A shared across the four tasks. It also
+trained the vanilla SR baselines and published them in <code>docs/coordination/vanilla_sr_baseline.md</code>. I do not retrain vanilla.</li>
+<li>I reuse its <code>data_v1</code>, its <code>bench_eval.py</code> and its harness copy, so all three arms are evaluated identically.</li>
+<li>My own names are job prefix <code>antonp-frza-*</code> and COS root <code>/danieloh_cos/granite-switch/sr_frozen_a/</code>
+(<code>code/</code>, <code>frozen_a_r32_v1/</code>, <code>runs/v1/</code>).</li>
+</ul></li>
+<li><b>Git.</b> CLAUDE.md now says stage-only, never commit or push. An early design-doc/module commit (<code>d26876e</code>) was pushed while Anton had
+temporarily allowed pushes. The rest is staged, not committed. The Vela jobs therefore check out the vanilla commit <code>b1b24fb</code> and copy the three
+frozen-A files from <code>sr_frozen_a/code/</code> (sha256 printed in each log). That also keeps the model code byte-identical to the vanilla runs.</li>
+<li><b>Issue: the first submission failed in 2 s.</b> The chart does not clone the repo. The vanilla YAMLs have an explicit <code>git clone</code> line with a
+token, which my secret-filtered read had hidden. The repo is public, so my jobs clone without a token: <code>git clone https://${REPO_URL}</code>. I deleted the five
+failed jobs and resubmitted them.</li>
+<li><b>Issue: image pull.</b> The <code>req</code> pod failed with <code>ErrImagePull … unauthorized</code>. My YAMLs lacked <code>imagePullSecrets:
+image-pull-secret-us</code>; the same secret-word filter had hidden that line too. The other pods worked only because their nodes had the image cached. I added
+the pull-secret reference to every YAML and resubmitted <code>req</code>.</li>
+<li><b>Issue: bad node for 1-GPU jobs.</b> Both calibration submissions were scheduled on <code>dmf-nnnqh-gpu-worker-3-il-pcqjz</code>. Its COS s3fs mount fails
+there (<code>needs 251040 MB scratch, has 250005 MB</code>), leaving the pod in <code>ContainerCreating</code>. Workaround: delete the calibration job and run
+<code>compute_frozen_a</code> detached on GPU 0 inside the already-running <code>antonp-frza-ans</code> pod, which has the same code, environment and COS mount, and
+whose GPUs were idle while it waited for the A. The log goes to <code>sr_frozen_a/calib.log</code>. The manifest is copied last, which releases all four trainers.</li>
+<li><b>Issue: s3fs negative cache.</b> The waiting pods <code>qc</code> and <code>req</code> still reported the manifest as missing more than 40 minutes after it was
+written. <code>guard</code> saw it after about 20 minutes. <code>test -f</code> on a file inside a directory that was cached before the file existed keeps failing;
+an <code>ls</code> of that directory from inside the pod refreshes the listing and the file appears at once. Fix for future wait loops: <code>ls</code> the directory on
+every poll before testing for the file.</li>
+<li><b>Issue: helm schema.</b> <code>sshGitCloneConfig</code> must name <code>secretName</code> as well as <code>configMapName</code>, otherwise rendering fails.</li>
+<li><b>Ordering without queueing.</b> All five jobs are submitted together. Each training pod installs its environment, then waits in-pod (up to 3 h) for
+<code>frozen_a_r32_v1/manifest.json</code>, so nothing is queued by hand.</li>
 <li><b>Tooling.</b> At first, Claude Code's auto-mode classifier blocked <code>oc exec</code>, <code>helm</code> and the Vela skill. The user added allow rules in
 <code>.claude/settings.local.json</code>. Shell reads outside this repo are still blocked, so the harness files were read with the file-read tool.</li>
 <li><b>Docs drift.</b> <code>ADAPTER_TRAINING.md</code> places the eval sets at <code>datasets/eval/</code>. On COS they are at <code>adapter-bench/granite-4.2-3b/v1/eval/</code>, which is what the benchmark reads.</li>
 </ul>
 
 <h2>10. Results</h2>
-<p class="status">Pending.</p>
+<table id="results">
+<tr><th>intrinsic (headline)</th><th>vanilla SR</th><th>shared-A SR (3a884bc0)</th><th>SR-FrozenA</th><th>Δ FrozenA − vanilla</th></tr>
+<tr><td>answerability (acc)</td><td class="num">86.34</td><td class="num">85.69</td><td class="num">83.67</td><td class="num"><b>−2.67</b> [−3.51, −1.82]</td></tr>
+<tr><td>guardian_core (acc)</td><td class="num">80.24</td><td class="num">79.73</td><td class="num">78.19</td><td class="num"><b>−2.04</b> [−2.54, −1.56]</td></tr>
+<tr><td>query_clarification (overall acc)</td><td class="num">92.47</td><td class="num">92.83</td><td class="num">87.10</td><td class="num"><b>−5.38</b> [−8.96, −2.15]</td></tr>
+<tr><td>requirement_check (bal. acc)</td><td class="num">64.90</td><td class="num">63.53</td><td class="num">60.52</td><td class="num"><b>−4.38</b> [−6.03, −2.65]</td></tr>
+<tr><td>trainable params per adapter</td><td class="num">60.9M</td><td class="num">(163.2M for all 4)</td><td class="num">34.1M</td><td class="num">−44%</td></tr>
+</table>
+<p><small>Vanilla and shared-A numbers are from <code>docs/coordination/vanilla_sr_baseline.md</code> / <code>docs/sr_shared_a_design.html</code>, using the same
+data, eval script and harness. Brackets show a 95% paired-bootstrap CI: 1000 row resamples, both arms scored on the same resample with the bench scorer
+(<code>scratch/frza/paired_bootstrap.py</code>). Bold means the CI excludes 0.</small></p>
+
+<h3>10.1 Frozen-A bank (calibration output)</h3>
+<p>Calibration used 2,048 rows and 1,635,264 tokens. Whiteness error <code>max |A C Aᵀ/s² − I|</code> was ≤ 3e-6, except down_proj at 2.3e-3. Below, "energy" is the fraction
+of the activation-weighted output energy (<code>Σ_{i≤32}σᵢ²/Σσᵢ²</code>) that the rank-32 A keeps, which is what a rank-32 compressed base would retain.</p>
+<table>
+<tr><th>group</th><th>mean energy</th><th>min</th><th>L0 / L10 / L20 / L30 / L39</th><th>kaiming scale s (L0 / L20 / L39)</th></tr>
+<tr><td>q</td><td class="num">0.94</td><td class="num">0.90</td><td>0.98 / 0.96 / 0.92 / 0.95 / 0.95</td><td>1.44 / 3.60 / 4.00</td></tr>
+<tr><td>o</td><td class="num">0.56</td><td class="num">0.33</td><td>0.89 / 0.42 / 0.51 / 0.73 / 0.96</td><td>0.76 / 0.27 / 1.14</td></tr>
+<tr><td>gate+up</td><td class="num">0.64</td><td class="num">0.51</td><td>0.75 / 0.64 / 0.63 / 0.60 / 0.89</td><td>0.82 / 0.58 / 1.41</td></tr>
+<tr><td>down</td><td class="num">0.33</td><td class="num">0.13</td><td>0.23 / 0.20 / 0.29 / 0.36 / 1.00</td><td>0.32 / 0.14 / 6.98</td></tr>
+<tr><td>cross (PCA)</td><td class="num">0.95</td><td class="num">0.51</td><td>0.51 / 1.00 / 1.00 / 1.00 / 0.98</td><td>0.19 / 7.10 / 3.87</td></tr>
+</table>
+<p>In the middle layers the cross_stream PCA keeps 100% of the second moment of <code>h_base</code> in 32 directions. The residual stream there is dominated by a
+few massive-activation channels, so the cross A spends its whole budget on them.</p>
+
+<h3>10.2 Training curves (same steps, same data)</h3>
+<table>
+<tr><th>task</th><th>train loss, first 10% of steps (vanilla → FrozenA)</th><th>train loss, last 10%</th><th>eval loss per epoch</th></tr>
+<tr><td>guardian_core</td><td>0.240 → <b>0.197</b></td><td>0.0085 → 0.0109</td><td>[0.0160, 0.0133] → [0.0186, 0.0173]</td></tr>
+<tr><td>query_clarification</td><td>1.447 → <b>1.306</b></td><td>0.111 → 0.195</td><td>[0.160, 0.149] → [0.225, 0.199]</td></tr>
+<tr><td>answerability</td><td>0.478 → <b>0.292</b></td><td>0.0113 → 0.0158</td><td>[0.0244, 0.0142] → [0.0183, 0.0164]</td></tr>
+<tr><td>requirement_check</td><td>0.186 → <b>0.179</b></td><td>0.0627 → 0.0674</td><td>[0.0605, 0.0561] → [0.0655, 0.0588]</td></tr>
+</table>
+<p>The same pattern holds on all four tasks. The frozen A learns <b>faster at first</b> (lower loss over the first 10% of steps, most clearly on answerability, 0.29 vs 0.48)
+because its features are decorrelated and well-scaled from step 0. It then <b>plateaus higher</b>: final eval loss is +15% on ans, +30% on guard, +34% on qc
+and +5% on req. That is a capacity or subspace limit, not an optimization failure. Train runtimes: ans 22,350 s, guard 2,619 s, req 6,998 s.</p>
+
+<h3>10.3 Where vanilla SR puts its update</h3>
+<p>For each site of the four vanilla adapters I measured how much of the learned update <code>ΔW = B·A</code> falls in the row space of the frozen A:
+<code>‖ΔW·P‖²/‖ΔW‖²</code>, unweighted (<code>scratch/frza/subspace_capture.py</code>). A random r-dimensional subspace captures <code>r/in</code>.</p>
+<table>
+<tr><th>site</th><th>ans</th><th>guard</th><th>qc</th><th>req</th><th>random subspace</th></tr>
+<tr><td>q_proj</td><td class="num">0.027</td><td class="num">0.028</td><td class="num">0.020</td><td class="num">0.026</td><td class="num">0.0125</td></tr>
+<tr><td>o_proj</td><td class="num">0.016</td><td class="num">0.014</td><td class="num">0.015</td><td class="num">0.015</td><td class="num">0.0125</td></tr>
+<tr><td>gate_proj</td><td class="num">0.018</td><td class="num">0.016</td><td class="num">0.020</td><td class="num">0.016</td><td class="num">0.0125</td></tr>
+<tr><td>up_proj</td><td class="num">0.017</td><td class="num">0.016</td><td class="num">0.018</td><td class="num">0.016</td><td class="num">0.0125</td></tr>
+<tr><td>down_proj</td><td class="num">0.007</td><td class="num">0.006</td><td class="num">0.007</td><td class="num">0.009</td><td class="num">0.0039</td></tr>
+<tr><td>cross_stream</td><td class="num">0.018</td><td class="num">0.017</td><td class="num">0.019</td><td class="num">0.017</td><td class="num">0.0125</td></tr>
+</table>
+<p>Vanilla SR's update lies 97–99% <i>outside</i> the principal-energy subspace, and is only 1–2× more aligned with it than a random subspace would be. Read with care:
+LoRA's A moves little from its random init (Zhu et al. 2024), so this mostly says that vanilla adapts through a near-random 32-dimensional read of the input. The
+principal subspace chosen here is not where its useful update lives.</p>
 
 <h2>11. Conclusion</h2>
-<p class="status">Pending.</p>
+<div class="bad"><b>H1 is rejected.</b> SR-FrozenA trains 44% fewer parameters per adapter (34.1M vs 60.9M) and shares one frozen A set across all four adapters. But it loses
+<b>2.0–5.4 points on every intrinsic</b>, and every CI excludes 0 (ans −2.67, guard −2.04, qc −5.38, req −4.38). It is also worse than the <i>trained</i> shared A of
+session 3a884bc0 (−0.65 / −0.50 / +0.36 / −1.37 at −33% params for the family). The frozen A held exactly: the post-save check passed on all four runs.</div>
+<p><b>Why.</b> Compression keeps the input directions that carry the most energy <i>for the base weight's own output</i>. That is the right subspace for reconstructing
+the base model (SVD-LLM's goal), but not for adapting it:</p>
+<ul>
+<li>Vanilla SR's learned updates lie 97–99% outside that subspace (§10.3).</li>
+<li>Restricted to it, B fits the training data faster at first but plateaus at a higher loss on every task (§10.2).</li>
+<li>For cross_stream, the input PCA of the residual is dominated by massive-activation channels (energy 1.00 in 32 directions, §10.1), so that site reads almost nothing task-relevant.</li>
+</ul>
+<p>This matches the minor-component view (MiLoRA, CorDA's knowledge-preserving mode): the principal directions are what the base already uses, and the adaptation
+signal lives elsewhere.</p>
+<p><b>What is and isn't established.</b> The run shows that <i>this</i> A, the principal compression subspace, is worse than a learned one. It does not yet separate
+"freezing A" from "choosing the principal subspace". The decisive control is a <b>random frozen A</b> (LoRA-FA) with the same recipe and sharing:</p>
+<ul>
+<li>If random-frozen ≈ vanilla, the compression subspace is the problem, and the next variant is the <b>minor</b> components (<code>V_{−r:}</code>) or task-calibrated directions.</li>
+<li>If random-frozen ≈ FrozenA, freezing itself costs 2–5 points at r=32 on these tasks.</li>
+</ul>
+<p>That control is now running (§12). It uses the random bank <code>sr_frozen_a/frozen_a_rand_r32_v1</code> (kaiming draw, gate/up shared), zero-init B, and an otherwise identical recipe.</p>
+
+<h2>12. Compression-impact control: random frozen A, zero-init B</h2>
+<p><b>Goal (Anton, 2026-11-18):</b> keep everything from SR-FrozenA except the A matrix. A is drawn at random instead of derived from base-model compression, it stays
+frozen, and only B trains from its stock zero init. This differs from SR-FrozenA <b>only in A</b>, so the gap between the two runs is the value of the
+compression-derived subspace. It is also LoRA-FA (Zhang et al. 2023) and the "random A" arm of Zhu et al. 2024, applied to SR.</p>
+<table>
+<tr><th></th><th>SR-FrozenA (§1–11)</th><th>random-A control (this run)</th></tr>
+<tr><td>A</td><td>whitened-SVD / PCA of the base, kaiming-energy scaled, frozen</td><td><b>random</b> kaiming_uniform(a=√5) = U(−1/√in, 1/√in), seed 0, frozen. This is
+exactly the distribution of PEFT's stock lora_A init, so the only change from vanilla SR is that A never trains (<code>sr_frozen_a/frozen_a_rand_r32_v1</code>,
+written by <code>scratch/frza/gen_random_a.py</code>)</td></tr>
+<tr><td>A sharing</td><td>gate+up share one A</td><td>gate+up share one draw (same structure, same trainable count)</td></tr>
+<tr><td>B init</td><td colspan="2">zeros (stock LoRA), so step 0 equals the base on both arms</td></tr>
+<tr><td>trainable params</td><td colspan="2">34,078,720 per adapter (B only)</td></tr>
+<tr><td>everything else</td><td colspan="2">identical: commit <code>b1b24fb</code> + <code>sr_frozen_a/code_v2/</code> overlay, data_v1, recipe, 4-GPU DDP, bench_eval. Jobs
+<code>antonp-frzr-{ans,guard,qc,req}</code>, runs <code>sr_frozen_a/runs/v1/frzr-*</code></td></tr>
+</table>
+<p>The three arms vanilla, random-frozen A and compression-frozen A separate the two effects:</p>
+<ul>
+<li><b>vanilla − random-frozen</b> = the cost of not training A.</li>
+<li><b>compression − random-frozen</b> = the value of the compression subspace.</li>
+</ul>
+
+<h3>12.1 Results</h3>
+<table id="results-randa">
+<tr><th>intrinsic (headline)</th><th>vanilla SR</th><th>compression A, B=0</th><th>random A, B=0</th><th>Δ compression − random</th><th>Δ random − vanilla</th></tr>
+<tr><td>answerability (acc)</td><td class="num">86.34</td><td class="num">83.67</td><td class="num">86.34</td><td class="num"><b>−2.66</b> [−3.51, −1.85]</td><td class="num">0.00 [−0.70, +0.67]</td></tr>
+<tr><td>guardian_core (acc)</td><td class="num">80.24</td><td class="num">78.19</td><td class="num">79.95</td><td class="num"><b>−1.75</b> [−2.25, −1.25]</td><td class="num">−0.29 [−0.65, +0.10]</td></tr>
+<tr><td>query_clarification (overall acc)</td><td class="num">92.47</td><td class="num">87.10</td><td class="num">93.19</td><td class="num"><b>−6.09</b> [−9.68, −3.23]</td><td class="num">+0.72 [−1.08, +2.51]</td></tr>
+<tr><td>requirement_check (bal. acc)</td><td class="num">64.90</td><td class="num">60.52</td><td class="num">65.22</td><td class="num"><b>−4.70</b> [−6.44, −3.04]</td><td class="num">+0.32 [−0.92, +1.51]</td></tr>
+</table>
+<p><small>Paired bootstrap, 1000 resamples, bench scorers. Bold means the CI excludes 0. The frozen-A check passed on every finished run.
+qc random-A underspecified acc 84.8% (the random-A+random-B run had 7.6%).
+Issue: the first qc pod sat in ImagePullBackOff because <code>image-pull-secret-us</code> was rejected on its node. It was resubmitted with
+<code>all-icr-io</code> / <code>icr-pull-secret</code> / <code>icr-pull-secret-ares</code> as fallbacks.
+The ans random-A and vanilla accuracies are identical (3078/3565 correct each), but the per-row predictions differ (hence the non-zero CI).</small></p>
+<div class="ok"><b>Conclusion of the control.</b> A <b>random</b> frozen A with only B trained is <b>indistinguishable from vanilla SR</b> on all four intrinsics: Δ 0.00 / −0.29 / +0.72 / +0.32, and no CI excludes 0.
+It also beats the compression-derived A significantly on all four (+2.66 / +1.75 / +6.09 / +4.70). So:
+<ul>
+<li>Freezing A costs nothing here (Zhu et al. / LoRA-FA hold for SR at r=32).</li>
+<li>The entire 2–5 point loss of SR-FrozenA (§10) comes from the <b>compression subspace</b>: the principal, whitened directions of the base weight.</li>
+<li>One random A set shared by all four adapters gives vanilla quality at −44% trainable parameters per adapter.</li>
+</ul></div>
+
+<h3>12.2 Aborted earlier variant: random A + random B</h3>
+<p>The first version of this control also drew B at random (PEFT's <code>init_lora_weights=False</code>, flag <code>--lora-b-init random</code>, jobs <code>antonp-frzrb-*</code>).
+That changes two things against SR-FrozenA, so Anton stopped it and all its jobs were deleted. Two runs had finished. They are kept only as a note on random-B
+initialisation, not as a measure of A:</p>
+<ul>
+<li><b>The starting point is far from the base.</b> On guard, first-step loss was 16.7–17.0, which is above a uniform guess over the vocabulary (ln 100352 ≈ 11.5).
+Every site in all 40 layers adds a random delta, and these compound through the adapter stream.
+<ul>
+<li>guard (750 steps) recovered by about step 40, but still ended at 72.68, i.e. 5.5 points below compression A.</li>
+<li>qc (136 steps) never recovered: eval loss 2.5 and score 72.76, with underspecified accuracy 7.6%.</li>
+</ul></li>
+<li>The bare / <code>disable_adapter</code> model stays the exact base under random B (invariant 3, <code>test_random_b_is_seeded_stock_draw_and_a_stays_frozen</code>).
+The <code>--lora-b-init</code> flag stays in <code>train_frozen_a.py</code>, defaulting to <code>zeros</code>.</li>
+</ul>
+
+<h2>13. Literature review: what is the optimal LoRA <code>A</code> matrix?</h2>
+<p>This section is a general LoRA question, independent of SR. For a site <code>W + (α/r)·B·A</code> with <code>A ∈ ℝ^{r×in}</code> (down-projection) and
+<code>B ∈ ℝ^{out×r}</code>, what should A be? Should it be trained at all, and if so, where should it start? Every entry was checked against its arXiv abstract. Where numbers are quoted, they come from the
+paper's own tables (arXiv HTML).</p>
+<p><b>Notation:</b> LoRA-One uses the row-vector convention <code>y = xW</code>. Its statements are transposed here so that "A" is always the input-side factor and G is <code>out×in</code>.</p>
+
+<div class="box"><b>Short answer.</b> The best-supported choice is <b>A = the top-r right singular vectors of the task's full fine-tuning gradient
+<code>G = ∂L/∂W = Σ g xᵀ</code></b>, estimated from a few batches and suitably scaled (LoRA-One, LoRA-GA, GoRA).
+<ul>
+<li>Theory: standard LoRA's A drifts toward exactly that subspace, but slowly. LoRA-One shows Θ(ln d / λ) steps from a random start.</li>
+<li>Practice: LoRA-One beats LoRA, PiSSA, LoRA-GA and LoRA-Pro.</li>
+</ul>
+If no gradient is available:
+<ul>
+<li>The best cheap proxy is the <b>top principal directions of the input activations</b> (EVA). They maximise the expected gradient signal reaching B, and EVA has the best GLUE average among the inits it compares.</li>
+<li>A <b>random</b> A is a surprisingly strong baseline, even frozen.</li>
+<li>Taken from the weight alone, the <b>minor</b> singular directions beat the <b>principal</b> ones (MiLoRA vs PiSSA). Principal-weight directions are the worst of the families compared, sometimes below random.</li>
+</ul></div>
+
+<h3>13.1 Does A matter at all? (the asymmetry results)</h3>
+<table>
+<tr><th>Work</th><th>Finding</th><th>Numbers</th></tr>
+<tr><td><b>Asymmetry in Low-Rank Adapters</b> (Zhu et al. 2024, 2402.16842)</td>
+<td>A <i>extracts</i> features and B <i>maps</i> them to outputs. In linear regression, freezing A = Q turns training into least squares on the projected inputs <code>QX</code>, with optimum
+<code>B* = ΔΣQᵀ(QΣQᵀ)⁻¹</code>. A random Q loses nothing if the input covariance has rank ≤ r, and little if the inputs are redundant. Freezing B instead throws
+away output directions, which is much worse (Thm 4.3). B-only training also gets a √2-tighter generalization bound. The frozen A is a <b>random orthonormal</b>
+matrix; PEFT's kaiming draw gives essentially the same results.</td>
+<td>
+<ul>
+<li>GLUE avg, RoBERTa-L r=8: LoRA 87.2, B-only (frozen random A) <b>87.4</b>, A-only 84.2.</li>
+<li>MMLU, Llama-2-7B/Alpaca r=32: LoRA 44.76, B-only <b>45.36</b>.</li>
+<li><b>Exception:</b> on BART summarization, B-only even at 2× rank trails LoRA by about 0.9 R-1 on XSum.</li>
+</ul></td></tr>
+<tr><td><b>LoRA-FA</b> (Zhang et al. 2023, 2308.03303)</td><td>Freezing A at its random init (B-only) gives parity with LoRA and full fine-tuning on GLUE, GSM8K, MT-Bench and HumanEval, with lower activation memory.</td><td>—</td></tr>
+<tr><td><b>LoRI</b> (Zhang et al. 2025, 2504.07448)</td><td>A frozen random projection plus a sparse, task-masked B. Up to 95% fewer trainable parameters than LoRA. Random A makes different tasks' adapters
+near-orthogonal, which helps merging.</td><td>—</td></tr>
+<tr><td><b>Flora</b> (Hao et al., ICML 2024, 2402.03293)</td><td>LoRA's dynamics are approximately a <i>random-projection gradient compressor</i>. Re-sampling the projection during training gives high-rank updates with sublinear optimizer memory.</td><td>—</td></tr>
+<tr><td><b>VeRA</b> (2310.11454), <b>NOLA</b> (2310.02556), <b>RandLoRA</b> (2502.00987), <b>Tied-LoRA</b> (2311.09578), <b>HydraLoRA</b> (2404.19245)</td>
+<td>The factors are frozen random or shared, and only scales or coefficients (VeRA, NOLA, RandLoRA) or the B heads (HydraLoRA, one shared A) are trained. All report roughly LoRA-level quality.</td><td>—</td></tr>
+</table>
+<p><b>Takeaway.</b> A trained A carries much less task-specific information than B, and a <i>random</i> A preserves most of the input information that B needs.
+Even LoRA-One, which proves A does move toward the gradient subspace, finds that this alignment takes Θ(ln d) steps. So
+a smart A has to beat a high baseline, and the clearest gains come from <b>faster convergence</b> rather than a better final optimum.</p>
+
+<h3>13.2 What "optimal" means: three objectives in the literature</h3>
+<table>
+<tr><th>Objective</th><th>Resulting A</th><th>Source</th></tr>
+<tr><td><b>Match the endpoint of LoRA training</b></td><td>Top-r right singular vectors of the one-step full gradient <code>G♮</code>. LoRA-One proves (linear model, r ≥ 2r*) that from the standard init,
+LoRA's A aligns (to within θ) with this subspace after <code>t* ≈ ln(√d/θ)/ln(1+ηλ_{r*}(G♮))</code> steps. B lies <i>exactly</i> in G♮'s top output-side singular subspace
+from step 1 onward, because <code>B₁ = η·G♮A₀ᵀ</code>. Spectral init reaches the aligned state <i>immediately</i>. With preconditioning, convergence is linear and independent of the condition number (Thm 4.2).</td><td>LoRA-One (Zhang et al., ICML 2025 oral, 2502.01235)</td></tr>
+<tr><td><b>Match the first step of full fine-tuning</b></td><td>SVD of G at step 0, split between A and B (disjoint singular indices), with an offset so the model starts unchanged.
+LoRA-One points out that LoRA-GA's choice of indices r+1…2r for the other factor puts it outside the subspace it naturally converges to.</td><td>LoRA-GA (Wang et al. 2024, 2407.05000)</td></tr>
+<tr><td><b>Maximise the gradient signal reaching B</b> (data, no labels)</td><td>With B=0, <code>E‖∇_B‖² ∝ Tr(AΣAᵀ)</code>, where Σ is the input covariance. For orthonormal A this is maximised by the top-r principal directions of the
+activations, which also approximate the leading empirical-NTK subspace.</td><td>EVA (Paischer et al. 2024, 2410.07170, Thm 3.2)</td></tr>
+<tr><td><i>(contrast)</i> Reconstruct the base weight</td><td>Top singular directions of W (PiSSA) or of <code>W·S</code> with whitened activations (SVD-LLM, CorDA-IPM). These are the directions the base already uses most.
+No theory links them to the fine-tuning update.</td><td>PiSSA (2404.02948), CorDA (2406.05223), SVD-LLM</td></tr>
+</table>
+<p>The objectives nest. <code>G = Σ g xᵀ</code>, so the row space of G lies inside the span of the activations x.
+<ul>
+<li>EVA (activation PCA) is the gradient objective with the output-error signal g dropped.</li>
+<li>Weight-SVD drops the data <i>and</i> the task.</li>
+</ul>
+As the evidence below shows, each step down that chain loses quality.</p>
+
+<h3>13.3 Head-to-head evidence</h3>
+<table>
+<tr><th>Comparison (paper, setup)</th><th>Result</th></tr>
+<tr><td><b>LoRA-One</b>: T5-base GLUE r=8, avg of MNLI/SST-2/CoLA/QNLI/MRPC</td><td>LoRA 82.72 · LoRA+ 84.95 · PiSSA 84.71 · P-LoRA 87.13 · LoRA-GA 87.77 · LoRA-Pro 88.44 · <b>LoRA-One 88.73</b></td></tr>
+<tr><td><b>LoRA-One</b>: Llama-2-7B r=8, 5-seed means (LoRA / LoRA-GA / LoRA-One)</td><td>GSM8K 59.26 / 56.44 / <b>60.44</b> · GSM8K-CoT 53.36 / 46.07 / <b>55.88</b> · MMLU 45.73 / 45.15 / <b>47.24</b> · HumanEval 25.85 / 26.95 / <b>28.66</b>.
+LoRA-GA is <i>below</i> plain LoRA here. Init costs about 3 minutes on a 6-hour run, and memory is unchanged.</td></tr>
+<tr><td><b>EVA</b>: GLUE avg, RoBERTa-L / DeBERTa-v3-B</td><td>LoRA 89.3 / 89.6 · PiSSA 88.9 / 89.2 · OLoRA 89.3 / 89.8 · LoRA-GA 89.1 / 89.0 · CorDA 87.9 / 88.3 · <b>EVA 89.6 / 89.9</b>.
+EVA also has the top commonsense average on Llama-3.1-70B (94.5). Init overhead is 0.2–0.7% of training, vs 2.4% for LoRA-GA and 4.5% for CorDA. CorDA collapsed on some seeds.
+Ablation: the <i>least</i>-variance activation components are worse than the top ones.</td></tr>
+<tr><td><b>MiLoRA</b>: Llama-2-7B GSM8K / MATH init ablation</td><td>principal 60.7 / 14.6 · random 63.2 / 15.5 · <b>minor 64.0 / 16.1</b></td></tr>
+<tr><td><b>MiLoRA</b>: commonsense avg (8 tasks, r=32)</td><td>Llama-2-7B: LoRA 77.6 · PiSSA 73.8 · <b>MiLoRA 79.2</b>. Llama-3-8B: LoRA 80.8 · PiSSA 75.4 · <b>MiLoRA 81.9</b>.
+LoRA rows are cited from DoRA, so they come from different runs.</td></tr>
+<tr><td><b>MiLoRA</b>: PiSSA hyperparameter sensitivity (Llama-2-7B r=128)</td><td>In PiSSA's own setup (LR 2e-5, batch 128): PiSSA 29.4 vs LoRA 23.6 (GSM8K/MATH avg). In a standard PEFT setup (LR 3e-4, batch 16): PiSSA 30.8 vs LoRA 33.7 and MiLoRA 35.1.
+PiSSA's advantage looks tied to slow-learning regimes.</td></tr>
+<tr><td><b>PiSSA</b> (own paper)</td><td>Beats LoRA on 12 models, e.g. GSM8K 72.86 vs 67.7 on Mistral-7B, with faster convergence. These are its own hyperparameters; see the row above.</td></tr>
+<tr><td><b>LoRA-SB vs LoRA-XS</b> (2411.19557): same architecture, frozen A and B with a trained r×r core</td><td>Frozen factors from the <b>gradient</b> (LoRA-SB) beat frozen factors from the <b>weight SVD</b> (LoRA-XS). LoRA-SB matches or beats LoRA with 27–90× fewer parameters.</td></tr>
+<tr><td><b>GoRA</b> (He et al., NeurIPS 2025, 2502.12171)</td><td>Gradient-driven init plus per-layer rank allocation: +5.13 over LoRA and +2.05 over full fine-tuning on Llama-3.1-8B math (high-rank setting).</td></tr>
+</table>
+<p><small>Cross-paper caution: these are different setups, ranks, α conventions and LR sweeps. Single-paper gaps are often 1–2 points, and the MiLoRA paper shows the ranking can flip with the
+learning rate. The robust pattern is the <i>ordering</i>, which repeats across independent papers: gradient ≥ activation ≳ random ≳ minor-weight &gt; principal-weight.</small></p>
+
+<h3>13.4 Scale and dynamics (as important as direction)</h3>
+<table>
+<tr><th>Work</th><th>Finding</th></tr>
+<tr><td><b>Impact of Initialization on LoRA</b> (Hayou et al. 2024, 2406.08447)</td><td>Of the two no-op inits, "A random, B=0" beats "A=0, B random" on average because it tolerates larger learning rates without output instability.</td></tr>
+<tr><td><b>LoRA+</b> (Hayou et al. 2024, 2402.12354)</td><td>At large width, A and B need different learning rates: η_B ≫ η_A. That gives +1–2% and up to 2× faster training. A frozen A is the η_A → 0 limit.</td></tr>
+<tr><td><b>rsLoRA</b> (Kalajdzievski 2023, 2312.03732)</td><td>Scaling α/√r rather than α/r keeps learning stable as r grows, which makes higher ranks useful.</td></tr>
+<tr><td><b>Riemannian preconditioned LoRA</b> (Zhang &amp; Pilanci 2024, 2402.02347); <b>LoRA-Pro</b> (Wang et al., ICLR 2025, 2407.18242)</td><td>Fix the A/B dynamics rather than the init: an r×r preconditioner per step, or gradient corrections so the effective low-rank gradient approximates the full one. LoRA-Pro is close to LoRA-One on GLUE (88.44 vs 88.73) but uses about 2× the memory.</td></tr>
+<tr><td><b>LoRA-One</b> (§13.2)</td><td>From a random start, smaller init scale gives better eventual alignment but slower convergence, a "double-edged sword". Spectral init removes the trade-off.</td></tr>
+<tr><td><b>Orthogonal init</b> (PEFT <code>init_lora_weights="orthogonal"</code>)</td><td>A and B are built from interleaved rows of one random orthogonal matrix. Both are non-zero, yet <code>B·A = 0</code> exactly, so both get gradient from step 1 while the adapter still starts as a no-op (checked in PEFT 0.19.1 source).</td></tr>
+</table>
+
+<h3>13.5 Catalogue of A-instantiation methods</h3>
+<table>
+<tr><th>Family</th><th>Method</th><th>A</th><th>A trained?</th><th>Needs</th></tr>
+<tr><td rowspan="3">random</td><td>LoRA (2106.09685), PEFT default</td><td>kaiming_uniform(a=√5); B=0</td><td>yes</td><td>—</td></tr>
+<tr><td>Gaussian / orthogonal (PEFT)</td><td>N(0, 1/r) / interleaved orthogonal rows</td><td>yes</td><td>—</td></tr>
+<tr><td>LoRA-FA, Zhu et al., LoRI, Flora</td><td>random (orthonormal), frozen; Flora re-samples</td><td>no</td><td>—</td></tr>
+<tr><td rowspan="4">weight</td><td>PiSSA (2404.02948)</td><td>top-r right singular vectors of W (·√σ), residual frozen</td><td>yes</td><td>SVD of W</td></tr>
+<tr><td>MiLoRA (2406.09044)</td><td>bottom-r singular vectors of W</td><td>yes</td><td>SVD of W</td></tr>
+<tr><td>OLoRA (2406.01775)</td><td>from QR of W</td><td>yes</td><td>QR of W</td></tr>
+<tr><td>LoRA-XS (2405.17604)</td><td>SVD of W, frozen, trained r×r core</td><td>no</td><td>SVD of W</td></tr>
+<tr><td rowspan="4">activations</td><td>EVA (2410.07170), PEFT <code>"eva"</code></td><td>top right-singular vectors of minibatch activations; adaptive rank</td><td>yes</td><td>forward passes</td></tr>
+<tr><td>CorDA (2406.05223)</td><td>SVD of W·C (input covariance): top for instruction mode, bottom for knowledge-preserving</td><td>yes</td><td>forward passes</td></tr>
+<tr><td>LoRA-Null (2503.02659)</td><td>null space of the input activations (preserves knowledge)</td><td>yes</td><td>forward passes</td></tr>
+<tr><td>SVD-LLM / ESPACE (compression)</td><td><code>V_rᵀS⁻¹</code> (whitened) / input PCA</td><td>n/a (compression)</td><td>forward passes</td></tr>
+<tr><td rowspan="4">gradient</td><td>LoRA-GA (2407.05000), in PEFT</td><td>singular vectors of G at step 0 (split indices), offset</td><td>yes</td><td>forward+backward</td></tr>
+<tr><td>LoRA-One (2502.01235)</td><td>top-r singular subspace of the one-step G, √S-scaled, preconditioned training</td><td>yes</td><td>forward+backward</td></tr>
+<tr><td>LoRA-SB (2411.19557)</td><td>from the update approximation, frozen, trained r×r core</td><td>no</td><td>forward+backward</td></tr>
+<tr><td>GoRA (2502.12171)</td><td>gradient-driven init plus rank allocation</td><td>yes</td><td>forward+backward</td></tr>
+<tr><td>quantisation</td><td>LoftQ (2310.08659)</td><td>chosen jointly with quantised W to absorb the quantisation error</td><td>yes</td><td>SVD</td></tr>
+</table>
+
+<h3>13.6 Relation to this experiment</h3>
+<p>The SR-FrozenA <code>A</code> (§2.1) is a <b>weight-reconstruction</b> subspace. The SVD-LLM whitened SVD keeps the input directions that matter most for the base weight's own output.
+That puts it in the principal family (PiSSA / CorDA-instruction mode), which ranks lowest in §13.3, and it is <i>frozen</i>, so training cannot drift away from it.
+The 2–5 point loss in §10 and the 97–99% of vanilla's update lying outside that subspace (§10.3) match that ranking. The random-A control (§12) measures the
+"random ≳ principal" step directly. The literature points to the next candidate as a gradient-derived A: top right singular vectors of the task gradient accumulated over a few
+batches, as in LoRA-One / LoRA-SB.</p>
+
+<h2>14. Data-free A from the base weights: minor singular directions (MiLoRA-style)</h2>
+<p><b>Goal (Anton, 2026-11-18):</b> compute a good A candidate <i>from the base weights alone</i>, with one A set shared by all four adapters.
+There is no gradient or task data. A gradient-derived A needs labels, so it is ruled out.</p>
+<p><b>Choice.</b> Weight-only methods can take the principal directions (PiSSA) or the minor ones (MiLoRA). §13.3 ranks minor &gt; random &gt; principal (MiLoRA's GSM8K ablation: 64.0 / 63.2 / 60.7).
+Our compression A sits in the principal family and lost to random on guard (§12). So the candidate is the <b>minor right singular vectors</b> of W:</p>
+<pre>  W = U Σ Vᵀ (thin SVD)   ⇒   A = V_{−r:}ᵀ / √3      (r = 32, the 32 smallest σ)
+  gate+up: one shared A from the thin SVD of [W_gate; W_up]   (same sharing as §3)
+  down_proj (2560×8192): thin SVD, so the minor directions lie in W's row space, not its exact null space</pre>
+<ul>
+<li><b>Scale.</b> The rows are orthonormal, scaled by 1/√3, which is the expected row norm of PEFT's kaiming lora_A. That matches the random bank's scale, so in A only the directions differ from §12.</li>
+<li><b>Meaning.</b> These are the input directions the base weight is nearly blind to. The adapter adds new reads there instead of re-weighting what the base already reads.</li>
+<li><b>cross_stream</b> has W≡0, so there is nothing to decompose. Its A is copied from the random bank (seed 0), so this arm differs from §12 only at the 200 q/o/gate/up/down sites.</li>
+</ul>
+<p><b>Risk.</b> The base may have learned to ignore minor input directions because activations carry little energy there. Then the frozen features <code>A x</code> would be small and
+B would learn slowly. MiLoRA trains A afterwards, so it can recover from this; here A stays frozen. The training curves will show it if it happens.</p>
+<p><b>Run.</b> Code is <code>frozen_a.weight_svd_a</code> plus <code>training/compute_weight_a.py</code>; the tests are <code>test_weight_svd_a_picks_minor_or_principal_directions</code> and
+<code>test_weight_bank_covers_every_site_from_weights_only</code>. The bank is <code>sr_frozen_a/frozen_a_minor_r32_v1</code> (log in <code>minor_calib.log</code>). The jobs are
+<code>antonp-frzm-{ans,guard,qc,req}</code>, using <code>sr_frozen_a/code_v3/</code> with B=0 and a recipe identical to §12.</p>
+<p><b>Bank diagnostics (before training).</b> In the minor directions, the weight energy <code>Σσ²(minor 32)/Σσ²</code> is 4e-7 for q, 7e-7 for o and about 0.2% for gate+up and down.
+So for q/o these are near-null directions of W.</p>
+<p>The activation energy those directions read was measured as the per-feature variance <code>diag(A C Aᵀ)</code>, with C the input covariance from 32 calibration rows (8 per task,
+≤1024 tokens) on CPU (<code>scratch/frza/feature_energy.py</code>, <code>sr_frozen_a/feature_energy_v1.json</code>). Values are relative to the random bank:</p>
+<table>
+<tr><th>group</th><th>minor-weight A: mean feature var vs random (avg, range over layers)</th><th>compression A</th><th>max/min feature var: minor / random / compression</th></tr>
+<tr><td>q</td><td class="num">5.1× (0.65–10.2)</td><td class="num">1.00×</td><td class="num">39 / 15 / 1.2</td></tr>
+<tr><td>o</td><td class="num">1.6× (0.80–3.2)</td><td class="num">0.99×</td><td class="num">3.9 / 2.7 / 1.5</td></tr>
+<tr><td>gate+up</td><td class="num">7.6× (3.5–24.8)</td><td class="num">1.02×</td><td class="num">96 / 2.6 / 1.4</td></tr>
+<tr><td>down</td><td class="num">1.4× (0.48–5.0)</td><td class="num">0.98×</td><td class="num">380 / 21 / 1.5</td></tr>
+</table>
+<p>The data-free minor directions are <i>not</i> low-energy input directions. They read <b>more</b> activation variance than random, concentrated in a few features.
+The base weights apparently learned to suppress a few large-variance input channels (the massive-activation channels that also dominated the cross_stream PCA, §10.1),
+and the minor SVD picks exactly those out. Expected consequences:</p>
+<ul>
+<li>A higher effective step size on q and gate+up: feature std is about 2.2–2.8× random's.</li>
+<li>Some of the 32 features read near-constant outlier channels. These act like a bias, so this A may behave like a lower-rank random A.</li>
+</ul>
+<p>Rescaling per feature would need calibration data, which breaks the weights-only constraint, so the run is kept as designed.</p>
+
+<h3>14.1 Results</h3>
+<table id="results-minor">
+<tr><th>intrinsic (headline)</th><th>vanilla SR</th><th>compression A</th><th>random A</th><th>minor-weight A</th><th>Δ minor − random</th><th>Δ minor − vanilla</th></tr>
+<tr><td>answerability (acc)</td><td class="num">86.34</td><td class="num">83.67</td><td class="num">86.34</td><td class="num">87.24</td><td class="num"><b>+0.90</b> [+0.34, +1.51]</td><td class="num"><b>+0.90</b> [+0.31, +1.54]</td></tr>
+<tr><td>guardian_core (acc)</td><td class="num">80.24</td><td class="num">78.19</td><td class="num">79.95</td><td class="num">79.69</td><td class="num">−0.26 [−0.66, +0.07]</td><td class="num"><b>−0.55</b> [−0.81, −0.30]</td></tr>
+<tr><td>query_clarification (overall acc)</td><td class="num">92.47</td><td class="num">87.10</td><td class="num">93.19</td><td class="num">90.68</td><td class="num"><b>−2.51</b> [−4.66, −0.36]</td><td class="num">−1.79 [−4.30, +0.72]</td></tr>
+<tr><td>requirement_check (bal. acc)</td><td class="num">64.90</td><td class="num">60.52</td><td class="num">65.22</td><td class="num">64.02</td><td class="num">−1.20 [−2.34, +0.04]</td><td class="num">−0.87 [−2.00, +0.35]</td></tr>
+<tr><td><i>mean of the 4 headlines</i></td><td class="num">80.99</td><td class="num">77.37</td><td class="num">81.18</td><td class="num">80.41</td><td class="num">−0.77</td><td class="num">−0.58</td></tr>
+</table>
+<p><small>Minor-weight A vs compression A: +3.57 [+2.75, +4.43] ans, +1.50 [+1.03, +2.02] guard, +3.58 [+0.72, +6.81] qc, +3.50 [+1.91, +5.15] req. All significant.
+The frozen-A check passed on all four.</small></p>
+<div class="box"><b>Conclusion.</b>
+<ul>
+<li><b>Minor beats principal, as MiLoRA predicts.</b> Of the two weight-derived A's, the minor singular directions beat the principal/compression ones on all four intrinsics, by 1.5–3.6 points.</li>
+<li><b>Minor does not reliably beat random.</b> It wins on ans (+0.90, significant), ties on guard and req, and loses on qc (−2.51, significant). Its 4-task mean is 0.77 below random's.</li>
+<li>The bank diagnostic is a plausible reason. A few minor features read the large-variance outlier channels (feature-variance spread up to 96× on gate+up and 380× on down), so the effective rank is below 32 at those sites.</li>
+<li>The ordering on this setup is <b>random ≈ vanilla ≳ minor-weight &gt; principal-weight (compression)</b>. That matches the cross-paper ordering in §13.3.</li>
+<li>Weight-only A selection, without data, does not beat a random draw.</li>
+</ul></div>
+
+<h2>15. Compressing W into A: row pruning, neuron folding, random sketching</h2>
+<p><b>Goal (Anton, 2026-11-21):</b> test more strategies that <i>compress</i> the base weight W (out×in) into the frozen A (r×in), instead of calculating A from other signals.
+Each strategy builds A's 32 rows from W's output rows. Everything is data-free and uses one bank for all 4 adapters. Only B trains. The briefing with the full log is
+<code>docs/autopilot/sr-a-compression/index.html</code>.</p>
+<pre>  prune : A = the 32 rows of W with the largest L1 norm          structured neuron pruning (Li et al. 2016, 1608.08710)
+  fold  : A = k-means (k=32) centroids of W's rows               model folding (Wang et al. 2025, 2502.10216)
+  sketch: A = G·W,  G ~ N(0,1) of shape 32×out                   random sketching (Woodruff 2014, 1411.4357)
+  all   : rows rescaled to norm 1/√3 (stock kaiming row norm); gate+up share A from [W_gate; W_up]; cross_stream = random A</pre>
+<p>Code: <code>frozen_a.compressed_rows_a</code>, <code>frozen_a.row_space_stats</code> and <code>compute_weight_a.py --which prune|fold|sketch</code>. There are 26 new or extended
+CPU tests. A reviewer agent found 9 issues: 7 were fixed, 2 kept with a reason. Banks: <code>sr_frozen_a/frozen_a_{prune,fold,sketch}_r32_v1</code>.
+Every site has rank 32. The fraction of ‖W‖² in A's row space is 2–8%, against 1.25% for a random subspace. Jobs: <code>antonp-frz{p,f,s}-*</code>, code <code>sr_frozen_a/code_v4</code>.</p>
+<h3>15.1 Results</h3>
+<table id="results-compress">
+<tr><th>intrinsic</th><th>vanilla</th><th>random A</th><th>SVD-LLM A (§10)</th><th>minor A (§14)</th><th>prune</th><th>fold</th><th>sketch</th></tr>
+<tr><td>answerability</td><td class="num">86.34</td><td class="num">86.34</td><td class="num">83.67</td><td class="num">87.24</td><td class="num">85.44</td><td class="num">85.55</td><td class="num">86.76</td></tr>
+<tr><td>guardian_core</td><td class="num">80.24</td><td class="num">79.95</td><td class="num">78.19</td><td class="num">79.69</td><td class="num">79.99</td><td class="num">80.27</td><td class="num">80.15</td></tr>
+<tr><td>query_clarification</td><td class="num">92.47</td><td class="num">93.19</td><td class="num">87.10</td><td class="num">90.68</td><td class="num">91.04</td><td class="num">92.11</td><td class="num">91.76</td></tr>
+<tr><td>requirement_check</td><td class="num">64.90</td><td class="num">65.22</td><td class="num">60.52</td><td class="num">64.02</td><td class="num">63.33</td><td class="num">63.04</td><td class="num">61.69</td></tr>
+<tr><td><i>mean</i></td><td class="num">80.99</td><td class="num"><b>81.18</b></td><td class="num">77.37</td><td class="num">80.41</td><td class="num">79.95</td><td class="num">80.24</td><td class="num">80.09</td></tr>
+</table>
+<table>
+<tr><th>Δ (paired bootstrap, 95% CI)</th><th>ans</th><th>guard</th><th>qc</th><th>req</th></tr>
+<tr><td>prune − random A</td><td class="num"><b>−0.90</b> [−1.51, −0.34]</td><td class="num">+0.04 [−0.20, +0.32]</td><td class="num">−2.15 [−4.30, 0.00]</td><td class="num"><b>−1.89</b> [−3.21, −0.62]</td></tr>
+<tr><td>fold − random A</td><td class="num"><b>−0.79</b> [−1.40, −0.20]</td><td class="num"><b>+0.32</b> [+0.07, +0.60]</td><td class="num">−1.08 [−3.23, +1.08]</td><td class="num"><b>−2.18</b> [−3.45, −0.86]</td></tr>
+<tr><td>sketch − random A</td><td class="num">+0.42 [−0.11, +0.98]</td><td class="num">+0.20 [−0.06, +0.48]</td><td class="num">−1.43 [−3.23, 0.00]</td><td class="num"><b>−3.52</b> [−4.87, −2.22]</td></tr>
+<tr><td>prune − vanilla</td><td class="num"><b>−0.90</b> [−1.60, −0.20]</td><td class="num">−0.25 [−0.60, +0.13]</td><td class="num">−1.43 [−4.30, +1.08]</td><td class="num"><b>−1.56</b> [−2.88, −0.22]</td></tr>
+<tr><td>fold − vanilla</td><td class="num"><b>−0.79</b> [−1.46, −0.08]</td><td class="num">+0.03 [−0.30, +0.43]</td><td class="num">−0.36 [−2.51, +1.43]</td><td class="num"><b>−1.86</b> [−3.19, −0.53]</td></tr>
+<tr><td>sketch − vanilla</td><td class="num">+0.42 [−0.20, +1.07]</td><td class="num">−0.09 [−0.36, +0.25]</td><td class="num">−0.72 [−2.87, +1.43]</td><td class="num"><b>−3.20</b> [−4.65, −1.70]</td></tr>
+<tr><td>prune − SVD-LLM A</td><td class="num"><b>+1.77</b></td><td class="num"><b>+1.80</b></td><td class="num"><b>+3.94</b></td><td class="num"><b>+2.82</b></td></tr>
+<tr><td>fold − SVD-LLM A</td><td class="num"><b>+1.88</b></td><td class="num"><b>+2.08</b></td><td class="num"><b>+5.02</b></td><td class="num"><b>+2.52</b></td></tr>
+<tr><td>sketch − SVD-LLM A</td><td class="num"><b>+3.09</b></td><td class="num"><b>+1.96</b></td><td class="num"><b>+4.66</b></td><td class="num">+1.18 [−0.07, +2.68]</td></tr>
+</table>
+<p><small>1000 paired resamples with the bench scorers (<code>sr_frozen_a/code_v4/bootstrap_task.sh</code>). Bold means the CI excludes 0. Every run passed the frozen-A check.
+The SVD-LLM CIs are omitted for space; they are in the briefing.</small></p>
+<div class="box"><b>Conclusion.</b>
+<ul>
+<li><b>Row compression is far better than SVD compression.</b> All three strategies beat the SVD-LLM A on every task by 1.8–5.0 points; sketch on req (+1.2) is the one non-significant case.
+They lean only mildly toward W's high-energy directions (2–8% of ‖W‖² vs 1.25% random), while SVD-LLM concentrates on them. That confirms the §10 diagnosis: the principal subspace is the wrong place to adapt.</li>
+<li><b>No compression strategy beats a random A.</b> Their 4-task means are 0.9–1.2 below random A. Each has at most one significant win (fold on guard, +0.32), and fold and prune lose significantly on ans and req.</li>
+<li><b>No strategy is consistent across tasks.</b> Sketch is best on ans but worst on req. Fold is best on guard and qc but loses on ans and req.</li>
+<li><b>Why: compressed rows read the outlier channels.</b> The activation variance <code>diag(A C Aᵀ)</code> was measured on 32 calibration rows (<code>sr_frozen_a/feature_energy_compress_v1.json</code>).
+Relative to random A, the mean feature variance is 2.8–5.2× for prune, 1.7–10.2× for fold and 1.4–2.4× for sketch.
+The max/min spread across the 32 features reaches 3157 (prune, down), 11219 (fold, down) and 450 (sketch, down), against 21 for random.
+A few features dominate, so the effective rank is below 32. Sketch is the least skewed compression.</li>
+<li><b>Seed noise</b> comes from a parallel session (<code>docs/autopilot/a-compression/</code>: random frozen A, seeds 2–5). The run-to-run SD is 0.94 on qc and 0.58 on req, and about 1 req run in 20 drops by about 7 points.
+So all qc differences here are within noise. The req losses vs random A (−1.9 / −2.2 / −3.5) are 2–4× the SD of a two-run difference (≈0.82), so they are probably real.
+No floor was measured for ans or guard.</li>
+<li>Overall ordering: <b>random A ≈ vanilla ≳ minor ≈ fold ≈ sketch ≈ prune ≫ SVD-LLM</b>. The more an A leans toward the base weight's own structure, the worse it does.
+The best data-free frozen A on this setup is still a plain random draw.</li>
+</ul></div>
+
+<h3>Artifacts</h3>
+<ul>
+<li>Frozen A: <code>/danieloh_cos/granite-switch/sr_frozen_a/frozen_a_r32_v1/{frozen_a.safetensors, manifest.json}</code>. Calibration log: <code>sr_frozen_a/calib.log</code>.</li>
+<li>Runs: <code>/danieloh_cos/granite-switch/sr_frozen_a/runs/v1/frza-sr-qo-mlp-r32-c32-skv-g42-{ans,guard,qc,req}/run_*/</code>, each with
+<code>checkpoints/</code> (a stock PEFT SR adapter, with <code>frozen_lora_a</code> provenance in <code>adapter_config.json</code>), <code>eval/&lt;intrinsic&gt;/{predictions,score,status}.json*</code>
+and <code>frozen_a_manifest.json</code>.</li>
+<li>Code (staged, not committed): <code>src/shadow_residual/training/{frozen_a,compute_frozen_a,train_frozen_a}.py</code>, <code>tests/training/test_frozen_a.py</code>.
+Exact copies used by the jobs are in <code>sr_frozen_a/code/</code>, alongside the analysis scripts (<code>paired_bootstrap.py</code>, <code>subspace_capture.py</code>, <code>gen_random_a.py</code>).</li>
+</ul>
 
 </body>
 </html>
