@@ -486,6 +486,8 @@ def test_last_context_boundary_sample_n_caps_scan(tokenizer):
 class _RecordingTokenizer:
     """Minimal stub that records every apply_chat_template kwargs call."""
 
+    eos_token = None
+
     def __init__(self):
         self.calls: list[dict] = []
 
@@ -515,3 +517,28 @@ def test_enable_thinking_defaults_false(tmp_path):
     tok = _RecordingTokenizer()
     load_jsonl_dataset(_one_row_jsonl(tmp_path), tok)
     assert tok.calls[0]["enable_thinking"] is False
+
+
+@pytest.mark.parametrize("model_id, marker", [
+    ("ibm-granite/granite-4.1-3b", "<|end_of_text|>"),
+    ("ibm-granite/granite-4.2-3b", "<|im_end|>"),
+])
+@pytest.mark.parametrize("with_last_token", [True, False])
+def test_rows_end_exactly_on_eos(tmp_path, model_id, marker, with_last_token):
+    """The template ends each turn with "<marker>\\n"; the row must end on the marker
+    itself, or TRL's SFTTrainer (which appends eos_token to any text not ending in
+    it) supervises a second "\\n<marker>" after the gold."""
+    pytest.importorskip("datasets")
+    from tests._tokenizers import load_tokenizer
+    tok = load_tokenizer(model_id)
+    assert tok.eos_token == marker
+    p = tmp_path / "rows.jsonl"
+    p.write_text(json.dumps({"messages": [{"role": "user", "content": "q?"},
+                                          {"role": "assistant", "content": "a."}]}) + "\n")
+    ds = load_jsonl_dataset(p, tok, last_token=marker if with_last_token else None)
+    text = ds[0]["text"]
+    assert text.endswith("a." + marker)
+    collator = ResponseOnlyCollator(tok, "<|start_of_role|>assistant<|end_of_role|>"
+                                    if "4.1" in model_id else "<|im_start|>assistant\n<think></think>")
+    labels = collator([{"input_ids": tok.encode(text, add_special_tokens=False)}])["labels"][0].tolist()
+    assert tok.decode([v for v in labels if v != -100]) == "a." + marker
